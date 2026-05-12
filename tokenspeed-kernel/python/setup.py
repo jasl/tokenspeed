@@ -465,6 +465,13 @@ KERNEL_GROUPS = [
         [],
     ),
     (
+        "sm12x_deepseek_v4_output_proj",
+        [
+            CUDA_CSRC_DIR / "sm12x_deepseek_v4_output_proj.cu",
+        ],
+        [],
+    ),
+    (
         "kvcacheio",
         [
             CUDA_CSRC_DIR / "kvcacheio_transfer.cu",

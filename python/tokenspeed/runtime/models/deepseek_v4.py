@@ -461,6 +461,7 @@ _DEEPSEEK_V4_SM12X_MHC_UNAVAILABLE = False
 _DEEPSEEK_V4_SM12X_FP8_QUANT_UNAVAILABLE = False
 _DEEPSEEK_V4_SM12X_FP8_WEIGHT_GEMV_UNAVAILABLE = False
 _DEEPSEEK_V4_SM12X_OUTPUT_PROJ_UNAVAILABLE = False
+_DEEPSEEK_V4_SM12X_OUTPUT_PROJ_CUDA_UNAVAILABLE = False
 
 
 def _deepseek_v4_fast_mhc_enabled_for_platform() -> bool:
@@ -3536,6 +3537,7 @@ class DeepseekV4Attention(nn.Module):
         positions: torch.Tensor,
     ) -> torch.Tensor:
         global _DEEPSEEK_V4_SM12X_OUTPUT_PROJ_UNAVAILABLE
+        global _DEEPSEEK_V4_SM12X_OUTPUT_PROJ_CUDA_UNAVAILABLE
 
         heads_per_group = self.num_local_heads // self.num_local_groups
         wo_a_scale = getattr(self.wo_a, "weight_scale_inv", None)
@@ -3556,15 +3558,32 @@ class DeepseekV4Attention(nn.Module):
         ):
             try:
                 from tokenspeed_kernel.ops.attention.deepseek_v4 import (
+                    deepseek_v4_fp8_einsum_sm12x_cuda,
                     deepseek_v4_fp8_einsum_sm12x_triton,
                     deepseek_v4_fused_inv_rope_fp8_quant_triton,
                 )
 
+                if deepseek_v4_fused_inv_rope_fp8_quant_triton is None:
+                    raise RuntimeError(
+                        "SM12x fused inverse-RoPE + FP8 quant kernel unavailable"
+                    )
+
+                # Prefer native CUDA einsum; fall back to Triton if the .so is
+                # missing (development environments without the SM12x build) or
+                # the kernel raises at launch.
+                einsum_fn = None
                 if (
-                    deepseek_v4_fp8_einsum_sm12x_triton is None
-                    or deepseek_v4_fused_inv_rope_fp8_quant_triton is None
+                    not _DEEPSEEK_V4_SM12X_OUTPUT_PROJ_CUDA_UNAVAILABLE
+                    and deepseek_v4_fp8_einsum_sm12x_cuda is not None
                 ):
-                    raise RuntimeError("SM12x Triton projection kernels unavailable")
+                    einsum_fn = deepseek_v4_fp8_einsum_sm12x_cuda
+                if einsum_fn is None:
+                    if deepseek_v4_fp8_einsum_sm12x_triton is None:
+                        raise RuntimeError(
+                            "SM12x FP8 einsum kernel unavailable (no CUDA, no Triton)"
+                        )
+                    einsum_fn = deepseek_v4_fp8_einsum_sm12x_triton
+
                 grouped_fp8, grouped_scale = (
                     deepseek_v4_fused_inv_rope_fp8_quant_triton(
                         attn_output,
@@ -3585,13 +3604,33 @@ class DeepseekV4Attention(nn.Module):
                     dtype=attn_output.dtype,
                     device=attn_output.device,
                 )
-                deepseek_v4_fp8_einsum_sm12x_triton(
-                    grouped_fp8,
-                    grouped_scale,
-                    self.wo_a.weight,
-                    wo_a_scale,
-                    z,
-                )
+                try:
+                    einsum_fn(
+                        grouped_fp8,
+                        grouped_scale,
+                        self.wo_a.weight,
+                        wo_a_scale,
+                        z,
+                    )
+                except Exception as cuda_exc:
+                    if einsum_fn is deepseek_v4_fp8_einsum_sm12x_cuda:
+                        _DEEPSEEK_V4_SM12X_OUTPUT_PROJ_CUDA_UNAVAILABLE = True
+                        logger.warning(
+                            "DeepSeek V4 SM12x CUDA output-projection kernel "
+                            "failed; falling back to Triton einsum. "
+                            f"reason={type(cuda_exc).__name__}: {cuda_exc}"
+                        )
+                        if deepseek_v4_fp8_einsum_sm12x_triton is None:
+                            raise
+                        deepseek_v4_fp8_einsum_sm12x_triton(
+                            grouped_fp8,
+                            grouped_scale,
+                            self.wo_a.weight,
+                            wo_a_scale,
+                            z,
+                        )
+                    else:
+                        raise
                 return self._fp8_linear(
                     self.wo_b,
                     z.flatten(1),

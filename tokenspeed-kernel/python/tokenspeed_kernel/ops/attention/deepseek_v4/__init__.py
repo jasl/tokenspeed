@@ -26,6 +26,14 @@ from tokenspeed_kernel.ops.attention.deepseek_v4.reference import (
 )
 
 try:
+    from tokenspeed_kernel.ops.attention.deepseek_v4.cuda_projection import (
+        deepseek_v4_fp8_einsum_sm12x_cuda,
+    )
+except (ImportError, RuntimeError):
+    # Pre-compiled SO is absent in environments without the SM12x build.
+    deepseek_v4_fp8_einsum_sm12x_cuda = None
+
+try:
     from tokenspeed_kernel.ops.attention.deepseek_v4.triton_projection import (
         deepseek_v4_fp8_einsum_sm12x_triton,
         deepseek_v4_fused_inv_rope_fp8_quant_triton,
@@ -40,6 +48,7 @@ __all__ = [
     "csa_indexer_cache_insert_fp8_cuda",
     "deepseek_v4_compressed_kv_cache_insert_cuda",
     "deepseek_v4_decode_indices_cuda",
+    "deepseek_v4_fp8_einsum_sm12x_cuda",
     "deepseek_v4_fp8_einsum_sm12x_triton",
     "deepseek_v4_full_candidate_topk_cuda",
     "deepseek_v4_fused_inv_rope_fp8_quant_triton",
