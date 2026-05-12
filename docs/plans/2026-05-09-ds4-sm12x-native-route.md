@@ -384,22 +384,50 @@ graph rather than from the kernel itself. The pre-T1-α eager number with the
 gate active and the slow reference path engaged was `14.54` tok/s. The 100
 tok/s vLLM-revenge target stays well out of reach until the MoE island lands.
 
+The MoE island (`T3-α`) tensorcore prototype is in place but does not yet
+deliver a net end-to-end win:
+
+* The new pieces are landed and individually correct -- a tensorcore W13
+  GEMM (commit `a4b813e`), a tensorcore W2 GEMM plus deterministic
+  weighted-reduce (commit `069dc17`), a Python orchestrator
+  `sm12x_mxfp4_moe_forward_tensorcore` that chains
+  quantize -> W13 -> SwiGLU+quantize -> W2 -> reduce
+  (commit `d7fc65e`), and a `TOKENSPEED_SM12X_MXFP4_MOE_IMPL=persistent`
+  dispatch switch (commit `97e63c9`). All correctness tests pass
+  (CUDA-vs-reference + CUDA-vs-warp tolerances).
+* Isolated microbenches confirm the tensorcore path is faster: the warp
+  full forward is `0.430` ms / call (bs=2) and `0.232` ms (bs=1) at the
+  DSv4-Flash decode shape; the tensorcore orchestrator is `0.339` ms
+  (bs=2) and `0.194` ms (bs=1) -- a `1.20` - `1.27`x speedup.
+* End-to-end, the persistent path regresses by `6%`: the warp `1024x1024 c1`
+  graph-mode bench reports `17.73` tok/s / `53.00` ms TPOT, while the
+  persistent variant at `<remote-workspace>/tokenspeed_t1_gamma_bench_20260513_043539`
+  reports `16.65` tok/s / `57.84` ms TPOT. The microbench predicts a
+  `~1` ms / step saving for 30 MoE layers; the actual delta is `+5` ms.
+  The gap is not yet diagnosed -- candidates are graph-node fan-out
+  (5 kernels per layer vs warp's 2), allocator pool fragmentation under
+  capture for the per-call scratch buffers, or a per-layer non-MoE side
+  effect of the dispatch switch. The next concrete step is an `nsys`
+  profile of both paths at the captured `bs=1` decode and a direct
+  comparison.
+* `w2_bias` is currently silently ignored on the persistent path; the
+  W2 bias fuse is the natural follow-up once the end-to-end regression
+  is resolved.
+
 ## Next Step
 
-The attention output-projection island (`T1-γ`) and the decode graph-capture
-island (`T1-α`) are both delivered. The next high-yield route is the MoE
-island (`T3-α`):
+`T3-α` is currently a **landed prototype with no net win**. The two
+work items in priority order:
 
-- Move the current SM12x MXFP4 expert path toward a #324/MegaMoE shape using
-  CUTLASS/CuTe DSL where it helps NVIDIA maintainability: stable route buffers,
-  no heavy route padding, and a persistent or padding-aware W13/SwiGLU/W2
-  schedule. The immediate prototype should use the validated weight-major
-  FP4xFP8 tile (`sm12x_mxfp4_mxfp8_dense`) to compute output-channel tiles for
-  up to eight local routes at a time, instead of reviving the rejected
-  M-grouped route padding path.
-- Stand the new MoE backend up as `--moe-backend sm12x_mxfp4_persistent` so it
-  can be evaluated against the current `sm12x_mxfp4` baseline without
-  destabilising the runtime path.
+1. Diagnose and close the persistent-path regression. Profile the
+   captured decode graph for `bs=1` (`nsys profile --capture-range=cudaProfilerApi`
+   driven by a short bench), compare warp vs persistent kernel-by-kernel,
+   and identify whether the cost lives in the orchestrator's extra kernel
+   launches, the allocator pool, or somewhere outside MoE.
+2. Once the regression is closed, fold `w2_bias` into the weighted-reduce
+   kernel and re-bench. After that, decide whether the next leverage is
+   further W2 optimisation (currently `3.8x` over bandwidth floor, vs W13's
+   `1.5x`) or pivoting to `T2-α` sparse MLA splits.
 
 A follow-up sparse MLA island (`T2-α`) is also on deck for once T3-α lands:
 split SWA / C4 / C128 dataflow so each layer kind has a focused CUDA kernel
