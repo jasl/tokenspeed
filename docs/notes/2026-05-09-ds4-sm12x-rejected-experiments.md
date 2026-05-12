@@ -432,3 +432,54 @@ fresh benchmark.
   splitting into template-specialized smaller `B`. Do not try the same
   naive per-thread accumulator design again -- the failure mode is
   occupancy collapse on Blackwell, not algorithmic.
+
+## DSv4 Output Projection FP8 einsum: per-thread multi-token tile (template-specialized B=1..16)
+
+- Date: 2026-05-13.
+- Attempt: extend the ported DeepGEMM SM120 FP8 einsum (commit `0831acd`)
+  with a multi-token grid axis. Templated kernel on `kBTokenTile ∈ {1, 2,
+  4, 8, 16}`; the host wrapper picks the smallest specialization that
+  covers `num_tokens`. Each thread holds `kBTokenTile` fp32 accumulators
+  and `kBTokenTile` activation-scale slots; the outer K loop loads one
+  shared weight cell per thread and the unrolled inner token-loop reuses
+  that weight across all valid tokens. Hypothesis: weight reads scale
+  with `ceil(T / kBTokenTile)` blocks rather than `T` blocks, so total
+  weight LDGs drop by `kBTokenTile` and the t≥4 cliff disappears.
+- Evidence: cuobjdump usage came out clean for B≤8 (REG: 1→40, 2→39,
+  4→47, 8→63, 16→114). Correctness tests passed (9/9). Decode-shape
+  microbench (groups=8, hidden=2048, out=1024, GPU idle, 2 runs each):
+
+  | tokens | multi-token mean | naive port mean | Triton |
+  |--------|------------------|-----------------|--------|
+  | 1      | 0.030 ms         | 0.028 ms        | 0.020 ms |
+  | 2      | 0.031 ms         | 0.028 ms        | 0.021 ms |
+  | 8      | 0.100 ms         | 0.077 ms        | 0.020 ms |
+
+  Multi-token is strictly slower at every tokens it was expected to help.
+- Root cause: the hypothesis was wrong. The naive port's per-thread total
+  LDG count and the multi-token kernel's per-thread total LDG count are
+  basically identical -- the new design just shifts the cost from
+  per-block weight reads to per-thread activation reads (each thread now
+  loops over `kBTokenTile` activation lanes). What does change is
+  parallelism: the multi-token grid is `kBTokenTile`x smaller, so at
+  tokens=8 with B=8 we get 64 blocks × 128 threads = 8 192 threads
+  scattered over 140 Blackwell SMs (~58 threads/SM), down from the naive
+  port's 65 536 threads (~468 threads/SM). Latency hiding evaporates. The
+  per-thread register footprint also grows (40 → 63 regs at B=8), so even
+  if the thread count were comparable, occupancy halves.
+- Decision: revert to the naive single-token-per-block DeepGEMM port
+  (commit `0831acd`). The multi-token kernel was not committed; the
+  working tree returns to that state. The t=8 regression versus Triton
+  (0.27x) is real but tolerable until T1-α actually exposes graph bs ≥ 8
+  to production; the correct optimization at that point is
+  cooperative-thread MMA tile (Triton's actual underlying strategy) or
+  shared-memory weight staging on top of the naive design, not
+  per-thread multi-token accumulation.
+- Anti-pattern guard: at decode shape (small `M`, small total blocks,
+  Blackwell with 140 SMs), do not reduce block count via per-thread
+  multi-output tiling -- the GPU is parallelism-starved, not bandwidth-
+  starved. A kernel that produces fewer blocks-with-more-work-each at
+  this shape will lose to one with more blocks-with-less-work-each, even
+  if their total LDG counts match. Verify the parallelism cost via
+  `nthreads_per_SM = grid * threads_per_block / num_SMs` before assuming
+  a tile-size optimization will pay off.
