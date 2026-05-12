@@ -39,6 +39,18 @@ def _cuda_einsum_available() -> bool:
     return deepseek_v4_fp8_einsum_sm12x_cuda is not None
 
 
+def _cuda_inv_rope_quant_available() -> bool:
+    if not _has_sm12x():
+        return False
+    try:
+        from tokenspeed_kernel.ops.attention.deepseek_v4 import (
+            deepseek_v4_fused_inv_rope_fp8_quant_sm12x_cuda,
+        )
+    except Exception:
+        return False
+    return deepseek_v4_fused_inv_rope_fp8_quant_sm12x_cuda is not None
+
+
 def _inverse_rope_grouped_reference(
     o: torch.Tensor,
     positions: torch.Tensor,
@@ -130,6 +142,236 @@ def test_deepseek_v4_fused_inv_rope_fp8_quant_matches_reference():
     assert actual_scale.shape == expected_scale.shape
     torch.testing.assert_close(actual_scale, expected_scale, rtol=0, atol=0)
     torch.testing.assert_close(actual_fp8.float(), expected_fp8.float(), rtol=0, atol=0)
+
+
+def _make_inv_rope_inputs(
+    *,
+    tokens: int,
+    n_groups: int,
+    heads_per_group: int,
+    nope_dim: int = 448,
+    rope_dim: int = 64,
+    max_position: int = 32,
+    seed: int = 20260513,
+    device: str = "cuda",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    torch.manual_seed(seed)
+    head_dim = nope_dim + rope_dim
+    positions = torch.randint(
+        low=0, high=max_position, size=(tokens,), device=device, dtype=torch.int64
+    )
+    theta = torch.randn(max_position, rope_dim // 2, device=device, dtype=torch.float32)
+    cos_sin_cache = torch.cat([torch.cos(theta), torch.sin(theta)], dim=-1)
+    o = torch.randn(
+        tokens,
+        n_groups * heads_per_group,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    return o, positions, cos_sin_cache
+
+
+@pytest.mark.skipif(
+    not _cuda_inv_rope_quant_available(),
+    reason="SM12x CUDA inv-rope+quant required",
+)
+@pytest.mark.parametrize("tokens", [1, 2, 3, 5, 8])
+def test_deepseek_v4_fused_inv_rope_fp8_quant_cuda_matches_reference(tokens):
+    from tokenspeed_kernel.ops.attention.deepseek_v4 import (
+        deepseek_v4_fused_inv_rope_fp8_quant_sm12x_cuda,
+    )
+
+    n_groups = 2
+    heads_per_group = 2
+    nope_dim = 448
+    rope_dim = 64
+    o, positions, cos_sin_cache = _make_inv_rope_inputs(
+        tokens=tokens, n_groups=n_groups, heads_per_group=heads_per_group
+    )
+
+    actual_fp8, actual_scale = deepseek_v4_fused_inv_rope_fp8_quant_sm12x_cuda(
+        o,
+        positions,
+        cos_sin_cache,
+        n_groups=n_groups,
+        heads_per_group=heads_per_group,
+        nope_dim=nope_dim,
+        rope_dim=rope_dim,
+    )
+    grouped = _inverse_rope_grouped_reference(
+        o,
+        positions,
+        cos_sin_cache,
+        n_groups=n_groups,
+        heads_per_group=heads_per_group,
+        nope_dim=nope_dim,
+        rope_dim=rope_dim,
+    )
+    expected_fp8, expected_scale = _fp8_quant_reference(grouped)
+
+    torch.cuda.synchronize()
+    assert actual_fp8.shape == expected_fp8.shape
+    assert actual_scale.shape == expected_scale.shape
+    torch.testing.assert_close(actual_scale, expected_scale, rtol=0, atol=0)
+    torch.testing.assert_close(actual_fp8.float(), expected_fp8.float(), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not _cuda_inv_rope_quant_available(),
+    reason="SM12x CUDA inv-rope+quant required",
+)
+@pytest.mark.parametrize("tokens", [1, 2, 4, 8, 16])
+def test_deepseek_v4_fused_inv_rope_fp8_quant_cuda_matches_triton(tokens):
+    """CUDA and Triton implementations must produce byte-exact output.
+
+    The dispatcher swaps between them based on env (build availability /
+    launch failure recovery); the downstream einsum walks identical
+    strides either way, so any drift would silently corrupt decoded
+    tokens after the fallback. Use exact equality.
+    """
+    from tokenspeed_kernel.ops.attention.deepseek_v4 import (
+        deepseek_v4_fused_inv_rope_fp8_quant_sm12x_cuda,
+        deepseek_v4_fused_inv_rope_fp8_quant_triton,
+    )
+
+    if deepseek_v4_fused_inv_rope_fp8_quant_triton is None:
+        pytest.skip("Triton sibling unavailable in this environment")
+
+    n_groups = 2
+    heads_per_group = 2
+    o, positions, cos_sin_cache = _make_inv_rope_inputs(
+        tokens=tokens, n_groups=n_groups, heads_per_group=heads_per_group
+    )
+
+    cuda_fp8, cuda_scale = deepseek_v4_fused_inv_rope_fp8_quant_sm12x_cuda(
+        o,
+        positions,
+        cos_sin_cache,
+        n_groups=n_groups,
+        heads_per_group=heads_per_group,
+    )
+    triton_fp8, triton_scale = deepseek_v4_fused_inv_rope_fp8_quant_triton(
+        o,
+        positions,
+        cos_sin_cache,
+        n_groups=n_groups,
+        heads_per_group=heads_per_group,
+    )
+
+    torch.cuda.synchronize()
+    assert cuda_fp8.shape == triton_fp8.shape
+    assert cuda_scale.shape == triton_scale.shape
+    # CUDA-vs-Triton at exact equality: both walk the same UE8M0 ceil-log2
+    # path on the same FP32 intermediate values, so quantised bytes match.
+    torch.testing.assert_close(cuda_scale, triton_scale, rtol=0, atol=0)
+    torch.testing.assert_close(cuda_fp8.float(), triton_fp8.float(), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not _cuda_inv_rope_quant_available(),
+    reason="SM12x CUDA inv-rope+quant required",
+)
+def test_deepseek_v4_fused_inv_rope_fp8_quant_cuda_handles_zero_tokens():
+    from tokenspeed_kernel.ops.attention.deepseek_v4 import (
+        deepseek_v4_fused_inv_rope_fp8_quant_sm12x_cuda,
+    )
+
+    n_groups = 2
+    heads_per_group = 2
+    nope_dim = 448
+    rope_dim = 64
+    head_dim = nope_dim + rope_dim
+    positions = torch.empty((0,), device="cuda", dtype=torch.int64)
+    cos_sin_cache = torch.empty((32, rope_dim), device="cuda", dtype=torch.float32)
+    o = torch.empty(
+        0,
+        n_groups * heads_per_group,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    fp8, scale = deepseek_v4_fused_inv_rope_fp8_quant_sm12x_cuda(
+        o,
+        positions,
+        cos_sin_cache,
+        n_groups=n_groups,
+        heads_per_group=heads_per_group,
+    )
+    torch.cuda.synchronize()
+    assert fp8.shape == (0, n_groups, heads_per_group * head_dim)
+    assert scale.shape == (0, n_groups, head_dim * heads_per_group // 128)
+
+
+@pytest.mark.skipif(
+    not _cuda_inv_rope_quant_available(),
+    reason="SM12x CUDA inv-rope+quant required",
+)
+@pytest.mark.skipif(
+    os.environ.get("TOKENSPEED_ENABLE_PROJECTION_MICROBENCH") != "1",
+    reason="Set TOKENSPEED_ENABLE_PROJECTION_MICROBENCH=1 to run the microbench",
+)
+@pytest.mark.parametrize("tokens", [1, 2, 8])
+def test_deepseek_v4_fused_inv_rope_fp8_quant_cuda_decode_microbench(tokens):
+    """Decode-shape microbench. Opt-in via env var."""
+    from tokenspeed_kernel.ops.attention.deepseek_v4 import (
+        deepseek_v4_fused_inv_rope_fp8_quant_sm12x_cuda,
+        deepseek_v4_fused_inv_rope_fp8_quant_triton,
+    )
+
+    # DSv4-Flash shape: G=8 local groups × heads_per_group=4.
+    n_groups = 8
+    heads_per_group = 4
+    o, positions, cos_sin_cache = _make_inv_rope_inputs(
+        tokens=tokens, n_groups=n_groups, heads_per_group=heads_per_group
+    )
+
+    def _time(fn, *, iters=200, warmup=20):
+        for _ in range(warmup):
+            fn()
+        torch.cuda.synchronize()
+        starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+        ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+        for s, e in zip(starts, ends):
+            s.record()
+            fn()
+            e.record()
+        torch.cuda.synchronize()
+        times = [s.elapsed_time(e) for s, e in zip(starts, ends)]
+        times.sort()
+        return times[0], sum(times) / len(times), times[-1]
+
+    cuda_min, cuda_mean, cuda_max = _time(
+        lambda: deepseek_v4_fused_inv_rope_fp8_quant_sm12x_cuda(
+            o,
+            positions,
+            cos_sin_cache,
+            n_groups=n_groups,
+            heads_per_group=heads_per_group,
+        )
+    )
+    print(
+        f"[t={tokens}] cuda_inv_rope_quant   min={cuda_min:.3f}ms "
+        f"mean={cuda_mean:.3f}ms max={cuda_max:.3f}ms"
+    )
+    if deepseek_v4_fused_inv_rope_fp8_quant_triton is not None:
+        tri_min, tri_mean, tri_max = _time(
+            lambda: deepseek_v4_fused_inv_rope_fp8_quant_triton(
+                o,
+                positions,
+                cos_sin_cache,
+                n_groups=n_groups,
+                heads_per_group=heads_per_group,
+            )
+        )
+        print(
+            f"[t={tokens}] triton_inv_rope_quant min={tri_min:.3f}ms "
+            f"mean={tri_mean:.3f}ms max={tri_max:.3f}ms"
+        )
+        print(
+            f"[t={tokens}] speedup mean={tri_mean / cuda_mean:.2f}x "
+            f"min={tri_min / cuda_min:.2f}x"
+        )
 
 
 @pytest.mark.skipif(not _has_sm12x(), reason="SM12x CUDA GPU required")

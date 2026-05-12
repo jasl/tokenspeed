@@ -45,6 +45,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -252,6 +253,208 @@ void launch_deepseek_v4_grouped_fp8_einsum(
       << cudaGetErrorString(status);
 }
 
+// =============================================================================
+// Fused inverse-RoPE + FP8 quant (DSv4 attention output projection prelude)
+// =============================================================================
+//
+// Replaces the Triton sibling kernel
+// `_fused_inv_rope_fp8_quant_kernel` (tokenspeed-kernel/.../triton_projection.py).
+// Per DeepSeek V4 attention, the attention output for each (token, head)
+// has its last `rope_dim=64` elements rotated by the inverse RoPE and then
+// the full `head_dim=512` is quantized into FP8 with one UE8M0-style
+// fp32 block-128 scale per `quant_group_size=128` chunk. The downstream
+// `bhr,hdr->bhd` einsum consumes this output.
+//
+// Schedule: one CUDA block per (token, head). The block has 512 threads
+// (one per head_dim element). Per-block work:
+//   1. Load `o[token, head, tid]` as fp32.
+//   2. If `tid` falls in the rope region (last `rope_dim` elements),
+//      apply inverse RoPE by swapping with the partner element
+//      (`tid ^ 1`) and multiplying by cos / -sin from `cos_sin_cache`.
+//   3. Compute block-128 absolute max via warp shuffles + cross-warp
+//      shared-memory reduction. 4 chunks per head -> 4 chunk_max slots.
+//   4. UE8M0-style fp32 scale = `exp2(ceil(log2(absmax / fp8_max)))`.
+//   5. Quantize: clamp(x / scale, ±fp8_max) -> fp8 e4m3.
+//   6. Write fp8 (per-thread) and scale (one thread per chunk) into the
+//      `[G, T_aligned, H]` storage layout that the Triton sibling uses.
+//
+// Output layout matches the Triton kernel byte-for-byte so callers and
+// the existing einsum see identical strides whether the Triton fallback
+// or this CUDA path produced them. T_aligned padding (multiple-of-4)
+// is the caller's responsibility -- this kernel skips the data write
+// and zeros the scale for padded tokens.
+
+constexpr int kQuantGroupSize = 128;
+constexpr int kHeadDim = 512;
+constexpr int kChunksPerHead = kHeadDim / kQuantGroupSize;            // 4
+constexpr int kBlockThreadsForInvRopeQuant = kHeadDim;                // 512
+constexpr int kWarpsForInvRopeQuant = kBlockThreadsForInvRopeQuant / 32;  // 16
+constexpr float kFp8E4m3Max = 448.0f;
+constexpr float kInvRopeQuantEps = 1.0e-10f;
+
+template <typename input_t>
+__global__ void deepseek_v4_inv_rope_fp8_quant_kernel(
+    __nv_fp8_e4m3* __restrict__ fp8_out,
+    float* __restrict__ scale_out,
+    const input_t* __restrict__ o,
+    const int64_t* __restrict__ positions,
+    const float* __restrict__ cos_sin_cache,
+    int num_tokens,
+    int heads_per_group,
+    int rope_abs_start,
+    int half_rope,
+    int64_t o_stride_token,
+    int64_t o_stride_head,
+    int64_t cache_stride_pos,
+    int64_t fp8_stride_group,
+    int64_t fp8_stride_token,
+    int64_t scale_stride_group,
+    int64_t scale_stride_block) {
+  int const token_id = blockIdx.x;
+  int const head_id = blockIdx.y;
+  int const tid = threadIdx.x;
+
+  int const group = head_id / heads_per_group;
+  int const head_in_group = head_id % heads_per_group;
+  int const chunk_id = tid / kQuantGroupSize;          // 0..3
+  int const scale_block_idx = head_in_group * kChunksPerHead + chunk_id;
+
+  // Padded-token slot: just zero the scale and bail.
+  if (token_id >= num_tokens) {
+    if (tid < kChunksPerHead) {
+      int const sb = head_in_group * kChunksPerHead + tid;
+      scale_out[group * scale_stride_group
+                + token_id
+                + sb * scale_stride_block] = 0.0f;
+    }
+    return;
+  }
+
+  // Load this thread's element of `o[token, head, :]`.
+  const input_t* input_base = o + static_cast<int64_t>(token_id) * o_stride_token
+                              + static_cast<int64_t>(head_id) * o_stride_head;
+  float x;
+  if constexpr (std::is_same_v<input_t, nv_bfloat16>) {
+    x = __bfloat162float(input_base[tid]);
+  } else {
+    x = static_cast<float>(input_base[tid]);
+  }
+
+  // Inverse RoPE for the last `rope_dim` elements.
+  if (tid >= rope_abs_start) {
+    int const rope_local = tid - rope_abs_start;
+    int const partner_idx = tid ^ 1;
+    float partner;
+    if constexpr (std::is_same_v<input_t, nv_bfloat16>) {
+      partner = __bfloat162float(input_base[partner_idx]);
+    } else {
+      partner = static_cast<float>(input_base[partner_idx]);
+    }
+    int const cs_idx = rope_local >> 1;
+    int64_t const pos = positions[token_id];
+    float const cos_v = cos_sin_cache[pos * cache_stride_pos + cs_idx];
+    float const sin_v = cos_sin_cache[pos * cache_stride_pos + half_rope + cs_idx];
+    if ((rope_local & 1) == 0) {
+      x = x * cos_v + partner * sin_v;
+    } else {
+      x = x * cos_v - partner * sin_v;
+    }
+  }
+
+  // Per-chunk absolute max via warp + cross-warp reductions.
+  // 4 warps per chunk (128 threads per chunk, 32 threads per warp).
+  float ax = fabsf(x);
+  unsigned int const full_mask = 0xFFFFFFFFu;
+#pragma unroll
+  for (int offset = 16; offset > 0; offset /= 2) {
+    ax = fmaxf(ax, __shfl_down_sync(full_mask, ax, offset));
+  }
+  // Lane 0 of each warp now holds its warp's max.
+
+  __shared__ float warp_max_shared[kWarpsForInvRopeQuant];
+  __shared__ float chunk_max[kChunksPerHead];
+  int const lane = tid & 31;
+  int const global_warp = tid >> 5;
+  int const warp_in_chunk = global_warp & 3;  // 4 warps per chunk
+  if (lane == 0) {
+    warp_max_shared[global_warp] = ax;
+  }
+  __syncthreads();
+
+  if (warp_in_chunk == 0) {
+    int const chunk_warp_base = chunk_id * 4;
+    float cm = (lane < 4) ? warp_max_shared[chunk_warp_base + lane] : 0.0f;
+    cm = fmaxf(cm, __shfl_down_sync(full_mask, cm, 2));
+    cm = fmaxf(cm, __shfl_down_sync(full_mask, cm, 1));
+    if (lane == 0) {
+      chunk_max[chunk_id] = cm;
+    }
+  }
+  __syncthreads();
+
+  // UE8M0 scale: exp2(ceil(log2(absmax / fp8_max))).
+  float const absmax = fmaxf(chunk_max[chunk_id], kInvRopeQuantEps);
+  float const scale = exp2f(ceilf(log2f(absmax * (1.0f / kFp8E4m3Max))));
+  float const x_quant_f = fminf(fmaxf(x / scale, -kFp8E4m3Max), kFp8E4m3Max);
+
+  int64_t const fp8_offset = static_cast<int64_t>(group) * fp8_stride_group
+                             + static_cast<int64_t>(token_id) * fp8_stride_token
+                             + static_cast<int64_t>(head_in_group) * kHeadDim
+                             + tid;
+  fp8_out[fp8_offset] = __nv_fp8_e4m3(x_quant_f);
+
+  // One thread per chunk writes the scale.
+  if ((tid & (kQuantGroupSize - 1)) == 0) {
+    int64_t const scale_offset = static_cast<int64_t>(group) * scale_stride_group
+                                 + token_id
+                                 + static_cast<int64_t>(scale_block_idx)
+                                       * scale_stride_block;
+    scale_out[scale_offset] = scale;
+  }
+}
+
+template <typename input_t>
+void launch_deepseek_v4_inv_rope_fp8_quant(
+    TensorView fp8_out,
+    TensorView scale_out,
+    TensorView o,
+    TensorView positions,
+    TensorView cos_sin_cache,
+    int num_tokens,
+    int aligned_tokens,
+    int num_heads,
+    int heads_per_group,
+    int rope_abs_start,
+    int half_rope,
+    cudaStream_t stream) {
+  if (aligned_tokens == 0 || num_heads == 0) {
+    return;
+  }
+  dim3 const grid(aligned_tokens, num_heads);
+  deepseek_v4_inv_rope_fp8_quant_kernel<input_t>
+      <<<grid, kBlockThreadsForInvRopeQuant, 0, stream>>>(
+          static_cast<__nv_fp8_e4m3*>(fp8_out.data_ptr()),
+          static_cast<float*>(scale_out.data_ptr()),
+          static_cast<const input_t*>(o.data_ptr()),
+          static_cast<const int64_t*>(positions.data_ptr()),
+          static_cast<const float*>(cos_sin_cache.data_ptr()),
+          num_tokens,
+          heads_per_group,
+          rope_abs_start,
+          half_rope,
+          o.stride(0),
+          o.stride(1),
+          cos_sin_cache.stride(0),
+          fp8_out.stride(0),
+          fp8_out.stride(1),
+          scale_out.stride(0),
+          scale_out.stride(2));
+  cudaError_t const status = cudaGetLastError();
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "sm12x_deepseek_v4_inv_rope_fp8_quant launch failed: "
+      << cudaGetErrorString(status);
+}
+
 }  // namespace
 
 void sm12x_deepseek_v4_grouped_fp8_gemv(
@@ -329,3 +532,116 @@ void sm12x_deepseek_v4_grouped_fp8_gemv(
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm12x_deepseek_v4_grouped_fp8_gemv,
                               sm12x_deepseek_v4_grouped_fp8_gemv);
+
+void sm12x_deepseek_v4_inv_rope_fp8_quant(
+    TensorView fp8_out,
+    TensorView scale_out,
+    TensorView o,
+    TensorView positions,
+    TensorView cos_sin_cache,
+    int64_t heads_per_group,
+    int64_t nope_dim,
+    int64_t rope_dim) {
+  // `fp8_out`: [n_groups, T_aligned, hidden] (contig)  -- caller computes
+  //            T_aligned = round_up(num_tokens, 4) and passes the
+  //            underlying [G, T_aligned, H] storage so the kernel's
+  //            T_aligned slot for padded tokens can have its scale
+  //            zeroed deterministically.
+  // `scale_out`: weird strided view  (n_groups, num_tokens, scale_blocks)
+  //              with strides (scale_blocks * T_aligned, 1, T_aligned)
+  //              -- matches the Triton sibling layout byte-for-byte so
+  //              the downstream FP8 einsum sees identical strides
+  //              regardless of which path produced this output.
+  // `o`: [num_tokens, num_heads, head_dim] bfloat16 (CUDA tensor; arbitrary
+  //      strides for token/head, hidden contig).
+  // `positions`: [num_tokens] int64.
+  // `cos_sin_cache`: [max_pos, >= rope_dim] fp32.
+  CHECK_CUDA(fp8_out);
+  CHECK_CUDA(scale_out);
+  CHECK_CUDA(o);
+  CHECK_CUDA(positions);
+  CHECK_CUDA(cos_sin_cache);
+  CHECK_DEVICE(fp8_out, scale_out);
+  CHECK_DEVICE(fp8_out, o);
+  CHECK_DEVICE(fp8_out, positions);
+  CHECK_DEVICE(fp8_out, cos_sin_cache);
+  CHECK_DIM(3, fp8_out);
+  CHECK_DIM(3, scale_out);
+  CHECK_DIM(3, o);
+  CHECK_DIM(1, positions);
+  CHECK_DIM(2, cos_sin_cache);
+  TVM_FFI_ICHECK_EQ(fp8_out.dtype(), dl_float8_e4m3fn);
+  TVM_FFI_ICHECK_EQ(scale_out.dtype(), dl_float32);
+  TVM_FFI_ICHECK_EQ(o.dtype(), dl_bfloat16);
+  TVM_FFI_ICHECK_EQ(positions.dtype(), dl_int64);
+  TVM_FFI_ICHECK_EQ(cos_sin_cache.dtype(), dl_float32);
+
+  int64_t const num_tokens = o.size(0);
+  int64_t const num_heads = o.size(1);
+  int64_t const head_dim = o.size(2);
+  TVM_FFI_ICHECK_EQ(head_dim, nope_dim + rope_dim)
+      << "head_dim must equal nope_dim + rope_dim";
+  TVM_FFI_ICHECK_EQ(head_dim, kHeadDim)
+      << "kernel hard-codes head_dim=" << kHeadDim;
+  TVM_FFI_ICHECK(rope_dim > 0 && rope_dim % 2 == 0)
+      << "rope_dim must be even and positive";
+  TVM_FFI_ICHECK_EQ(head_dim % kQuantGroupSize, 0)
+      << "head_dim must be divisible by " << kQuantGroupSize;
+  TVM_FFI_ICHECK(heads_per_group > 0);
+  TVM_FFI_ICHECK_EQ(num_heads % heads_per_group, 0)
+      << "num_heads must be divisible by heads_per_group";
+
+  TVM_FFI_ICHECK_EQ(o.stride(2), 1)
+      << "o hidden dim must be contiguous";
+  TVM_FFI_ICHECK_EQ(cos_sin_cache.size(1) >= rope_dim, true);
+
+  int64_t const n_groups = num_heads / heads_per_group;
+  int64_t const hidden = heads_per_group * head_dim;
+  int64_t const scale_blocks = hidden / kQuantGroupSize;
+
+  TVM_FFI_ICHECK_EQ(fp8_out.size(0), n_groups);
+  // fp8_out.size(1) is T_aligned (>= num_tokens).
+  int64_t const aligned_tokens = fp8_out.size(1);
+  TVM_FFI_ICHECK_GE(aligned_tokens, num_tokens);
+  TVM_FFI_ICHECK_EQ(aligned_tokens % 4, 0)
+      << "T_aligned must be a multiple of 4";
+  TVM_FFI_ICHECK_EQ(fp8_out.size(2), hidden);
+
+  TVM_FFI_ICHECK_EQ(scale_out.size(0), n_groups);
+  TVM_FFI_ICHECK_EQ(scale_out.size(1), num_tokens);
+  TVM_FFI_ICHECK_EQ(scale_out.size(2), scale_blocks);
+
+  TVM_FFI_ICHECK_EQ(positions.size(0), num_tokens);
+
+  // rope_abs_start matches the Triton constant: the last `rope_dim`
+  // elements of head_dim land in the last quant chunk's tail.
+  int const rope_start_in_chunk = static_cast<int>(nope_dim % kQuantGroupSize);
+  TVM_FFI_ICHECK_EQ(rope_start_in_chunk + rope_dim, kQuantGroupSize)
+      << "DeepSeek V4 inverse-RoPE block layout is unsupported";
+  int const rope_abs_start = (kChunksPerHead - 1) * kQuantGroupSize
+                             + rope_start_in_chunk;
+  int const half_rope = static_cast<int>(rope_dim / 2);
+
+  if (num_heads == 0) {
+    return;
+  }
+
+  cudaSetDevice(fp8_out.device().device_id);
+  cudaStream_t const stream = get_stream(fp8_out.device());
+  launch_deepseek_v4_inv_rope_fp8_quant<nv_bfloat16>(
+      fp8_out,
+      scale_out,
+      o,
+      positions,
+      cos_sin_cache,
+      static_cast<int>(num_tokens),
+      static_cast<int>(aligned_tokens),
+      static_cast<int>(num_heads),
+      static_cast<int>(heads_per_group),
+      rope_abs_start,
+      half_rope,
+      stream);
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm12x_deepseek_v4_inv_rope_fp8_quant,
+                              sm12x_deepseek_v4_inv_rope_fp8_quant);

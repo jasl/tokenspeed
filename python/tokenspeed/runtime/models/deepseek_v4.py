@@ -3560,17 +3560,20 @@ class DeepseekV4Attention(nn.Module):
                 from tokenspeed_kernel.ops.attention.deepseek_v4 import (
                     deepseek_v4_fp8_einsum_sm12x_cuda,
                     deepseek_v4_fp8_einsum_sm12x_triton,
+                    deepseek_v4_fused_inv_rope_fp8_quant_sm12x_cuda,
                     deepseek_v4_fused_inv_rope_fp8_quant_triton,
                 )
 
-                if deepseek_v4_fused_inv_rope_fp8_quant_triton is None:
+                if (
+                    deepseek_v4_fused_inv_rope_fp8_quant_sm12x_cuda is None
+                    and deepseek_v4_fused_inv_rope_fp8_quant_triton is None
+                ):
                     raise RuntimeError(
                         "SM12x fused inverse-RoPE + FP8 quant kernel unavailable"
                     )
 
-                # Prefer native CUDA einsum (m16n8k32 tensor-core MMA path);
-                # fall back to Triton if the .so is missing or the kernel
-                # raises at launch.
+                # Prefer native CUDA einsum; fall back to Triton if the .so
+                # is missing or the kernel raises at launch.
                 einsum_fn = None
                 if (
                     not _DEEPSEEK_V4_SM12X_OUTPUT_PROJ_CUDA_UNAVAILABLE
@@ -3584,8 +3587,26 @@ class DeepseekV4Attention(nn.Module):
                         )
                     einsum_fn = deepseek_v4_fp8_einsum_sm12x_triton
 
-                grouped_fp8, grouped_scale = (
-                    deepseek_v4_fused_inv_rope_fp8_quant_triton(
+                # Prefer native CUDA inverse-RoPE + FP8 quant; fall back to
+                # Triton on launch failure (single shared CUDA-unavailable
+                # flag covers both the einsum and the prelude so a CUDA
+                # build mismatch flips the whole projection island onto
+                # Triton in lockstep).
+                inv_rope_fn = (
+                    deepseek_v4_fused_inv_rope_fp8_quant_sm12x_cuda
+                    if (
+                        not _DEEPSEEK_V4_SM12X_OUTPUT_PROJ_CUDA_UNAVAILABLE
+                        and deepseek_v4_fused_inv_rope_fp8_quant_sm12x_cuda is not None
+                    )
+                    else deepseek_v4_fused_inv_rope_fp8_quant_triton
+                )
+                if inv_rope_fn is None:
+                    raise RuntimeError(
+                        "SM12x fused inverse-RoPE + FP8 quant kernel unavailable"
+                    )
+
+                try:
+                    grouped_fp8, grouped_scale = inv_rope_fn(
                         attn_output,
                         positions,
                         self._cos_sin_cache(),
@@ -3594,7 +3615,38 @@ class DeepseekV4Attention(nn.Module):
                         nope_dim=self.nope_head_dim,
                         rope_dim=self.qk_rope_head_dim,
                     )
-                )
+                except Exception as inv_rope_exc:
+                    if (
+                        inv_rope_fn is deepseek_v4_fused_inv_rope_fp8_quant_sm12x_cuda
+                        and deepseek_v4_fused_inv_rope_fp8_quant_triton is not None
+                    ):
+                        _DEEPSEEK_V4_SM12X_OUTPUT_PROJ_CUDA_UNAVAILABLE = True
+                        logger.warning(
+                            "DeepSeek V4 SM12x CUDA inverse-RoPE + FP8 quant "
+                            "kernel failed; falling back to Triton sibling. "
+                            f"reason={type(inv_rope_exc).__name__}: "
+                            f"{inv_rope_exc}"
+                        )
+                        grouped_fp8, grouped_scale = (
+                            deepseek_v4_fused_inv_rope_fp8_quant_triton(
+                                attn_output,
+                                positions,
+                                self._cos_sin_cache(),
+                                n_groups=self.num_local_groups,
+                                heads_per_group=heads_per_group,
+                                nope_dim=self.nope_head_dim,
+                                rope_dim=self.qk_rope_head_dim,
+                            )
+                        )
+                        # Also stop preferring CUDA for the einsum until the
+                        # next process restart.
+                        einsum_fn = (
+                            deepseek_v4_fp8_einsum_sm12x_triton
+                            if deepseek_v4_fp8_einsum_sm12x_triton is not None
+                            else einsum_fn
+                        )
+                    else:
+                        raise
                 z = torch.empty(
                     (
                         attn_output.shape[0],

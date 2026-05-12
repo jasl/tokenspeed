@@ -11,7 +11,7 @@
 # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 
-"""SM12x DeepSeek V4 attention output projection FP8 einsum (CUDA).
+"""SM12x DeepSeek V4 attention output projection kernels (CUDA).
 
 This wrapper is targeted at the SM12x family validated by this project --
 SM120 (RTX Pro / GeForce 50-series) and SM121 (GB10). It calls
@@ -19,6 +19,17 @@ SM120 (RTX Pro / GeForce 50-series) and SM121 (GB10). It calls
 output tensor's device before launching, so accidental dispatch on
 Hopper / Blackwell / Ampere will fail loudly instead of hitting an opaque
 ``no kernel image available`` CUDA error at launch time.
+
+Two ops are exported by the underlying ``.so``:
+
+- :func:`sm12x_deepseek_v4_fused_inv_rope_fp8_quant` — applies inverse
+  RoPE to the last ``rope_dim`` elements of each attention head and
+  quantises the full ``head_dim`` into FP8 e4m3 with one UE8M0-style
+  fp32 scale per 128-element block. Output layout matches the Triton
+  sibling exactly so the downstream einsum is layout-agnostic.
+- :func:`sm12x_deepseek_v4_grouped_fp8_gemv` — the ``bhr,hdr->bhd``
+  per-group batched FP8 GEMV that follows the inverse-RoPE / FP8 quant
+  step; ported from upstream DeepGEMM's SM120 einsum kernel.
 """
 
 from __future__ import annotations
@@ -154,4 +165,129 @@ def sm12x_deepseek_v4_grouped_fp8_gemv(
     )
 
 
-__all__ = ["sm12x_deepseek_v4_grouped_fp8_gemv"]
+def _aligned_tokens(num_tokens: int) -> int:
+    return ((num_tokens + 3) // 4) * 4
+
+
+def sm12x_deepseek_v4_fused_inv_rope_fp8_quant(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    *,
+    n_groups: int,
+    heads_per_group: int,
+    nope_dim: int = 448,
+    rope_dim: int = 64,
+    quant_group_size: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Inverse-RoPE attention output + grouped block-128 FP8 quant.
+
+    Mirrors :func:`deepseek_v4_fused_inv_rope_fp8_quant_triton`. Returns
+    ``(o_fp8, o_scale)`` with logical shapes
+    ``[tokens, groups, heads_per_group * head_dim]`` (FP8 e4m3) and
+    ``[tokens, groups, hidden / quant_group_size]`` (fp32), both as the
+    same non-contiguous strided views the Triton sibling produces -- the
+    underlying storage is ``[groups, T_aligned, hidden]`` and a strided
+    scale buffer so the downstream FP8 einsum is byte-compatible with
+    either implementation.
+
+    Hard-codes the DSv4-Flash head shape (`head_dim = nope_dim + rope_dim
+    = 512`); other shapes fall through to the Triton sibling.
+    """
+
+    if o.dim() != 3:
+        raise ValueError(f"o must be 3-D, got {o.dim()}")
+    if positions.dim() != 1:
+        raise ValueError(f"positions must be 1-D, got {positions.dim()}")
+    if cos_sin_cache.dim() != 2:
+        raise ValueError(f"cos_sin_cache must be 2-D, got {cos_sin_cache.dim()}")
+    if o.dtype != torch.bfloat16:
+        raise ValueError(f"o must be bfloat16, got {o.dtype}")
+    if positions.dtype != torch.int64:
+        raise ValueError(f"positions must be int64, got {positions.dtype}")
+    if cos_sin_cache.dtype != torch.float32:
+        raise ValueError(f"cos_sin_cache must be float32, got {cos_sin_cache.dtype}")
+
+    for name, tensor in (
+        ("o", o),
+        ("positions", positions),
+        ("cos_sin_cache", cos_sin_cache),
+    ):
+        if not tensor.is_cuda:
+            raise ValueError(f"{name} must be a CUDA tensor")
+
+    num_tokens, num_heads, head_dim = o.shape
+    if num_heads != n_groups * heads_per_group:
+        raise ValueError(
+            f"expected {n_groups * heads_per_group} heads, got {num_heads}"
+        )
+    if head_dim != nope_dim + rope_dim:
+        raise ValueError(f"expected head_dim={nope_dim + rope_dim}, got {head_dim}")
+    if head_dim % quant_group_size != 0:
+        raise ValueError(f"head_dim={head_dim} must be divisible by {quant_group_size}")
+    if nope_dim % quant_group_size != quant_group_size - rope_dim:
+        raise ValueError("DeepSeek V4 inverse-RoPE block layout is unsupported")
+    if rope_dim % 2 != 0:
+        raise ValueError(f"rope_dim must be even, got {rope_dim}")
+    if cos_sin_cache.shape[-1] < rope_dim:
+        raise ValueError(
+            f"cos_sin_cache last dim must be >= {rope_dim}, "
+            f"got {cos_sin_cache.shape[-1]}"
+        )
+    if quant_group_size != 128:
+        raise ValueError(
+            f"quant_group_size must be 128 for the SM12x CUDA kernel, "
+            f"got {quant_group_size}"
+        )
+    if o.stride(2) != 1:
+        raise ValueError("o hidden dim must be contiguous (stride==1)")
+    if positions.shape[0] != num_tokens:
+        raise ValueError(
+            f"positions length ({positions.shape[0]}) must match num_tokens ({num_tokens})"
+        )
+
+    hidden = heads_per_group * head_dim
+    scale_blocks = hidden // quant_group_size
+    aligned_tokens = _aligned_tokens(num_tokens)
+
+    fp8_buf = torch.empty(
+        (n_groups, aligned_tokens, hidden),
+        dtype=torch.float8_e4m3fn,
+        device=o.device,
+    )
+    scale_storage = torch.empty(
+        n_groups * scale_blocks * aligned_tokens,
+        dtype=torch.float32,
+        device=o.device,
+    )
+    scale_buf = scale_storage.as_strided(
+        (n_groups, num_tokens, scale_blocks),
+        (scale_blocks * aligned_tokens, 1, aligned_tokens),
+    )
+
+    if num_tokens == 0:
+        return fp8_buf[:, :0, :].transpose(0, 1), scale_buf.transpose(0, 1)
+
+    ensure_sm12x_supported_device(o.device)
+    _load_module().sm12x_deepseek_v4_inv_rope_fp8_quant(
+        fp8_buf,
+        scale_buf,
+        o,
+        positions,
+        cos_sin_cache.contiguous(),
+        heads_per_group,
+        nope_dim,
+        rope_dim,
+    )
+    # `fp8_buf` was allocated with the T_aligned slot count; slice back to
+    # the live `num_tokens` rows before exposing it. The CUDA kernel zero
+    # the scale for padded tokens; the data rows for padded tokens are
+    # never read by the downstream einsum.
+    fp8_live = fp8_buf[:, :num_tokens, :]
+    return fp8_live.transpose(0, 1), scale_buf.transpose(0, 1)
+
+
+__all__ = [
+    "sm12x_deepseek_v4_fused_inv_rope_fp8_quant",
+    "sm12x_deepseek_v4_grouped_fp8_gemv",
+]

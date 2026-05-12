@@ -19,8 +19,58 @@ import torch
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.thirdparty.cuda.sm12x_deepseek_v4_output_proj import (
+    sm12x_deepseek_v4_fused_inv_rope_fp8_quant as _sm12x_deepseek_v4_fused_inv_rope_fp8_quant,
+)
+from tokenspeed_kernel.thirdparty.cuda.sm12x_deepseek_v4_output_proj import (
     sm12x_deepseek_v4_grouped_fp8_gemv as _sm12x_deepseek_v4_grouped_fp8_gemv,
 )
+
+
+@register_kernel(
+    "attention",
+    "deepseek_v4_fused_inv_rope_fp8_quant",
+    name="deepseek_v4_fused_inv_rope_fp8_quant_sm12x_cuda",
+    solution="cuda",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(12, 0),
+        max_arch_version=ArchVersion(12, 1),
+        vendors=frozenset({"nvidia"}),
+    ),
+    dtypes={torch.bfloat16},
+    priority=Priority.PERFORMANT,
+    tags={"cuda", "deepseek_v4", "fp8", "projection", "sm12x"},
+)
+def deepseek_v4_fused_inv_rope_fp8_quant_sm12x_cuda(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    *,
+    n_groups: int,
+    heads_per_group: int,
+    nope_dim: int = 448,
+    rope_dim: int = 64,
+    quant_group_size: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute the DSv4 inverse-RoPE + block-128 FP8 quant on SM12x (CUDA).
+
+    Mirrors :func:`deepseek_v4_fused_inv_rope_fp8_quant_triton` so the
+    runtime can swap solutions without changing call sites. Output layout
+    matches the Triton sibling byte-for-byte: the underlying storage is
+    ``[n_groups, T_aligned, hidden]`` for the FP8 buffer and a strided
+    ``[n_groups, num_tokens, scale_blocks]`` view for the scales, both
+    returned as ``.transpose(0, 1)`` views so the consumer sees
+    ``[num_tokens, n_groups, ...]``.
+    """
+    return _sm12x_deepseek_v4_fused_inv_rope_fp8_quant(
+        o,
+        positions,
+        cos_sin_cache,
+        n_groups=n_groups,
+        heads_per_group=heads_per_group,
+        nope_dim=nope_dim,
+        rope_dim=rope_dim,
+        quant_group_size=quant_group_size,
+    )
 
 
 @register_kernel(
