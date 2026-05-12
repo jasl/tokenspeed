@@ -3543,7 +3543,7 @@ class DeepseekV4Attention(nn.Module):
         wo_a_scale = getattr(self.wo_a, "weight_scale_inv", None)
         if (
             not _DEEPSEEK_V4_SM12X_OUTPUT_PROJ_UNAVAILABLE
-            and _platform.is_sm12x
+            and _platform.is_sm12x_supported
             and attn_output.is_cuda
             and positions.is_cuda
             and attn_output.dim() == 3

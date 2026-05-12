@@ -11,7 +11,15 @@
 # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 
-"""SM12x DeepSeek V4 attention output projection FP8 einsum (CUDA)."""
+"""SM12x DeepSeek V4 attention output projection FP8 einsum (CUDA).
+
+This wrapper is targeted at the SM12x family validated by this project --
+SM120 (RTX Pro / GeForce 50-series) and SM121 (GB10). It calls
+:func:`tokenspeed_kernel.platform.ensure_sm12x_supported_device` on the
+output tensor's device before launching, so accidental dispatch on
+Hopper / Blackwell / Ampere will fail loudly instead of hitting an opaque
+``no kernel image available`` CUDA error at launch time.
+"""
 
 from __future__ import annotations
 
@@ -19,6 +27,7 @@ import functools
 from pathlib import Path
 
 import torch
+from tokenspeed_kernel.platform import ensure_sm12x_supported_device
 
 
 @functools.cache
@@ -94,13 +103,9 @@ def sm12x_deepseek_v4_grouped_fp8_gemv(
     num_tokens, num_groups, hidden = a.shape
     out_groups, out_rank, weight_hidden = b.shape
     if out_groups != num_groups:
-        raise ValueError(
-            f"b groups ({out_groups}) must match a groups ({num_groups})"
-        )
+        raise ValueError(f"b groups ({out_groups}) must match a groups ({num_groups})")
     if weight_hidden != hidden:
-        raise ValueError(
-            f"b hidden ({weight_hidden}) must match a hidden ({hidden})"
-        )
+        raise ValueError(f"b hidden ({weight_hidden}) must match a hidden ({hidden})")
     if hidden % 128 != 0:
         raise ValueError(f"hidden ({hidden}) must be divisible by 128")
     if out_rank % 128 != 0:
@@ -139,6 +144,7 @@ def sm12x_deepseek_v4_grouped_fp8_gemv(
     if num_tokens == 0:
         return
 
+    ensure_sm12x_supported_device(output.device)
     _load_module().sm12x_deepseek_v4_grouped_fp8_gemv(
         output,
         a,

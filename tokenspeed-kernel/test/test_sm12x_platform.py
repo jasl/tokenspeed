@@ -17,7 +17,13 @@ import importlib.util
 from pathlib import Path
 
 import pytest
-from tokenspeed_kernel.platform import ArchVersion, InterconnectInfo, PlatformInfo
+from tokenspeed_kernel.platform import (
+    SUPPORTED_SM12X_VARIANTS,
+    ArchVersion,
+    InterconnectInfo,
+    PlatformInfo,
+    ensure_sm12x_supported_device,
+)
 
 
 def _load_kernel_setup(monkeypatch: pytest.MonkeyPatch):
@@ -166,3 +172,102 @@ def test_platform_info_exposes_sm12x_family_helpers():
     assert not platform.is_sm120
     assert platform.is_blackwell_plus
     assert not platform.is_blackwell
+    assert platform.is_sm12x_supported
+
+
+def _make_platform_info(arch: ArchVersion) -> PlatformInfo:
+    return PlatformInfo(
+        vendor="nvidia",
+        arch_version=arch,
+        device_name=f"NVIDIA SM{arch}",
+        device_count=1,
+        total_memory=64 * (1024**3),
+        memory_bandwidth=1000.0,
+        sm_count=20,
+        max_threads_per_sm=2048,
+        max_shared_memory_per_sm=262144,
+        sm_features=frozenset(),
+        runtime_features=frozenset(),
+        interconnect=InterconnectInfo(topology="single_gpu"),
+    )
+
+
+@pytest.mark.parametrize("arch", [ArchVersion(12, 0), ArchVersion(12, 1)])
+def test_is_sm12x_supported_accepts_validated_variants(arch):
+    platform = _make_platform_info(arch)
+    assert platform.is_sm12x_supported
+
+
+@pytest.mark.parametrize(
+    "arch",
+    [
+        ArchVersion(8, 0),
+        ArchVersion(8, 9),
+        ArchVersion(9, 0),
+        ArchVersion(10, 0),
+        ArchVersion(12, 2),
+    ],
+)
+def test_is_sm12x_supported_rejects_other_variants(arch):
+    platform = _make_platform_info(arch)
+    assert not platform.is_sm12x_supported
+
+
+def test_supported_sm12x_variants_constant_matches_property():
+    """The whitelist constant must agree with the property; future variants
+    require updating both, or the dispatch site silently accepts something
+    the wrapper guard rejects."""
+    for major, minor in SUPPORTED_SM12X_VARIANTS:
+        assert _make_platform_info(ArchVersion(major, minor)).is_sm12x_supported
+
+
+def _clear_capability_cache():
+    from tokenspeed_kernel.platform import _device_capability_cached
+
+    _device_capability_cached.cache_clear()
+
+
+@pytest.mark.parametrize("capability", sorted(SUPPORTED_SM12X_VARIANTS))
+def test_ensure_sm12x_supported_device_accepts_validated(monkeypatch, capability):
+    _clear_capability_cache()
+    monkeypatch.setattr(
+        "torch.cuda.get_device_capability",
+        lambda idx: capability,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "torch.cuda.get_device_name",
+        lambda idx: "FakeGPU",
+        raising=False,
+    )
+    monkeypatch.setattr("torch.cuda.current_device", lambda: 0, raising=False)
+    ensure_sm12x_supported_device(0)
+    ensure_sm12x_supported_device(None)
+
+
+@pytest.mark.parametrize(
+    "capability",
+    [(8, 0), (8, 9), (9, 0), (10, 0), (12, 2)],
+)
+def test_ensure_sm12x_supported_device_rejects_others(monkeypatch, capability):
+    _clear_capability_cache()
+    monkeypatch.setattr(
+        "torch.cuda.get_device_capability",
+        lambda idx: capability,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "torch.cuda.get_device_name",
+        lambda idx: f"FakeGPU_SM{capability[0]}_{capability[1]}",
+        raising=False,
+    )
+    with pytest.raises(RuntimeError, match=r"SM12x kernel requires"):
+        ensure_sm12x_supported_device(0)
+
+
+def test_ensure_sm12x_supported_device_rejects_non_cuda_device(monkeypatch):
+    _clear_capability_cache()
+    import torch
+
+    with pytest.raises(RuntimeError, match=r"require a CUDA device"):
+        ensure_sm12x_supported_device(torch.device("cpu"))
