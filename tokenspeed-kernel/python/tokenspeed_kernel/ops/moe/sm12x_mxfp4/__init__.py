@@ -21,7 +21,11 @@
 from tokenspeed_kernel.ops.moe.sm12x_mxfp4.native import (
     sm12x_mxfp4_moe_forward,
     sm12x_mxfp4_moe_forward_scalar,
+    sm12x_mxfp4_moe_forward_tensorcore,
     sm12x_mxfp4_moe_forward_warp,
+    sm12x_mxfp4_moe_w2_tensorcore,
+    sm12x_mxfp4_moe_w13_tensorcore,
+    sm12x_mxfp4_moe_weighted_reduce,
     sm12x_mxfp4_mxfp8_dense,
     sm12x_mxfp4_mxfp8_mma_tile,
     sm12x_mxfp4_mxfp8_quantize,
@@ -49,5 +53,9 @@ __all__ = [
     "sm12x_mxfp4_moe_forward",
     "sm12x_mxfp4_moe_forward_scalar",
     "sm12x_mxfp4_moe_forward_warp",
+    "sm12x_mxfp4_moe_forward_tensorcore",
+    "sm12x_mxfp4_moe_w13_tensorcore",
+    "sm12x_mxfp4_moe_w2_tensorcore",
+    "sm12x_mxfp4_moe_weighted_reduce",
     "sm12x_mxfp4_moe_reference_forward",
 ]
