@@ -3571,11 +3571,24 @@ class DeepseekV4Attention(nn.Module):
                 # Prefer native CUDA einsum; fall back to Triton if the .so is
                 # missing (development environments without the SM12x build) or
                 # the kernel raises at launch.
+                #
+                # Hotfix: the current CUDA kernel is a one-cell-per-block
+                # design that wastes weight bandwidth as `num_tokens` grows
+                # (1.25x faster at tokens=1, 0.73x at tokens=2, 0.21x at
+                # tokens=8 vs Triton at DSv4-Flash decode shape). Restrict CUDA
+                # dispatch to single-token decodes until the tile-based
+                # rewrite lands; Triton is the correct path for graph
+                # bs >= 2 in the meantime. Tracked in
+                # docs/notes/2026-05-09-ds4-sm12x-rejected-experiments.md
+                # under "DSv4 Output Projection FP8 GEMV: one-cell-per-block
+                # CUDA design".
                 einsum_fn = None
-                if (
+                cuda_eligible = (
                     not _DEEPSEEK_V4_SM12X_OUTPUT_PROJ_CUDA_UNAVAILABLE
                     and deepseek_v4_fp8_einsum_sm12x_cuda is not None
-                ):
+                    and attn_output.shape[0] == 1
+                )
+                if cuda_eligible:
                     einsum_fn = deepseek_v4_fp8_einsum_sm12x_cuda
                 if einsum_fn is None:
                     if deepseek_v4_fp8_einsum_sm12x_triton is None:

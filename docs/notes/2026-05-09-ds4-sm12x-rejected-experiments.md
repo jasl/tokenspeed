@@ -342,3 +342,42 @@ fresh benchmark.
   The retained precise-exp baseline was `20.18` output tok/s, TPOT `39.73 ms`.
 - Decision: keep precise `expf` in sparse MLA. This change only trades
   numerical-risk budget for measurement noise.
+
+## DSv4 Output Projection FP8 GEMV: one-cell-per-block CUDA design
+
+- Date: 2026-05-13.
+- Attempt: native CUDA per-group batched FP8 GEMV for the DSv4 attention
+  output projection (`bhr,hdr->bhd`), structured as one CUDA block per
+  `(token, group, out_col)` output cell with `blockDim.x = 128` threads
+  reducing over `hidden_dim` (commit `7eb2845`, file
+  `tokenspeed-kernel/.../csrc/sm12x_deepseek_v4_output_proj.cu`,
+  `deepseek_v4_grouped_fp8_gemv_kernel`).
+- Evidence: focused projection tests passed (9/9), platform guard tests
+  passed (31/31), and the decode-shape microbench
+  (`tokens={1,2,8}`, `groups=8`, `hidden=2048`, `out_rank=1024`) measured:
+
+  | tokens | CUDA mean | Triton mean | CUDA / Triton |
+  |--------|-----------|-------------|---------------|
+  | 1      | 0.016 ms  | 0.020 ms    | 1.25x ✓       |
+  | 2      | 0.028 ms  | 0.021 ms    | 0.73x ✗       |
+  | 8      | 0.096 ms  | 0.020 ms    | 0.21x ✗       |
+
+  Workstation log:
+  `<remote-workspace>/tokenspeed_t1_gamma_cuda_microbench_20260513_*.log`.
+- Root cause: the grid is `(out_dim, num_tokens, num_groups)`, so each
+  block reads the same weight column independently. Total weight bandwidth
+  scales linearly with `num_tokens`. At `num_tokens=8` the kernel reads the
+  16 MB wo_a weight 8x, hitting ~128 MB of duplicated reads versus
+  Triton's 16 MB (whose `BLOCK_TOKENS=16` tile shares one weight load
+  across all tokens in the tile).
+- Decision: this design ships **only** as a single-stream (tokens==1)
+  specialization while the proper tile-based replacement is built. The
+  replacement uses grid `(out_dim, ceil(num_tokens/B_TOKEN), num_groups)`
+  with `B_TOKEN=16`, per-thread `B_TOKEN`-wide accumulators, and a single
+  weight read amortized across the token tile -- the Triton schedule,
+  reimplemented in CUDA. Anti-pattern guard for future CUDA GEMV kernels
+  with batched M dimension on SM12x: a kernel whose grid contains the
+  batched-M dimension as a parallel axis (one block per row) cannot win
+  against any tile design that shares weights across the batch -- never
+  treat per-row launches as an acceptable starting design when `M` can
+  exceed 1 in production.
