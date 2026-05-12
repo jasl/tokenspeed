@@ -196,13 +196,20 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if not self._use_sparse_mla_fp8_cache_cuda() or not q.is_cuda:
             return None
 
-        extra_width = extra_indices.shape[-1] if extra_indices is not None else 0
-        total_width = swa_indices.shape[-1] + extra_width
-        max_topk = int(
-            os.getenv("TOKENSPEED_DEEPSEEK_V4_CUDA_SPARSE_MLA_CACHE_MAX_TOPK", "1024")
+        # The CUDA kernel iterates the candidate list linearly, so any
+        # `total_width` is correct; the env override exists only as a
+        # tactical kill-switch to force the reference fallback for
+        # debugging. Without the env, do not gate -- the previous
+        # default (1024) was tighter than DSv4-Flash's CSA topk_tokens
+        # (8192), causing the slow reference path to silently win.
+        max_topk_env = os.getenv(
+            "TOKENSPEED_DEEPSEEK_V4_CUDA_SPARSE_MLA_CACHE_MAX_TOPK"
         )
-        if total_width > max_topk:
-            return None
+        if max_topk_env is not None:
+            extra_width = extra_indices.shape[-1] if extra_indices is not None else 0
+            total_width = swa_indices.shape[-1] + extra_width
+            if total_width > int(max_topk_env):
+                return None
 
         try:
             from tokenspeed_kernel.ops.attention.deepseek_v4 import (
