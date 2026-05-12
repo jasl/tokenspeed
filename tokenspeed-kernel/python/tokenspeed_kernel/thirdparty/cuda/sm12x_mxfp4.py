@@ -242,10 +242,12 @@ def sm12x_mxfp4_moe_forward(
         forward_impl = sm12x_mxfp4_moe_forward_warp
     elif impl == "scalar":
         forward_impl = sm12x_mxfp4_moe_forward_scalar
+    elif impl == "persistent":
+        forward_impl = sm12x_mxfp4_moe_forward_tensorcore
     else:
         raise ValueError(
-            "TOKENSPEED_SM12X_MXFP4_MOE_IMPL must be 'warp' or 'scalar', "
-            f"got {impl!r}"
+            "TOKENSPEED_SM12X_MXFP4_MOE_IMPL must be 'warp', 'scalar', or "
+            f"'persistent', got {impl!r}"
         )
     return forward_impl(
         hidden_states,
@@ -894,6 +896,7 @@ def sm12x_mxfp4_moe_forward_tensorcore(
     ep_rank: int = 0,
     ep_size: int = 1,
     output: torch.Tensor | None = None,
+    intermediate: torch.Tensor | None = None,
     gate_up_buffer: torch.Tensor | None = None,
     intermediate_fp8_buffer: torch.Tensor | None = None,
     intermediate_scale_buffer: torch.Tensor | None = None,
@@ -906,11 +909,20 @@ def sm12x_mxfp4_moe_forward_tensorcore(
     intermediate buffers are float32/float8 as required by the kernels; pass
     ``*_buffer`` to reuse pre-allocated scratch across calls.
 
-    NOTE: this prototype does not yet handle a non-zero ``w2_bias``. Callers
-    that need w2_bias must keep using the warp/scalar path until the W2 bias
-    integration ships (tracked as the next T3-alpha follow-up). Passing a
-    zero-filled ``w2_bias`` is fine and matches the model's initial state.
+    NOTE: this prototype silently ignores ``w2_bias``; the W2 bias fuse is
+    the next T3-alpha follow-up. Callers that ship a model with a non-zero
+    ``w2_bias`` must keep using the warp/scalar path (set
+    ``TOKENSPEED_SM12X_MXFP4_MOE_IMPL=warp``) -- under ``persistent`` the
+    output will diverge from the reference. The check is intentionally not
+    done at call time so this path stays CUDA-graph-capture-safe (no
+    CPU<->GPU sync on a tensor value).
+
+    ``intermediate`` is accepted for signature compatibility with the
+    warp/scalar paths (which use an FP32 intermediate work buffer); the
+    tensorcore path owns its own FP8 intermediate scratch internally and
+    silently ignores any value passed here.
     """
+    del intermediate, w2_bias
     if hidden_states.dim() != 2:
         raise ValueError(f"hidden_states must be 2-D, got {hidden_states.dim()}")
     if topk_ids.shape != topk_weights.shape:
@@ -920,11 +932,6 @@ def sm12x_mxfp4_moe_forward_tensorcore(
         )
     if activation not in {"silu", "swiglu"}:
         raise ValueError(f"Unsupported SM12x MXFP4 activation: {activation}")
-    if w2_bias is not None and float(w2_bias.abs().sum().item()) != 0.0:
-        raise NotImplementedError(
-            "sm12x_mxfp4_moe_forward_tensorcore does not yet handle non-zero "
-            "w2_bias; use the warp path until the W2 bias fuse lands."
-        )
 
     num_tokens = hidden_states.shape[0]
     top_k = topk_ids.shape[1]

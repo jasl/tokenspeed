@@ -229,6 +229,11 @@ def test_sm12x_mxfp4_forward_dispatches_warp_impl_by_default(monkeypatch):
 
 @pytest.mark.parametrize("impl", ["tensorcore", "tile4", "grouped_tc"])
 def test_sm12x_mxfp4_forward_rejects_retired_impls(monkeypatch, impl):
+    """The legacy names from rejected SM12x MoE experiments stay rejected.
+
+    The current ``persistent`` impl is intentionally not in this set; it is
+    the production-targeted name for the tensorcore MoE forward.
+    """
     import tokenspeed_kernel.thirdparty.cuda.sm12x_mxfp4 as sm12x_native
 
     hidden_states = torch.zeros(2, 32)
@@ -240,7 +245,10 @@ def test_sm12x_mxfp4_forward_rejects_retired_impls(monkeypatch, impl):
     w2_scale = torch.full((1, 32, 1), 127, dtype=torch.uint8)
 
     monkeypatch.setenv("TOKENSPEED_SM12X_MXFP4_MOE_IMPL", impl)
-    with pytest.raises(ValueError, match="must be 'warp' or 'scalar'"):
+    with pytest.raises(
+        ValueError,
+        match="must be 'warp', 'scalar', or 'persistent'",
+    ):
         sm12x_native.sm12x_mxfp4_moe_forward(
             hidden_states,
             topk_weights,
@@ -250,6 +258,49 @@ def test_sm12x_mxfp4_forward_rejects_retired_impls(monkeypatch, impl):
             w2,
             w2_scale,
         )
+
+
+def test_sm12x_mxfp4_forward_dispatches_persistent_to_tensorcore(monkeypatch):
+    """`TOKENSPEED_SM12X_MXFP4_MOE_IMPL=persistent` routes to the tensorcore path."""
+    import tokenspeed_kernel.thirdparty.cuda.sm12x_mxfp4 as sm12x_native
+
+    monkeypatch.setenv("TOKENSPEED_SM12X_MXFP4_MOE_IMPL", "persistent")
+
+    calls = []
+
+    def fake_tensorcore_forward(*args, **kwargs):
+        calls.append((args, kwargs))
+        return torch.full_like(args[0], 13.0)
+
+    monkeypatch.setattr(
+        sm12x_native,
+        "sm12x_mxfp4_moe_forward_tensorcore",
+        fake_tensorcore_forward,
+    )
+
+    hidden_states = torch.zeros(2, 32)
+    topk_weights = torch.ones(2, 1)
+    topk_ids = torch.zeros(2, 1, dtype=torch.int32)
+    w13 = torch.zeros(1, 64, 16, dtype=torch.uint8)
+    w13_scale = torch.full((1, 64, 1), 127, dtype=torch.uint8)
+    w2 = torch.zeros(1, 32, 16, dtype=torch.uint8)
+    w2_scale = torch.full((1, 32, 1), 127, dtype=torch.uint8)
+
+    actual = sm12x_native.sm12x_mxfp4_moe_forward(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        activation="swiglu",
+        ep_rank=0,
+        ep_size=1,
+    )
+    assert torch.equal(actual, torch.full_like(hidden_states, 13.0))
+    assert len(calls) == 1
+    assert calls[0][1]["ep_rank"] == 0
 
 
 @pytest.mark.skipif(not _has_sm12x(), reason="SM12x CUDA GPU required")
