@@ -702,6 +702,180 @@ def sm12x_mxfp4_moe_w13_tensorcore(
     return out
 
 
+def sm12x_mxfp4_moe_w2_tensorcore(
+    intermediate_fp8: torch.Tensor,
+    intermediate_scale: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_scale: torch.Tensor,
+    *,
+    ep_rank: int = 0,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Tensorcore MoE W2 GEMM (per-pair output, no weighted reduce yet).
+
+    Inputs are FP8 e4m3 post-SwiGLU intermediates (as produced by
+    ``sm12x_mxfp4_swiglu_mxfp8_quantize``) and packed MXFP4 W2 weights. The
+    output is a per-pair float32 tensor ``[num_tokens, top_k, hidden]``; the
+    caller is expected to invoke ``sm12x_mxfp4_moe_weighted_reduce`` to fold
+    in topk_weights and cast back to the model dtype.
+    """
+    if intermediate_fp8.dim() != 2:
+        raise ValueError(f"intermediate_fp8 must be 2-D, got {intermediate_fp8.dim()}")
+    if intermediate_scale.dim() != 2:
+        raise ValueError(
+            f"intermediate_scale must be 2-D, got {intermediate_scale.dim()}"
+        )
+    if topk_ids.dim() != 2:
+        raise ValueError(f"topk_ids must be 2-D, got {topk_ids.dim()}")
+    if w2_weight.dim() != 3:
+        raise ValueError(f"w2_weight must be 3-D, got {w2_weight.dim()}")
+    if w2_scale.dim() != 3:
+        raise ValueError(f"w2_scale must be 3-D, got {w2_scale.dim()}")
+    if intermediate_fp8.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            "intermediate_fp8 must use float8_e4m3fn, " f"got {intermediate_fp8.dtype}"
+        )
+    if intermediate_scale.dtype != torch.uint8:
+        raise ValueError(
+            f"intermediate_scale must use torch.uint8, "
+            f"got {intermediate_scale.dtype}"
+        )
+    if w2_weight.dtype != torch.uint8:
+        raise ValueError(f"w2_weight must use torch.uint8, got {w2_weight.dtype}")
+    if w2_scale.dtype != torch.uint8:
+        raise ValueError(f"w2_scale must use torch.uint8, got {w2_scale.dtype}")
+    if not intermediate_fp8.is_cuda:
+        raise ValueError("intermediate_fp8 must be a CUDA tensor")
+
+    num_tokens, top_k = topk_ids.shape
+    num_pairs = num_tokens * top_k
+    if intermediate_fp8.shape[0] != num_pairs:
+        raise ValueError(
+            f"intermediate_fp8 first dim {intermediate_fp8.shape[0]} must "
+            f"equal num_tokens*top_k ({num_pairs})"
+        )
+    intermediate = intermediate_fp8.shape[1]
+    num_local_experts, hidden, weight_packed_k = w2_weight.shape
+    if weight_packed_k * 2 != intermediate:
+        raise ValueError(
+            f"w2_weight packed_k {weight_packed_k} must equal intermediate/2"
+            f" ({intermediate // 2})"
+        )
+    if hidden % 16 != 0:
+        raise ValueError(f"hidden must be a multiple of 16, got {hidden}")
+    if intermediate % 32 != 0:
+        raise ValueError(f"intermediate must be a multiple of 32, got {intermediate}")
+    if intermediate_scale.shape != (num_pairs, intermediate // 32):
+        raise ValueError(
+            "intermediate_scale must have shape "
+            f"({num_pairs}, {intermediate // 32}), got "
+            f"{tuple(intermediate_scale.shape)}"
+        )
+    if w2_scale.shape != (num_local_experts, hidden, intermediate // 32):
+        raise ValueError(
+            f"w2_scale must have shape ({num_local_experts}, {hidden}, "
+            f"{intermediate // 32}), got {tuple(w2_scale.shape)}"
+        )
+
+    out_shape = (num_tokens, top_k, hidden)
+    if out is None:
+        out = torch.empty(
+            out_shape, dtype=torch.float32, device=intermediate_fp8.device
+        )
+    else:
+        if out.shape != out_shape:
+            raise ValueError(f"out must have shape {out_shape}, got {tuple(out.shape)}")
+        if out.dtype != torch.float32:
+            raise ValueError(f"out must use torch.float32, got {out.dtype}")
+        if out.device != intermediate_fp8.device:
+            raise ValueError("out must be on the intermediate_fp8 device")
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
+
+    if num_pairs == 0 or hidden == 0:
+        return out
+
+    mod = _load_sm12x_mxfp4_moe_module()
+    mod.sm12x_mxfp4_moe_w2_tensorcore(
+        out,
+        intermediate_fp8.contiguous(),
+        intermediate_scale.contiguous(),
+        topk_ids.to(torch.int32).contiguous(),
+        w2_weight.contiguous(),
+        w2_scale.contiguous(),
+        int(ep_rank),
+    )
+    return out
+
+
+def sm12x_mxfp4_moe_weighted_reduce(
+    per_pair: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Reduce ``[num_tokens, top_k, hidden]`` per-pair outputs with topk_weights.
+
+    Computes ``out[t, c] = sum_k topk_weights[t, k] * per_pair[t, k, c]`` and
+    casts to ``dtype`` (or ``out.dtype`` if ``out`` is provided). The output
+    is the final per-token hidden_dim tensor matching the model dtype.
+    """
+    if per_pair.dim() != 3:
+        raise ValueError(f"per_pair must be 3-D, got {per_pair.dim()}")
+    if topk_weights.dim() != 2:
+        raise ValueError(f"topk_weights must be 2-D, got {topk_weights.dim()}")
+    if per_pair.dtype != torch.float32:
+        raise ValueError(f"per_pair must use torch.float32, got {per_pair.dtype}")
+    if topk_weights.dtype != torch.float32:
+        raise ValueError(
+            f"topk_weights must use torch.float32, got {topk_weights.dtype}"
+        )
+    if not per_pair.is_cuda:
+        raise ValueError("per_pair must be a CUDA tensor")
+
+    num_tokens, top_k, hidden = per_pair.shape
+    if topk_weights.shape != (num_tokens, top_k):
+        raise ValueError(
+            f"topk_weights must have shape ({num_tokens}, {top_k}), "
+            f"got {tuple(topk_weights.shape)}"
+        )
+
+    target_dtype = dtype if out is None else out.dtype
+    if target_dtype is None:
+        target_dtype = torch.bfloat16
+    if target_dtype not in {torch.float32, torch.float16, torch.bfloat16}:
+        raise ValueError(
+            f"output dtype must be float32, float16, or bfloat16, "
+            f"got {target_dtype}"
+        )
+
+    if out is None:
+        out = torch.empty(
+            (num_tokens, hidden), dtype=target_dtype, device=per_pair.device
+        )
+    else:
+        if out.shape != (num_tokens, hidden):
+            raise ValueError(
+                f"out must have shape ({num_tokens}, {hidden}), "
+                f"got {tuple(out.shape)}"
+            )
+        if out.device != per_pair.device:
+            raise ValueError("out must be on the per_pair device")
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
+
+    if num_tokens == 0 or hidden == 0:
+        return out
+
+    mod = _load_sm12x_mxfp4_moe_module()
+    mod.sm12x_mxfp4_moe_weighted_reduce(
+        out, per_pair.contiguous(), topk_weights.contiguous()
+    )
+    return out
+
+
 __all__ = [
     "sm12x_mxfp4_mxfp8_dense",
     "sm12x_mxfp4_mxfp8_mma_tile",
@@ -713,4 +887,6 @@ __all__ = [
     "sm12x_mxfp4_moe_forward_scalar",
     "sm12x_mxfp4_moe_forward_warp",
     "sm12x_mxfp4_moe_w13_tensorcore",
+    "sm12x_mxfp4_moe_w2_tensorcore",
+    "sm12x_mxfp4_moe_weighted_reduce",
 ]

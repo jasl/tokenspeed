@@ -841,6 +841,137 @@ def test_sm12x_mxfp4_moe_w13_tensorcore_filters_non_local_experts():
     assert torch.any(actual[0, 3] != 0.0)
 
 
+def _moe_w2_tensorcore_reference(
+    intermediate_fp8: torch.Tensor,
+    intermediate_scale: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_scale: torch.Tensor,
+    *,
+    ep_rank: int,
+    num_local_experts: int,
+) -> torch.Tensor:
+    """Pure-PyTorch reference for the tensorcore W2 GEMM (per-pair output)."""
+    num_tokens, top_k = topk_ids.shape
+    hidden = w2_weight.shape[1]
+    out = torch.zeros(
+        (num_tokens, top_k, hidden),
+        dtype=torch.float32,
+        device=intermediate_fp8.device,
+    )
+    expert_lo = ep_rank * num_local_experts
+    expert_hi = expert_lo + num_local_experts
+
+    intermediate_f32 = mxfp8_dequantize(intermediate_fp8, intermediate_scale)
+    for token_idx in range(num_tokens):
+        for choice_idx in range(top_k):
+            pair_idx = token_idx * top_k + choice_idx
+            expert_id = int(topk_ids[token_idx, choice_idx])
+            if expert_id < expert_lo or expert_id >= expert_hi:
+                continue
+            local_id = expert_id - expert_lo
+            w = mxfp4_dequantize_packed(
+                w2_weight[local_id : local_id + 1],
+                w2_scale[local_id : local_id + 1],
+            )[0]
+            out[token_idx, choice_idx] = (
+                intermediate_f32[pair_idx].unsqueeze(0).to(torch.float32)
+                @ w.T.to(torch.float32)
+            ).squeeze(0)
+    return out
+
+
+@pytest.mark.skipif(not _has_sm12x(), reason="SM12x CUDA GPU required")
+def test_sm12x_mxfp4_moe_w2_tensorcore_matches_reference_small():
+    """Small-shape correctness: 2 tokens, top_k=4, 8 experts, intermediate=32, hidden=64."""
+    import tokenspeed_kernel.thirdparty.cuda.sm12x_mxfp4 as sm12x_native
+
+    torch.manual_seed(20260516)
+    device = torch.device("cuda")
+    num_tokens = 2
+    top_k = 4
+    num_local_experts = 8
+    intermediate = 32
+    hidden = 64
+
+    intermediate_fp32 = (
+        torch.randn(num_tokens * top_k, intermediate, device=device) * 0.5
+    )
+    intermediate_fp8, intermediate_scale = _quantize_mxfp8_ue8m0(intermediate_fp32)
+
+    topk_ids = torch.tensor(
+        [[0, 3, 1, 5], [2, 7, 4, 6]], dtype=torch.int32, device=device
+    )
+
+    values = torch.tensor([0.0, 0.5, -0.5, 1.0, -1.0, 1.5, -1.5, 2.0], device=device)
+    w2_dense = values[
+        torch.arange(num_local_experts * hidden * intermediate, device=device).reshape(
+            num_local_experts, hidden, intermediate
+        )
+        % values.numel()
+    ].float()
+    w2_weight = _pack_dense(w2_dense)
+    w2_scale = torch.full(
+        (num_local_experts, hidden, intermediate // 32),
+        127,
+        dtype=torch.uint8,
+        device=device,
+    )
+
+    actual = sm12x_native.sm12x_mxfp4_moe_w2_tensorcore(
+        intermediate_fp8,
+        intermediate_scale,
+        topk_ids,
+        w2_weight,
+        w2_scale,
+        ep_rank=0,
+    )
+    expected = _moe_w2_tensorcore_reference(
+        intermediate_fp8,
+        intermediate_scale,
+        topk_ids,
+        w2_weight,
+        w2_scale,
+        ep_rank=0,
+        num_local_experts=num_local_experts,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not _has_sm12x(), reason="SM12x CUDA GPU required")
+def test_sm12x_mxfp4_moe_weighted_reduce_matches_torch():
+    """Weighted reduce: sum top_k contributions weighted by topk_weights."""
+    import tokenspeed_kernel.thirdparty.cuda.sm12x_mxfp4 as sm12x_native
+
+    torch.manual_seed(20260517)
+    device = torch.device("cuda")
+    num_tokens = 4
+    top_k = 6
+    hidden = 192
+    per_pair = torch.randn(num_tokens, top_k, hidden, device=device)
+    topk_weights = torch.rand(num_tokens, top_k, device=device)
+    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+    expected_bf16 = (
+        (topk_weights.unsqueeze(-1) * per_pair).sum(dim=1).to(torch.bfloat16)
+    )
+    actual_bf16 = sm12x_native.sm12x_mxfp4_moe_weighted_reduce(
+        per_pair, topk_weights, dtype=torch.bfloat16
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        actual_bf16.float(), expected_bf16.float(), rtol=1e-3, atol=1e-3
+    )
+
+    # fp32 path: exact match modulo accumulation order.
+    expected_f32 = (topk_weights.unsqueeze(-1) * per_pair).sum(dim=1)
+    actual_f32 = sm12x_native.sm12x_mxfp4_moe_weighted_reduce(
+        per_pair, topk_weights, dtype=torch.float32
+    )
+    torch.testing.assert_close(actual_f32, expected_f32, rtol=1e-5, atol=1e-5)
+
+
 @pytest.mark.skipif(not _has_sm12x(), reason="SM12x CUDA GPU required")
 def test_sm12x_mxfp4_moe_w13_tensorcore_matches_reference_ds4_decode_shape():
     """DSv4-Flash decode shape: 2 tokens, top_k=6, 128 local experts, hidden=4096, gate_up=4096.

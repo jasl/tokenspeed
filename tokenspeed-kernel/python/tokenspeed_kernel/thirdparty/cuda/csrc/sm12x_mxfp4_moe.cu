@@ -1471,6 +1471,164 @@ __global__ void mxfp4_moe_w13_tensorcore_kernel(
 #endif
 }
 
+// Tensorcore W2 GEMM + weighted-scatter for MoE decode.
+//
+// Companion to ``mxfp4_moe_w13_tensorcore_kernel``: per (token, top_k) pair,
+// run the SM120 mxf4xfp8 block-scaled m16n8k32 MMA over the selected expert's
+// W2 weights and the post-SwiGLU FP8 intermediate, then write the per-pair
+// output to a scratch buffer. A separate weighted-reduce kernel finishes the
+// MoE step by summing the top_k contributions with their topk_weights into
+// the final per-token hidden_dim output.
+//
+// Grid: (num_pairs, hidden / 16). Block: 32 threads. The activation tile is
+// padded M=1 -> M=8 with zeros and broadcasts the per-pair ue8m0 scale.
+// Out-of-rank pairs (filtered by ep_rank) write zeros so the downstream
+// reduce sees a stable buffer.
+__global__ void mxfp4_moe_w2_tensorcore_kernel(
+    float* __restrict__ per_pair_out,
+    const uint8_t* __restrict__ intermediate_fp8,
+    const uint8_t* __restrict__ intermediate_scale,
+    const int* __restrict__ topk_ids,
+    const uint8_t* __restrict__ w2_weight,
+    const uint8_t* __restrict__ w2_scale,
+    int num_tokens,
+    int top_k,
+    int intermediate,
+    int hidden,
+    int num_local_experts,
+    int weight_packed_k,
+    int weight_scale_k,
+    int intermediate_scale_k,
+    int ep_rank) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
+  int const pair_idx = blockIdx.x;
+  int const n_tile_idx = blockIdx.y;
+  int const lane = threadIdx.x & (kWarpSize - 1);
+  if (pair_idx >= num_tokens * top_k) {
+    return;
+  }
+  int const n_base = n_tile_idx * 16;
+  int64_t const out_base =
+      static_cast<int64_t>(pair_idx) * static_cast<int64_t>(hidden);
+
+  int const global_expert = topk_ids[pair_idx];
+  int const expert_lo = ep_rank * num_local_experts;
+  int const expert_hi = expert_lo + num_local_experts;
+  bool const local_expert =
+      (global_expert >= expert_lo) && (global_expert < expert_hi);
+
+  int const group_id = lane / 4;
+  int const thread_id = lane % 4;
+
+  if (!local_expert) {
+    if (thread_id == 0) {
+      int const row0 = n_base + group_id;
+      int const row1 = n_base + group_id + 8;
+      per_pair_out[out_base + row0] = 0.0f;
+      per_pair_out[out_base + row1] = 0.0f;
+    }
+    return;
+  }
+  int const local_expert_id = global_expert - expert_lo;
+
+  __shared__ __align__(128) uint8_t smem_a[16 * 32];
+  __shared__ __align__(128) uint8_t smem_b[8 * 32];
+
+  float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+  int64_t const expert_packed_base =
+      static_cast<int64_t>(local_expert_id) * hidden;
+  int64_t const expert_scale_base = expert_packed_base;
+
+  for (int k_block = 0; k_block < intermediate / 32; ++k_block) {
+    for (int i = lane; i < 16 * 32; i += kWarpSize) {
+      int const row = i / 32;
+      int const col = i & 31;
+      uint8_t const packed =
+          w2_weight[(expert_packed_base + n_base + row) * weight_packed_k +
+                    k_block * 16 + col / 2];
+      uint8_t const nibble =
+          (col & 1) ? ((packed >> 4) & 0x0F) : (packed & 0x0F);
+      smem_a[i] = nibble << 2;
+    }
+    int64_t const a_base =
+        static_cast<int64_t>(pair_idx) * intermediate +
+        static_cast<int64_t>(k_block) * 32;
+    for (int i = lane; i < 8 * 32; i += kWarpSize) {
+      int const row = i / 32;
+      int const col = i & 31;
+      smem_b[i] = (row == 0) ? intermediate_fp8[a_base + col] : 0;
+    }
+    __syncwarp();
+
+    uint32_t a_frag[4];
+    uint32_t b_frag[2];
+    int const a_row = (lane & 7) + ((lane >> 3) & 1) * 8;
+    int const a_col = (lane >> 4) * 16;
+    ldmatrix_x4_b16(
+        a_frag[0], a_frag[1], a_frag[2], a_frag[3],
+        smem_a + a_row * 32 + a_col);
+
+    int const b_row = lane & 7;
+    int const b_col = ((lane >> 3) & 1) * 16;
+    ldmatrix_x2_b16(b_frag[0], b_frag[1], smem_b + b_row * 32 + b_col);
+
+    uint8_t const sfa =
+        w2_scale[(expert_scale_base + n_base + group_id +
+                  (thread_id & 1) * 8) *
+                     weight_scale_k +
+                 k_block];
+    uint8_t const sfb =
+        intermediate_scale[pair_idx * intermediate_scale_k + k_block];
+    sm120_mxfp4_mxfp8_mma(d, a_frag, b_frag, sfa, sfb);
+    __syncwarp();
+  }
+
+  if (thread_id == 0) {
+    int const row0 = n_base + group_id;
+    int const row1 = n_base + group_id + 8;
+    per_pair_out[out_base + row0] = d[0];
+    per_pair_out[out_base + row1] = d[2];
+  }
+#else
+  if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+    per_pair_out[0] = 0.0f;
+  }
+#endif
+}
+
+// Weighted reduce: sum top_k per-pair contributions (each is a row of length
+// `hidden`) into the per-token output, applying topk_weights. The reduce is
+// trivial enough that one warp covers a 32-wide stripe of channels per token;
+// the grid runs num_tokens * cdiv(hidden, kReduceTile) blocks.
+template <typename scalar_t>
+__global__ void moe_weighted_reduce_kernel(
+    scalar_t* __restrict__ output,
+    const float* __restrict__ per_pair,
+    const float* __restrict__ topk_weights,
+    int num_tokens,
+    int top_k,
+    int hidden) {
+  int const token_idx = blockIdx.x;
+  int const stripe = blockIdx.y;
+  int const lane = threadIdx.x & (kWarpSize - 1);
+  int const channel = stripe * kWarpSize + lane;
+  if (token_idx >= num_tokens || channel >= hidden) {
+    return;
+  }
+  float accum = 0.0f;
+  int64_t const pair_base =
+      static_cast<int64_t>(token_idx) * top_k * hidden;
+  for (int k = 0; k < top_k; ++k) {
+    float const w = topk_weights[token_idx * top_k + k];
+    float const v = per_pair[pair_base + static_cast<int64_t>(k) * hidden +
+                              channel];
+    accum += w * v;
+  }
+  output[static_cast<int64_t>(token_idx) * hidden + channel] =
+      static_cast<scalar_t>(accum);
+}
+
 void launch_sm12x_mxfp4_moe_w13_tensorcore(
     TensorView gate_up,
     TensorView hidden_fp8,
@@ -1514,6 +1672,80 @@ void launch_sm12x_mxfp4_moe_w13_tensorcore(
   cudaError_t const status = cudaGetLastError();
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "sm12x_mxfp4_moe_w13_tensorcore launch failed: "
+      << cudaGetErrorString(status);
+}
+
+void launch_sm12x_mxfp4_moe_w2_tensorcore(
+    TensorView per_pair_out,
+    TensorView intermediate_fp8,
+    TensorView intermediate_scale,
+    TensorView topk_ids,
+    TensorView w2_weight,
+    TensorView w2_scale,
+    int ep_rank,
+    cudaStream_t stream) {
+  int const num_tokens = static_cast<int>(topk_ids.size(0));
+  int const top_k = static_cast<int>(topk_ids.size(1));
+  int const num_pairs = num_tokens * top_k;
+  int const intermediate = static_cast<int>(intermediate_fp8.size(1));
+  int const num_local_experts = static_cast<int>(w2_weight.size(0));
+  int const hidden = static_cast<int>(w2_weight.size(1));
+  int const weight_packed_k = static_cast<int>(w2_weight.size(2));
+  int const weight_scale_k = static_cast<int>(w2_scale.size(2));
+  int const intermediate_scale_k = static_cast<int>(intermediate_scale.size(1));
+
+  if (num_pairs == 0 || hidden == 0) {
+    return;
+  }
+
+  dim3 const grid(num_pairs, hidden / 16);
+  mxfp4_moe_w2_tensorcore_kernel<<<grid, kWarpSize, 0, stream>>>(
+      static_cast<float*>(per_pair_out.data_ptr()),
+      static_cast<const uint8_t*>(intermediate_fp8.data_ptr()),
+      static_cast<const uint8_t*>(intermediate_scale.data_ptr()),
+      static_cast<const int*>(topk_ids.data_ptr()),
+      static_cast<const uint8_t*>(w2_weight.data_ptr()),
+      static_cast<const uint8_t*>(w2_scale.data_ptr()),
+      num_tokens,
+      top_k,
+      intermediate,
+      hidden,
+      num_local_experts,
+      weight_packed_k,
+      weight_scale_k,
+      intermediate_scale_k,
+      ep_rank);
+
+  cudaError_t const status = cudaGetLastError();
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "sm12x_mxfp4_moe_w2_tensorcore launch failed: "
+      << cudaGetErrorString(status);
+}
+
+template <typename scalar_t>
+void launch_moe_weighted_reduce(
+    TensorView output,
+    TensorView per_pair,
+    TensorView topk_weights,
+    cudaStream_t stream) {
+  int const num_tokens = static_cast<int>(per_pair.size(0));
+  int const top_k = static_cast<int>(per_pair.size(1));
+  int const hidden = static_cast<int>(per_pair.size(2));
+  if (num_tokens == 0 || hidden == 0) {
+    return;
+  }
+  int const stripes = (hidden + kWarpSize - 1) / kWarpSize;
+  dim3 const grid(num_tokens, stripes);
+  moe_weighted_reduce_kernel<scalar_t><<<grid, kWarpSize, 0, stream>>>(
+      static_cast<scalar_t*>(output.data_ptr()),
+      static_cast<const float*>(per_pair.data_ptr()),
+      static_cast<const float*>(topk_weights.data_ptr()),
+      num_tokens,
+      top_k,
+      hidden);
+  cudaError_t const status = cudaGetLastError();
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "sm12x_mxfp4_moe_weighted_reduce launch failed: "
       << cudaGetErrorString(status);
 }
 
@@ -2208,8 +2440,125 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm12x_mxfp4_moe_forward_warp,
                               sm12x_mxfp4_moe_forward_warp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm12x_mxfp4_moe_forward,
                               sm12x_mxfp4_moe_forward);
+void sm12x_mxfp4_moe_w2_tensorcore(
+    TensorView per_pair_out,
+    TensorView intermediate_fp8,
+    TensorView intermediate_scale,
+    TensorView topk_ids,
+    TensorView w2_weight,
+    TensorView w2_scale,
+    int64_t ep_rank) {
+  CHECK_CUDA(per_pair_out);
+  CHECK_CUDA(intermediate_fp8);
+  CHECK_CUDA(intermediate_scale);
+  CHECK_CUDA(topk_ids);
+  CHECK_CUDA(w2_weight);
+  CHECK_CUDA(w2_scale);
+  CHECK_DEVICE(per_pair_out, intermediate_fp8);
+  CHECK_DEVICE(per_pair_out, intermediate_scale);
+  CHECK_DEVICE(per_pair_out, topk_ids);
+  CHECK_DEVICE(per_pair_out, w2_weight);
+  CHECK_DEVICE(per_pair_out, w2_scale);
+
+  CHECK_DIM(3, per_pair_out);
+  CHECK_DIM(2, intermediate_fp8);
+  CHECK_DIM(2, intermediate_scale);
+  CHECK_DIM(2, topk_ids);
+  CHECK_DIM(3, w2_weight);
+  CHECK_DIM(3, w2_scale);
+
+  TVM_FFI_ICHECK(per_pair_out.IsContiguous()) << "per_pair_out must be contiguous";
+  TVM_FFI_ICHECK(intermediate_fp8.IsContiguous())
+      << "intermediate_fp8 must be contiguous";
+  TVM_FFI_ICHECK(intermediate_scale.IsContiguous())
+      << "intermediate_scale must be contiguous";
+  TVM_FFI_ICHECK(topk_ids.IsContiguous()) << "topk_ids must be contiguous";
+  TVM_FFI_ICHECK(w2_weight.IsContiguous()) << "w2_weight must be contiguous";
+  TVM_FFI_ICHECK(w2_scale.IsContiguous()) << "w2_scale must be contiguous";
+
+  TVM_FFI_ICHECK_EQ(per_pair_out.dtype(), dl_float32);
+  TVM_FFI_ICHECK_EQ(intermediate_fp8.dtype(), dl_float8_e4m3fn);
+  TVM_FFI_ICHECK_EQ(intermediate_scale.dtype(), dl_uint8);
+  TVM_FFI_ICHECK_EQ(topk_ids.dtype(), dl_int32);
+  TVM_FFI_ICHECK_EQ(w2_weight.dtype(), dl_uint8);
+  TVM_FFI_ICHECK_EQ(w2_scale.dtype(), dl_uint8);
+
+  int const num_tokens = static_cast<int>(topk_ids.size(0));
+  int const top_k = static_cast<int>(topk_ids.size(1));
+  int const num_pairs = num_tokens * top_k;
+  int const intermediate = static_cast<int>(intermediate_fp8.size(1));
+  int const num_local_experts = static_cast<int>(w2_weight.size(0));
+  int const hidden = static_cast<int>(w2_weight.size(1));
+
+  TVM_FFI_ICHECK_EQ(intermediate_fp8.size(0), num_pairs);
+  TVM_FFI_ICHECK_EQ(intermediate_scale.size(0), num_pairs);
+  TVM_FFI_ICHECK_EQ(per_pair_out.size(0), num_tokens);
+  TVM_FFI_ICHECK_EQ(per_pair_out.size(1), top_k);
+  TVM_FFI_ICHECK_EQ(per_pair_out.size(2), hidden);
+  TVM_FFI_ICHECK_EQ(w2_scale.size(0), num_local_experts);
+  TVM_FFI_ICHECK_EQ(w2_scale.size(1), hidden);
+  TVM_FFI_ICHECK_EQ(w2_weight.size(2), intermediate / 2);
+  TVM_FFI_ICHECK_EQ(w2_scale.size(2), intermediate / kMxfp4Block);
+  TVM_FFI_ICHECK_EQ(intermediate_scale.size(1), intermediate / kMxfp4Block);
+  TVM_FFI_ICHECK_EQ(intermediate % kMxfp4Block, 0);
+  TVM_FFI_ICHECK_EQ(hidden % 16, 0);
+  TVM_FFI_ICHECK_GE(ep_rank, 0);
+
+  cudaSetDevice(per_pair_out.device().device_id);
+  cudaStream_t const stream = get_stream(per_pair_out.device());
+  launch_sm12x_mxfp4_moe_w2_tensorcore(
+      per_pair_out, intermediate_fp8, intermediate_scale, topk_ids, w2_weight,
+      w2_scale, static_cast<int>(ep_rank), stream);
+}
+
+void sm12x_mxfp4_moe_weighted_reduce(
+    TensorView output,
+    TensorView per_pair,
+    TensorView topk_weights) {
+  CHECK_CUDA(output);
+  CHECK_CUDA(per_pair);
+  CHECK_CUDA(topk_weights);
+  CHECK_DEVICE(output, per_pair);
+  CHECK_DEVICE(output, topk_weights);
+  CHECK_DIM(2, output);
+  CHECK_DIM(3, per_pair);
+  CHECK_DIM(2, topk_weights);
+  TVM_FFI_ICHECK(output.IsContiguous()) << "output must be contiguous";
+  TVM_FFI_ICHECK(per_pair.IsContiguous()) << "per_pair must be contiguous";
+  TVM_FFI_ICHECK(topk_weights.IsContiguous())
+      << "topk_weights must be contiguous";
+  TVM_FFI_ICHECK_EQ(per_pair.dtype(), dl_float32);
+  TVM_FFI_ICHECK_EQ(topk_weights.dtype(), dl_float32);
+
+  int const num_tokens = static_cast<int>(per_pair.size(0));
+  int const top_k = static_cast<int>(per_pair.size(1));
+  int const hidden = static_cast<int>(per_pair.size(2));
+  TVM_FFI_ICHECK_EQ(output.size(0), num_tokens);
+  TVM_FFI_ICHECK_EQ(output.size(1), hidden);
+  TVM_FFI_ICHECK_EQ(topk_weights.size(0), num_tokens);
+  TVM_FFI_ICHECK_EQ(topk_weights.size(1), top_k);
+
+  cudaSetDevice(output.device().device_id);
+  cudaStream_t const stream = get_stream(output.device());
+  if (output.dtype() == dl_float32) {
+    launch_moe_weighted_reduce<float>(output, per_pair, topk_weights, stream);
+  } else if (output.dtype() == dl_float16) {
+    launch_moe_weighted_reduce<half>(output, per_pair, topk_weights, stream);
+  } else if (output.dtype() == dl_bfloat16) {
+    launch_moe_weighted_reduce<nv_bfloat16>(
+        output, per_pair, topk_weights, stream);
+  } else {
+    TVM_FFI_ICHECK(false)
+        << "output dtype must be float32, float16, or bfloat16";
+  }
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm12x_mxfp4_moe_w13_tensorcore,
                               sm12x_mxfp4_moe_w13_tensorcore);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm12x_mxfp4_moe_w2_tensorcore,
+                              sm12x_mxfp4_moe_w2_tensorcore);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm12x_mxfp4_moe_weighted_reduce,
+                              sm12x_mxfp4_moe_weighted_reduce);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm12x_mxfp4_mxfp8_quantize,
                               sm12x_mxfp4_mxfp8_quantize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm12x_mxfp4_swiglu_mxfp8_quantize,
