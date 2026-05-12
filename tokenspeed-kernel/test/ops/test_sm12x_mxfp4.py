@@ -973,6 +973,93 @@ def test_sm12x_mxfp4_moe_weighted_reduce_matches_torch():
 
 
 @pytest.mark.skipif(not _has_sm12x(), reason="SM12x CUDA GPU required")
+def test_sm12x_mxfp4_moe_forward_tensorcore_matches_warp_zero_bias():
+    """End-to-end tensorcore forward vs warp baseline at DSv4-Flash decode shape.
+
+    Uses zero w13/w2 biases since the tensorcore prototype does not yet fuse
+    in a non-zero w2_bias. Comparison tolerance is loose to allow for FP4
+    quant + tensorcore FP32 accumulation differences vs the warp's scalar
+    dequant + manual GEMV path.
+    """
+    import tokenspeed_kernel.ops.moe.sm12x_mxfp4 as sm12x_mxfp4
+
+    torch.manual_seed(20260518)
+    device = torch.device("cuda")
+    num_tokens = 2
+    top_k = 6
+    num_local_experts = 8
+    hidden = 4096
+    intermediate = 2048
+
+    hidden_states = (
+        torch.randn(num_tokens, hidden, dtype=torch.float32, device=device) * 0.01
+    ).to(torch.bfloat16)
+    topk_weights = torch.rand(num_tokens, top_k, dtype=torch.float32, device=device)
+    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    topk_ids = torch.randint(
+        0, num_local_experts, (num_tokens, top_k), dtype=torch.int32, device=device
+    )
+
+    w13_weight = torch.randint(
+        0,
+        256,
+        (num_local_experts, 2 * intermediate, hidden // 2),
+        dtype=torch.uint8,
+        device=device,
+    )
+    w13_scale = torch.full(
+        (num_local_experts, 2 * intermediate, hidden // 32),
+        120,
+        dtype=torch.uint8,
+        device=device,
+    )
+    w2_weight = torch.randint(
+        0,
+        256,
+        (num_local_experts, hidden, intermediate // 2),
+        dtype=torch.uint8,
+        device=device,
+    )
+    w2_scale = torch.full(
+        (num_local_experts, hidden, intermediate // 32),
+        120,
+        dtype=torch.uint8,
+        device=device,
+    )
+
+    warp_out = sm12x_mxfp4.sm12x_mxfp4_moe_forward_warp(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        w13_weight,
+        w13_scale,
+        w2_weight,
+        w2_scale,
+        activation="swiglu",
+        swiglu_alpha=1.702,
+        swiglu_limit=7.0,
+        ep_rank=0,
+        ep_size=1,
+    )
+    tc_out = sm12x_mxfp4.sm12x_mxfp4_moe_forward_tensorcore(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        w13_weight,
+        w13_scale,
+        w2_weight,
+        w2_scale,
+        activation="swiglu",
+        swiglu_alpha=1.702,
+        swiglu_limit=7.0,
+        ep_rank=0,
+        ep_size=1,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(tc_out.float(), warp_out.float(), rtol=5e-2, atol=5e-2)
+
+
+@pytest.mark.skipif(not _has_sm12x(), reason="SM12x CUDA GPU required")
 def test_sm12x_mxfp4_moe_w13_tensorcore_matches_reference_ds4_decode_shape():
     """DSv4-Flash decode shape: 2 tokens, top_k=6, 128 local experts, hidden=4096, gate_up=4096.
 

@@ -876,6 +876,167 @@ def sm12x_mxfp4_moe_weighted_reduce(
     return out
 
 
+def sm12x_mxfp4_moe_forward_tensorcore(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_scale: torch.Tensor,
+    *,
+    w13_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
+    activation: str = "swiglu",
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
+    swiglu_beta: float | None = None,
+    ep_rank: int = 0,
+    ep_size: int = 1,
+    output: torch.Tensor | None = None,
+    gate_up_buffer: torch.Tensor | None = None,
+    intermediate_fp8_buffer: torch.Tensor | None = None,
+    intermediate_scale_buffer: torch.Tensor | None = None,
+    per_pair_buffer: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Tensorcore MoE forward: quantize -> W13 -> SwiGLU+quantize -> W2 -> reduce.
+
+    Wires the four tensorcore building blocks into a single MoE step. The
+    output dtype matches ``hidden_states.dtype`` (typically bfloat16). All
+    intermediate buffers are float32/float8 as required by the kernels; pass
+    ``*_buffer`` to reuse pre-allocated scratch across calls.
+
+    NOTE: this prototype does not yet handle a non-zero ``w2_bias``. Callers
+    that need w2_bias must keep using the warp/scalar path until the W2 bias
+    integration ships (tracked as the next T3-alpha follow-up). Passing a
+    zero-filled ``w2_bias`` is fine and matches the model's initial state.
+    """
+    if hidden_states.dim() != 2:
+        raise ValueError(f"hidden_states must be 2-D, got {hidden_states.dim()}")
+    if topk_ids.shape != topk_weights.shape:
+        raise ValueError(
+            f"topk_ids shape {tuple(topk_ids.shape)} must match topk_weights"
+            f" shape {tuple(topk_weights.shape)}"
+        )
+    if activation not in {"silu", "swiglu"}:
+        raise ValueError(f"Unsupported SM12x MXFP4 activation: {activation}")
+    if w2_bias is not None and float(w2_bias.abs().sum().item()) != 0.0:
+        raise NotImplementedError(
+            "sm12x_mxfp4_moe_forward_tensorcore does not yet handle non-zero "
+            "w2_bias; use the warp path until the W2 bias fuse lands."
+        )
+
+    num_tokens = hidden_states.shape[0]
+    top_k = topk_ids.shape[1]
+    if num_tokens == 0:
+        if output is None:
+            return torch.empty_like(hidden_states)
+        return output
+
+    num_local_experts = w13_weight.shape[0]
+    gate_up_dim = w13_weight.shape[1]
+    intermediate_size = w2_weight.shape[2] * 2
+    hidden_dim = hidden_states.shape[1]
+
+    topk_weights = topk_weights.to(torch.float32).contiguous()
+    topk_ids = topk_ids.to(torch.int32).contiguous()
+
+    # Step 1: quantize hidden_states to FP8 + ue8m0 scales.
+    hidden_fp8, hidden_scale = sm12x_mxfp4_mxfp8_quantize(hidden_states)
+
+    # Step 2: W13 tensorcore GEMM.
+    gate_up_shape = (num_tokens, top_k, gate_up_dim)
+    if gate_up_buffer is None:
+        gate_up_buffer = torch.empty(
+            gate_up_shape, dtype=torch.float32, device=hidden_states.device
+        )
+    else:
+        gate_up_buffer = _validate_work_buffer(
+            "gate_up_buffer",
+            gate_up_buffer,
+            shape=gate_up_shape,
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+    sm12x_mxfp4_moe_w13_tensorcore(
+        hidden_fp8,
+        hidden_scale,
+        topk_ids,
+        w13_weight,
+        w13_scale,
+        ep_rank=ep_rank,
+        out=gate_up_buffer,
+    )
+
+    # Step 3: SwiGLU + bias + quantize to FP8 intermediate. The swiglu helper
+    # expects [rows, gate_up_width] with a per-row expert id used for the
+    # w13_bias lookup. Map global ids to local; non-local pairs already wrote
+    # zero gate_up so any bias addition is harmless (gate=up=0 -> SwiGLU=0).
+    expert_pair_ids = (topk_ids - ep_rank * num_local_experts).view(-1)
+    if w13_bias is None:
+        w13_bias_arg: torch.Tensor | None = None
+    else:
+        if w13_bias.dim() != 2:
+            raise ValueError(f"w13_bias must be 2-D, got {w13_bias.dim()}")
+        if w13_bias.shape != (num_local_experts, gate_up_dim):
+            raise ValueError(
+                f"w13_bias must have shape ({num_local_experts}, {gate_up_dim}),"
+                f" got {tuple(w13_bias.shape)}"
+            )
+        w13_bias_arg = w13_bias.to(torch.float32).contiguous()
+    intermediate_fp8, intermediate_scale = sm12x_mxfp4_swiglu_mxfp8_quantize(
+        gate_up_buffer.view(num_tokens * top_k, gate_up_dim),
+        expert_pair_ids.clamp_min(0).clamp_max(num_local_experts - 1),
+        w13_bias=w13_bias_arg,
+        activation=activation,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_limit=swiglu_limit,
+        swiglu_beta=swiglu_beta,
+    )
+
+    # Step 4: W2 tensorcore GEMM (per-pair output).
+    per_pair_shape = (num_tokens, top_k, hidden_dim)
+    if per_pair_buffer is None:
+        per_pair_buffer = torch.empty(
+            per_pair_shape, dtype=torch.float32, device=hidden_states.device
+        )
+    else:
+        per_pair_buffer = _validate_work_buffer(
+            "per_pair_buffer",
+            per_pair_buffer,
+            shape=per_pair_shape,
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+    sm12x_mxfp4_moe_w2_tensorcore(
+        intermediate_fp8,
+        intermediate_scale,
+        topk_ids,
+        w2_weight,
+        w2_scale,
+        ep_rank=ep_rank,
+        out=per_pair_buffer,
+    )
+
+    # Step 5: weighted reduce over top_k -> [num_tokens, hidden_dim].
+    if output is None:
+        output = torch.empty(
+            (num_tokens, hidden_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+    else:
+        output = _validate_work_buffer(
+            "output",
+            output,
+            shape=(num_tokens, hidden_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+    sm12x_mxfp4_moe_weighted_reduce(per_pair_buffer, topk_weights, out=output)
+    return output
+
+
 __all__ = [
     "sm12x_mxfp4_mxfp8_dense",
     "sm12x_mxfp4_mxfp8_mma_tile",
@@ -886,6 +1047,7 @@ __all__ = [
     "sm12x_mxfp4_moe_forward",
     "sm12x_mxfp4_moe_forward_scalar",
     "sm12x_mxfp4_moe_forward_warp",
+    "sm12x_mxfp4_moe_forward_tensorcore",
     "sm12x_mxfp4_moe_w13_tensorcore",
     "sm12x_mxfp4_moe_w2_tensorcore",
     "sm12x_mxfp4_moe_weighted_reduce",
