@@ -371,13 +371,64 @@ fresh benchmark.
   Triton's 16 MB (whose `BLOCK_TOKENS=16` tile shares one weight load
   across all tokens in the tile).
 - Decision: this design ships **only** as a single-stream (tokens==1)
-  specialization while the proper tile-based replacement is built. The
-  replacement uses grid `(out_dim, ceil(num_tokens/B_TOKEN), num_groups)`
-  with `B_TOKEN=16`, per-thread `B_TOKEN`-wide accumulators, and a single
-  weight read amortized across the token tile -- the Triton schedule,
-  reimplemented in CUDA. Anti-pattern guard for future CUDA GEMV kernels
-  with batched M dimension on SM12x: a kernel whose grid contains the
-  batched-M dimension as a parallel axis (one block per row) cannot win
-  against any tile design that shares weights across the batch -- never
-  treat per-row launches as an acceptable starting design when `M` can
-  exceed 1 in production.
+  specialization (hotfix `aff5c53`). The intended successor was a tile
+  variant with per-thread `B_TOKEN=16` accumulators -- recorded as a
+  separate rejected experiment below. Anti-pattern guard for future CUDA
+  GEMV kernels with batched M dimension on SM12x: a kernel whose grid
+  contains the batched-M dimension as a parallel axis (one block per row)
+  cannot win against any tile design that shares weights across the
+  batch -- never treat per-row launches as an acceptable starting design
+  when `M` can exceed 1 in production.
+
+## DSv4 Output Projection FP8 GEMV: per-thread B_TOKEN=16 accumulator tile
+
+- Date: 2026-05-13.
+- Attempt: replace the rejected one-cell-per-block design with a tile
+  variant `deepseek_v4_grouped_fp8_gemv_tile_kernel` that holds a
+  `B_TOKEN=16`-wide fp32 accumulator array per thread and amortizes the
+  wo_a weight read across the entire token tile. Inner loop unrolled with
+  `if (t < num_tokens)` masks for partial tiles / single-stream decodes.
+  Grid `(out_dim, ceil(num_tokens / 16), num_groups)`. Final reduction
+  uses a `partials[16][4]` shared scratch + per-token shuffles. Working
+  tree (uncommitted) on `codex/ds4-sm12x-poc` rebuilt on top of
+  `aff5c53`.
+- Evidence: focused projection tests passed (9/9). The decode-shape
+  microbench regressed at every token count:
+
+  | tokens | tile B=16 mean | Triton mean | tile B=16 / Triton |
+  |--------|----------------|-------------|--------------------|
+  | 1      | 0.096 ms       | 0.020 ms    | 0.21x ✗            |
+  | 2      | 0.098 ms       | 0.021 ms    | 0.21x ✗            |
+  | 8      | 0.169 ms       | 0.020 ms    | 0.12x ✗            |
+
+  This is 6x slower at tokens=1 than the previous one-cell-per-block
+  variant (0.016 ms), even where the tile shape has no compute waste --
+  pure overhead. Workstation log:
+  `<remote-workspace>/tokenspeed_t1_gamma_phase2_microbench_20260513_*.log`.
+- Root cause: `cuobjdump --dump-resource-usage` reports the tile kernel
+  uses **80 registers per thread**. With 128 threads per block that is
+  10240 registers per block; on RTX PRO 6000 Blackwell (65 536 registers
+  per SM), only 6 blocks fit per SM, capping resident threads at 768 of
+  the 2048 max -- ~37.5% theoretical occupancy. The 16-fp32 per-thread
+  accumulator array dominates the register pressure; the compiler keeps
+  all sixteen slots live across the entire k-block loop even when only
+  one slot ever receives a write (the `if (t < num_tokens)` mask cannot
+  prove the others dead at compile time).
+- Decision: revert. The per-thread accumulator tile model is not viable
+  on Blackwell at `B_TOKEN=16`. The viable replacement designs are
+  either (a) per-`B_TOKEN` kernel template specializations
+  (`__device__` kernel templated on `B`, instantiate for 1 / 2 / 4 / 8
+  / 16, wrapper dispatches based on `num_tokens`) so each instance has
+  exactly as many live accumulators as it actually needs; or (b) a true
+  cooperative tile (Triton-style) using shared-memory weight + activation
+  staging with cross-thread accumulation, which keeps each thread's
+  register footprint small but adds shared-memory traffic and reduction
+  complexity. Both options are deferred R&D items, not session-scoped
+  fixes.
+- Anti-pattern guard: any per-thread accumulator array of size >= 8 with
+  unrolled-with-mask population on a kernel that already pressures
+  registers (>= 32 regs/thread baseline) needs an explicit
+  `cuobjdump --dump-resource-usage` check before microbench, or
+  splitting into template-specialized smaller `B`. Do not try the same
+  naive per-thread accumulator design again -- the failure mode is
+  occupancy collapse on Blackwell, not algorithmic.
