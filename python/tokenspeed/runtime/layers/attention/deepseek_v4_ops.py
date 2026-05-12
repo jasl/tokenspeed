@@ -2103,7 +2103,13 @@ def read_deepseek_v4_indexer_fp8_cache(
     slot_mapping: torch.Tensor,
     block_size: int = 64,
 ) -> torch.Tensor:
-    """Dequantize FP8 indexer cache rows selected by `slot_mapping`."""
+    """Dequantize FP8 indexer cache rows selected by `slot_mapping`.
+
+    Vectorised over all slots so the implementation is safe under
+    CUDA-graph capture: there is no `.tolist()` or Python-level loop, and
+    invalid slots (`slot < 0`) are zeroed via a final mask rather than a
+    Python ``continue`` branch.
+    """
 
     min_stride = block_size * (DEEPSEEK_V4_INDEXER_DIM + 4)
     if cache_2d.dtype != torch.uint8:
@@ -2113,28 +2119,40 @@ def read_deepseek_v4_indexer_fp8_cache(
             f"cache_2d must be [pages, >= {min_stride}], got {tuple(cache_2d.shape)}"
         )
 
-    out = torch.zeros(
-        slot_mapping.numel(),
-        DEEPSEEK_V4_INDEXER_DIM,
-        device=cache_2d.device,
-        dtype=torch.float32,
-    )
+    out_shape = (slot_mapping.numel(), DEEPSEEK_V4_INDEXER_DIM)
+    if slot_mapping.numel() == 0:
+        return torch.zeros(out_shape, device=cache_2d.device, dtype=torch.float32)
+
     flat_cache = cache_2d.reshape(-1)
-    for token_idx, raw_slot in enumerate(slot_mapping.tolist()):
-        slot = int(raw_slot)
-        if slot < 0:
-            continue
-        page = slot // block_size
-        pos = slot % block_size
-        page_base = page * cache_2d.stride(0)
-        value_base = page_base + pos * DEEPSEEK_V4_INDEXER_DIM
-        scale_base = page_base + block_size * DEEPSEEK_V4_INDEXER_DIM + pos * 4
-        scale = flat_cache[scale_base : scale_base + 4].view(torch.float32)[0]
-        values = flat_cache[value_base : value_base + DEEPSEEK_V4_INDEXER_DIM].view(
-            torch.float8_e4m3fn
-        )
-        out[token_idx].copy_(values.float() * scale)
-    return out
+    slots = slot_mapping.to(torch.int64)
+    valid = slots >= 0
+    safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
+    pages = torch.div(safe_slots, block_size, rounding_mode="floor")
+    pos = safe_slots % block_size
+    page_base = pages * cache_2d.stride(0)
+    value_base = page_base + pos * DEEPSEEK_V4_INDEXER_DIM
+    scale_base = page_base + block_size * DEEPSEEK_V4_INDEXER_DIM + pos * 4
+
+    value_offsets = (
+        value_base[:, None]
+        + torch.arange(
+            DEEPSEEK_V4_INDEXER_DIM,
+            device=cache_2d.device,
+            dtype=torch.int64,
+        )[None, :]
+    )
+    fp8_bytes = flat_cache[value_offsets]
+    values = fp8_bytes.view(torch.float8_e4m3fn).float()
+
+    scale_offsets = (
+        scale_base[:, None]
+        + torch.arange(4, device=cache_2d.device, dtype=torch.int64)[None, :]
+    )
+    scale_bytes = flat_cache[scale_offsets].contiguous()
+    scale = scale_bytes.view(torch.float32).squeeze(-1)
+
+    out = values * scale[:, None]
+    return torch.where(valid[:, None], out, torch.zeros_like(out))
 
 
 @triton.jit
