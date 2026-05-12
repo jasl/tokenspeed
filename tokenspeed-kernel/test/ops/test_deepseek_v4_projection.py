@@ -92,58 +92,6 @@ def _fp8_quant_reference(
     return quantized.reshape_as(values).contiguous(), scale.contiguous()
 
 
-@pytest.mark.skipif(not _has_sm12x(), reason="SM12x CUDA GPU required")
-def test_deepseek_v4_fused_inv_rope_fp8_quant_matches_reference():
-    from tokenspeed_kernel.ops.attention.deepseek_v4 import (
-        deepseek_v4_fused_inv_rope_fp8_quant_triton,
-    )
-
-    torch.manual_seed(20260509)
-    tokens = 3
-    n_groups = 2
-    heads_per_group = 2
-    nope_dim = 448
-    rope_dim = 64
-    head_dim = nope_dim + rope_dim
-    max_position = 32
-    positions = torch.tensor([1, 7, 17], device="cuda", dtype=torch.int64)
-    theta = torch.randn(max_position, rope_dim // 2, device="cuda", dtype=torch.float32)
-    cos_sin_cache = torch.cat([torch.cos(theta), torch.sin(theta)], dim=-1)
-    o = torch.randn(
-        tokens,
-        n_groups * heads_per_group,
-        head_dim,
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
-
-    actual_fp8, actual_scale = deepseek_v4_fused_inv_rope_fp8_quant_triton(
-        o,
-        positions,
-        cos_sin_cache,
-        n_groups=n_groups,
-        heads_per_group=heads_per_group,
-        nope_dim=nope_dim,
-        rope_dim=rope_dim,
-    )
-    grouped = _inverse_rope_grouped_reference(
-        o,
-        positions,
-        cos_sin_cache,
-        n_groups=n_groups,
-        heads_per_group=heads_per_group,
-        nope_dim=nope_dim,
-        rope_dim=rope_dim,
-    )
-    expected_fp8, expected_scale = _fp8_quant_reference(grouped)
-
-    torch.cuda.synchronize()
-    assert actual_fp8.shape == expected_fp8.shape
-    assert actual_scale.shape == expected_scale.shape
-    torch.testing.assert_close(actual_scale, expected_scale, rtol=0, atol=0)
-    torch.testing.assert_close(actual_fp8.float(), expected_fp8.float(), rtol=0, atol=0)
-
-
 def _make_inv_rope_inputs(
     *,
     tokens: int,
@@ -221,57 +169,6 @@ def test_deepseek_v4_fused_inv_rope_fp8_quant_cuda_matches_reference(tokens):
     not _cuda_inv_rope_quant_available(),
     reason="SM12x CUDA inv-rope+quant required",
 )
-@pytest.mark.parametrize("tokens", [1, 2, 4, 8, 16])
-def test_deepseek_v4_fused_inv_rope_fp8_quant_cuda_matches_triton(tokens):
-    """CUDA and Triton implementations must produce byte-exact output.
-
-    The dispatcher swaps between them based on env (build availability /
-    launch failure recovery); the downstream einsum walks identical
-    strides either way, so any drift would silently corrupt decoded
-    tokens after the fallback. Use exact equality.
-    """
-    from tokenspeed_kernel.ops.attention.deepseek_v4 import (
-        deepseek_v4_fused_inv_rope_fp8_quant_sm12x_cuda,
-        deepseek_v4_fused_inv_rope_fp8_quant_triton,
-    )
-
-    if deepseek_v4_fused_inv_rope_fp8_quant_triton is None:
-        pytest.skip("Triton sibling unavailable in this environment")
-
-    n_groups = 2
-    heads_per_group = 2
-    o, positions, cos_sin_cache = _make_inv_rope_inputs(
-        tokens=tokens, n_groups=n_groups, heads_per_group=heads_per_group
-    )
-
-    cuda_fp8, cuda_scale = deepseek_v4_fused_inv_rope_fp8_quant_sm12x_cuda(
-        o,
-        positions,
-        cos_sin_cache,
-        n_groups=n_groups,
-        heads_per_group=heads_per_group,
-    )
-    triton_fp8, triton_scale = deepseek_v4_fused_inv_rope_fp8_quant_triton(
-        o,
-        positions,
-        cos_sin_cache,
-        n_groups=n_groups,
-        heads_per_group=heads_per_group,
-    )
-
-    torch.cuda.synchronize()
-    assert cuda_fp8.shape == triton_fp8.shape
-    assert cuda_scale.shape == triton_scale.shape
-    # CUDA-vs-Triton at exact equality: both walk the same UE8M0 ceil-log2
-    # path on the same FP32 intermediate values, so quantised bytes match.
-    torch.testing.assert_close(cuda_scale, triton_scale, rtol=0, atol=0)
-    torch.testing.assert_close(cuda_fp8.float(), triton_fp8.float(), rtol=0, atol=0)
-
-
-@pytest.mark.skipif(
-    not _cuda_inv_rope_quant_available(),
-    reason="SM12x CUDA inv-rope+quant required",
-)
 def test_deepseek_v4_fused_inv_rope_fp8_quant_cuda_handles_zero_tokens():
     from tokenspeed_kernel.ops.attention.deepseek_v4 import (
         deepseek_v4_fused_inv_rope_fp8_quant_sm12x_cuda,
@@ -316,7 +213,6 @@ def test_deepseek_v4_fused_inv_rope_fp8_quant_cuda_decode_microbench(tokens):
     """Decode-shape microbench. Opt-in via env var."""
     from tokenspeed_kernel.ops.attention.deepseek_v4 import (
         deepseek_v4_fused_inv_rope_fp8_quant_sm12x_cuda,
-        deepseek_v4_fused_inv_rope_fp8_quant_triton,
     )
 
     # DSv4-Flash shape: G=8 local groups × heads_per_group=4.
@@ -354,67 +250,6 @@ def test_deepseek_v4_fused_inv_rope_fp8_quant_cuda_decode_microbench(tokens):
         f"[t={tokens}] cuda_inv_rope_quant   min={cuda_min:.3f}ms "
         f"mean={cuda_mean:.3f}ms max={cuda_max:.3f}ms"
     )
-    if deepseek_v4_fused_inv_rope_fp8_quant_triton is not None:
-        tri_min, tri_mean, tri_max = _time(
-            lambda: deepseek_v4_fused_inv_rope_fp8_quant_triton(
-                o,
-                positions,
-                cos_sin_cache,
-                n_groups=n_groups,
-                heads_per_group=heads_per_group,
-            )
-        )
-        print(
-            f"[t={tokens}] triton_inv_rope_quant min={tri_min:.3f}ms "
-            f"mean={tri_mean:.3f}ms max={tri_max:.3f}ms"
-        )
-        print(
-            f"[t={tokens}] speedup mean={tri_mean / cuda_mean:.2f}x "
-            f"min={tri_min / cuda_min:.2f}x"
-        )
-
-
-@pytest.mark.skipif(not _has_sm12x(), reason="SM12x CUDA GPU required")
-def test_deepseek_v4_fp8_einsum_matches_reference():
-    from tokenspeed_kernel.ops.attention.deepseek_v4 import (
-        deepseek_v4_fp8_einsum_sm12x_triton,
-    )
-
-    torch.manual_seed(20260510)
-    tokens = 4
-    groups = 2
-    hidden = 512
-    out_rank = 256
-    a_float = torch.randn(tokens, groups, hidden, device="cuda") * 0.75
-    a, a_scale = _fp8_quant_reference(a_float)
-    b_float = torch.randn(groups * out_rank, hidden, device="cuda") * 0.25
-    b = b_float.to(torch.float8_e4m3fn)
-    b_scale = torch.pow(
-        2.0,
-        torch.ceil(
-            torch.log2(
-                torch.rand(
-                    groups * (out_rank // 128), hidden // 128, device="cuda"
-                ).clamp_min(1.0e-4)
-            )
-        ),
-    ).float()
-    out = torch.empty(tokens, groups, out_rank, device="cuda", dtype=torch.bfloat16)
-
-    deepseek_v4_fp8_einsum_sm12x_triton(a, a_scale, b, b_scale, out)
-
-    a_effective = a.float() * a_scale.repeat_interleave(128, dim=-1)
-    b_scale_view = b_scale.view(groups, out_rank // 128, hidden // 128)
-    b_effective = b.view(groups, out_rank, hidden).float()
-    b_effective = b_effective * b_scale_view.repeat_interleave(
-        128, dim=1
-    ).repeat_interleave(128, dim=2)
-    expected = torch.einsum("tgh,grh->tgr", a_effective, b_effective).to(torch.bfloat16)
-
-    torch.cuda.synchronize()
-    assert out.shape == expected.shape
-    assert out.dtype == torch.bfloat16
-    torch.testing.assert_close(out.float(), expected.float(), rtol=2e-2, atol=0.5)
 
 
 def _make_einsum_inputs(
@@ -432,7 +267,7 @@ def _make_einsum_inputs(
 
     When ``transpose_activation`` is True, returns ``a`` / ``a_scale`` as
     non-contiguous views laid out as ``[groups, tokens, ...]`` and transposed
-    to ``[tokens, groups, ...]`` -- this matches the buffer the Triton fused
+    to ``[tokens, groups, ...]`` -- this matches the buffer the fused
     inverse-RoPE + FP8 quant kernel emits at runtime.
     """
     torch.manual_seed(seed)
@@ -521,7 +356,7 @@ def test_deepseek_v4_fp8_einsum_cuda_matches_reference():
 
 @pytest.mark.skipif(not _cuda_einsum_available(), reason="SM12x CUDA einsum required")
 def test_deepseek_v4_fp8_einsum_cuda_handles_strided_activation():
-    """The Triton inverse-RoPE + quant kernel returns non-contig [T, G, ...]
+    """The fused inverse-RoPE + quant kernel returns non-contig [T, G, ...]
     views over [G, T, ...] storage; the CUDA einsum must agree."""
     from tokenspeed_kernel.ops.attention.deepseek_v4 import (
         deepseek_v4_fp8_einsum_sm12x_cuda,
@@ -592,51 +427,6 @@ def test_deepseek_v4_fp8_einsum_cuda_accepts_ue8m0_weight_scales():
     torch.testing.assert_close(out.float(), expected.float(), rtol=2e-2, atol=0.5)
 
 
-@pytest.mark.skipif(
-    not (_cuda_einsum_available() and _has_sm12x()),
-    reason="CUDA + Triton einsum both required",
-)
-@pytest.mark.parametrize("tokens", [1, 2, 8])
-def test_deepseek_v4_fp8_einsum_cuda_matches_triton_at_decode_shape(tokens):
-    """At the DSv4-Flash decode shape the CUDA path must agree with Triton
-    within FP8 quant noise (rtol=2e-2, atol=0.5 -- same as the reference test)."""
-    from tokenspeed_kernel.ops.attention.deepseek_v4 import (
-        deepseek_v4_fp8_einsum_sm12x_cuda,
-        deepseek_v4_fp8_einsum_sm12x_triton,
-    )
-
-    if deepseek_v4_fp8_einsum_sm12x_triton is None:
-        pytest.skip("Triton einsum unavailable in this environment")
-
-    groups = 8
-    hidden = 2048
-    out_rank = 1024
-    a, a_scale, b, b_scale, _ = _make_einsum_inputs(
-        tokens=tokens,
-        groups=groups,
-        hidden=hidden,
-        out_rank=out_rank,
-        transpose_activation=True,
-    )
-
-    out_cuda = torch.empty(
-        tokens, groups, out_rank, device="cuda", dtype=torch.bfloat16
-    )
-    out_triton = torch.empty_like(out_cuda)
-    deepseek_v4_fp8_einsum_sm12x_cuda(a, a_scale, b, b_scale, out_cuda)
-    deepseek_v4_fp8_einsum_sm12x_triton(a, a_scale, b, b_scale, out_triton)
-
-    torch.cuda.synchronize()
-    # Both implementations share an FP8 quant origin; the residual gap is the
-    # FMA-ordering difference between the two reduction schedules (Triton
-    # block-dot vs CUDA scalar-accumulate). At hidden=2048 the bf16 output
-    # magnitude can reach ~1e2, where bf16 ULP is ~0.4, so a few-ULP slack is
-    # expected.
-    torch.testing.assert_close(
-        out_cuda.float(), out_triton.float(), rtol=5e-3, atol=0.2
-    )
-
-
 @pytest.mark.skipif(not _cuda_einsum_available(), reason="SM12x CUDA einsum required")
 def test_deepseek_v4_fp8_einsum_cuda_handles_zero_tokens():
     from tokenspeed_kernel.ops.attention.deepseek_v4 import (
@@ -671,7 +461,6 @@ def test_deepseek_v4_fp8_einsum_cuda_decode_microbench(tokens):
     """
     from tokenspeed_kernel.ops.attention.deepseek_v4 import (
         deepseek_v4_fp8_einsum_sm12x_cuda,
-        deepseek_v4_fp8_einsum_sm12x_triton,
     )
 
     groups = 8
@@ -708,16 +497,3 @@ def test_deepseek_v4_fp8_einsum_cuda_decode_microbench(tokens):
         f"[t={tokens}] cuda_einsum   min={cuda_min:.3f}ms "
         f"mean={cuda_mean:.3f}ms max={cuda_max:.3f}ms"
     )
-
-    if deepseek_v4_fp8_einsum_sm12x_triton is not None:
-        tri_min, tri_mean, tri_max = _time(
-            lambda: deepseek_v4_fp8_einsum_sm12x_triton(a, a_scale, b, b_scale, out)
-        )
-        print(
-            f"[t={tokens}] triton_einsum min={tri_min:.3f}ms "
-            f"mean={tri_mean:.3f}ms max={tri_max:.3f}ms"
-        )
-        print(
-            f"[t={tokens}] speedup mean={tri_mean / cuda_mean:.2f}x "
-            f"min={tri_min / cuda_min:.2f}x"
-        )

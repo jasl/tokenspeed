@@ -25,8 +25,9 @@ Two ops are exported by the underlying ``.so``:
 - :func:`sm12x_deepseek_v4_fused_inv_rope_fp8_quant` — applies inverse
   RoPE to the last ``rope_dim`` elements of each attention head and
   quantises the full ``head_dim`` into FP8 e4m3 with one UE8M0-style
-  fp32 scale per 128-element block. Output layout matches the Triton
-  sibling exactly so the downstream einsum is layout-agnostic.
+  fp32 scale per 128-element block. Output uses
+  ``[n_groups, T_aligned, hidden]`` storage with the scale view strided
+  for fp8x4 vectorised reads.
 - :func:`sm12x_deepseek_v4_grouped_fp8_gemv` — the ``bhr,hdr->bhd``
   per-group batched FP8 GEMV that follows the inverse-RoPE / FP8 quant
   step; ported from upstream DeepGEMM's SM120 einsum kernel.
@@ -80,7 +81,7 @@ def sm12x_deepseek_v4_grouped_fp8_gemv(
         output  : ``[num_tokens, num_groups, out_rank]``       bf16
 
     ``a`` and ``a_scales`` may be non-contiguous strided views (e.g. the
-    transposed outputs of the Triton fused inverse-RoPE + FP8 quant kernel);
+    transposed outputs of the fused inverse-RoPE + FP8 quant kernel);
     ``b`` and ``b_scales`` must be contiguous.
     """
 
@@ -182,17 +183,16 @@ def sm12x_deepseek_v4_fused_inv_rope_fp8_quant(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Inverse-RoPE attention output + grouped block-128 FP8 quant.
 
-    Mirrors :func:`deepseek_v4_fused_inv_rope_fp8_quant_triton`. Returns
-    ``(o_fp8, o_scale)`` with logical shapes
+    Returns ``(o_fp8, o_scale)`` with logical shapes
     ``[tokens, groups, heads_per_group * head_dim]`` (FP8 e4m3) and
-    ``[tokens, groups, hidden / quant_group_size]`` (fp32), both as the
-    same non-contiguous strided views the Triton sibling produces -- the
-    underlying storage is ``[groups, T_aligned, hidden]`` and a strided
-    scale buffer so the downstream FP8 einsum is byte-compatible with
-    either implementation.
+    ``[tokens, groups, hidden / quant_group_size]`` (fp32), both as
+    non-contiguous strided views. The underlying storage is
+    ``[groups, T_aligned, hidden]`` and a strided scale buffer chosen so
+    the downstream FP8 einsum can walk the per-token row with stride 1.
 
-    Hard-codes the DSv4-Flash head shape (`head_dim = nope_dim + rope_dim
-    = 512`); other shapes fall through to the Triton sibling.
+    Hard-codes the DSv4-Flash head shape (``head_dim = nope_dim +
+    rope_dim = 512``); larger or smaller heads need their own kernel
+    instance.
     """
 
     if o.dim() != 3:

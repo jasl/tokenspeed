@@ -35,9 +35,9 @@
 // out_rank/128 weight tile) are folded into the FMA accumulation per
 // scale group.
 //
-// Two earlier designs were rejected and one cooperative-tile MMA design
-// only reached ~0.5x of the Triton baseline (see
-// docs/notes/2026-05-09-ds4-sm12x-rejected-experiments.md). The
+// Two earlier hand-written designs were rejected and one cooperative-tile
+// MMA design only reached ~0.5x of the contemporaneous Triton baseline
+// (see docs/notes/2026-05-09-ds4-sm12x-rejected-experiments.md). The
 // per-thread GEMV-style design ported here side-steps the tensor-core
 // path entirely -- at decode shape (small `tokens` batch) the M axis is
 // too small for MMA tiles to pay for themselves; a thread-per-output-cell
@@ -257,8 +257,6 @@ void launch_deepseek_v4_grouped_fp8_einsum(
 // Fused inverse-RoPE + FP8 quant (DSv4 attention output projection prelude)
 // =============================================================================
 //
-// Replaces the Triton sibling kernel
-// `_fused_inv_rope_fp8_quant_kernel` (tokenspeed-kernel/.../triton_projection.py).
 // Per DeepSeek V4 attention, the attention output for each (token, head)
 // has its last `rope_dim=64` elements rotated by the inverse RoPE and then
 // the full `head_dim=512` is quantized into FP8 with one UE8M0-style
@@ -276,13 +274,11 @@ void launch_deepseek_v4_grouped_fp8_einsum(
 //   4. UE8M0-style fp32 scale = `exp2(ceil(log2(absmax / fp8_max)))`.
 //   5. Quantize: clamp(x / scale, ±fp8_max) -> fp8 e4m3.
 //   6. Write fp8 (per-thread) and scale (one thread per chunk) into the
-//      `[G, T_aligned, H]` storage layout that the Triton sibling uses.
+//      `[G, T_aligned, H]` storage layout consumed by the einsum.
 //
-// Output layout matches the Triton kernel byte-for-byte so callers and
-// the existing einsum see identical strides whether the Triton fallback
-// or this CUDA path produced them. T_aligned padding (multiple-of-4)
-// is the caller's responsibility -- this kernel skips the data write
-// and zeros the scale for padded tokens.
+// T_aligned padding (multiple-of-4) is the caller's responsibility --
+// this kernel skips the data write and zeros the scale for padded
+// tokens so the downstream einsum sees stable zero contributions there.
 
 constexpr int kQuantGroupSize = 128;
 constexpr int kHeadDim = 512;
@@ -542,16 +538,16 @@ void sm12x_deepseek_v4_inv_rope_fp8_quant(
     int64_t heads_per_group,
     int64_t nope_dim,
     int64_t rope_dim) {
-  // `fp8_out`: [n_groups, T_aligned, hidden] (contig)  -- caller computes
+  // `fp8_out`: [n_groups, T_aligned, hidden] (contig) -- caller computes
   //            T_aligned = round_up(num_tokens, 4) and passes the
   //            underlying [G, T_aligned, H] storage so the kernel's
   //            T_aligned slot for padded tokens can have its scale
   //            zeroed deterministically.
-  // `scale_out`: weird strided view  (n_groups, num_tokens, scale_blocks)
-  //              with strides (scale_blocks * T_aligned, 1, T_aligned)
-  //              -- matches the Triton sibling layout byte-for-byte so
-  //              the downstream FP8 einsum sees identical strides
-  //              regardless of which path produced this output.
+  // `scale_out`: strided view (n_groups, num_tokens, scale_blocks) with
+  //              strides (scale_blocks * T_aligned, 1, T_aligned) -- the
+  //              `stride_token = 1` axis is what lets the downstream FP8
+  //              einsum walk per-token scales with a single contiguous
+  //              load.
   // `o`: [num_tokens, num_heads, head_dim] bfloat16 (CUDA tensor; arbitrary
   //      strides for token/head, hidden contig).
   // `positions`: [num_tokens] int64.
@@ -613,8 +609,9 @@ void sm12x_deepseek_v4_inv_rope_fp8_quant(
 
   TVM_FFI_ICHECK_EQ(positions.size(0), num_tokens);
 
-  // rope_abs_start matches the Triton constant: the last `rope_dim`
-  // elements of head_dim land in the last quant chunk's tail.
+  // rope_abs_start: the last `rope_dim` elements of head_dim must land
+  // in the last quant chunk's tail so a single contiguous block-128
+  // scale covers the rope-rotated region.
   int const rope_start_in_chunk = static_cast<int>(nope_dim % kQuantGroupSize);
   TVM_FFI_ICHECK_EQ(rope_start_in_chunk + rope_dim, kQuantGroupSize)
       << "DeepSeek V4 inverse-RoPE block layout is unsupported";

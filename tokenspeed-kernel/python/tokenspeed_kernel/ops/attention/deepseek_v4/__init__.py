@@ -35,26 +35,13 @@ except (ImportError, RuntimeError):
     deepseek_v4_fp8_einsum_sm12x_cuda = None
     deepseek_v4_fused_inv_rope_fp8_quant_sm12x_cuda = None
 
-try:
-    from tokenspeed_kernel.ops.attention.deepseek_v4.triton_projection import (
-        deepseek_v4_fp8_einsum_sm12x_triton,
-        deepseek_v4_fused_inv_rope_fp8_quant_triton,
-    )
-except ModuleNotFoundError as exc:
-    if exc.name not in {"tokenspeed_triton", "triton"}:
-        raise
-    deepseek_v4_fp8_einsum_sm12x_triton = None
-    deepseek_v4_fused_inv_rope_fp8_quant_triton = None
-
 __all__ = [
     "csa_indexer_cache_insert_fp8_cuda",
     "deepseek_v4_compressed_kv_cache_insert_cuda",
     "deepseek_v4_decode_indices_cuda",
     "deepseek_v4_fp8_einsum_sm12x_cuda",
-    "deepseek_v4_fp8_einsum_sm12x_triton",
     "deepseek_v4_full_candidate_topk_cuda",
     "deepseek_v4_fused_inv_rope_fp8_quant_sm12x_cuda",
-    "deepseek_v4_fused_inv_rope_fp8_quant_triton",
     "deepseek_v4_inv_rope_grouped_cuda",
     "deepseek_v4_save_compressor_state_cuda",
     "deepseek_v4_sparse_mla_cuda",

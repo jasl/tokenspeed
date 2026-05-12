@@ -53,12 +53,9 @@ def deepseek_v4_fused_inv_rope_fp8_quant_sm12x_cuda(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute the DSv4 inverse-RoPE + block-128 FP8 quant on SM12x (CUDA).
 
-    Mirrors :func:`deepseek_v4_fused_inv_rope_fp8_quant_triton` so the
-    runtime can swap solutions without changing call sites. Output layout
-    matches the Triton sibling byte-for-byte: the underlying storage is
-    ``[n_groups, T_aligned, hidden]`` for the FP8 buffer and a strided
-    ``[n_groups, num_tokens, scale_blocks]`` view for the scales, both
-    returned as ``.transpose(0, 1)`` views so the consumer sees
+    Output: ``[n_groups, T_aligned, hidden]`` storage for the FP8 buffer
+    and a strided ``[n_groups, num_tokens, scale_blocks]`` view for the
+    scales, both returned as ``.transpose(0, 1)`` so the consumer sees
     ``[num_tokens, n_groups, ...]``.
     """
     return _sm12x_deepseek_v4_fused_inv_rope_fp8_quant(
@@ -96,10 +93,8 @@ def deepseek_v4_fp8_einsum_sm12x_cuda(
 ) -> None:
     """Compute DeepSeek V4 ``bhr,hdr->bhd`` for SM12x FP8 tensors (CUDA).
 
-    Mirrors :func:`deepseek_v4_fp8_einsum_sm12x_triton` so the runtime can
-    swap solutions without changing call sites. Validation is delegated to
-    the underlying CUDA entry point, which also handles the wo_a weight
-    reshape conventions described below.
+    Validation is delegated to the underlying CUDA entry point, which
+    also handles the wo_a weight reshape conventions described below.
     """
 
     num_tokens, num_groups, hidden_size = a.shape
@@ -136,7 +131,7 @@ def _reshape_wo_a_weight(
     out_rank: int,
     hidden_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Match the layout convention used by the Triton sibling kernel.
+    """Reshape the flat wo_a weight + scales into per-group layout.
 
     The DeepSeek V4 ``wo_a`` weight ships as a flat
     ``[num_local_groups * out_rank, hidden]`` FP8 tensor with scales
