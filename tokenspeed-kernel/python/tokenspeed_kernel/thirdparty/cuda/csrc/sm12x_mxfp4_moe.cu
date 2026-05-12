@@ -1331,6 +1331,192 @@ void launch_sm12x_mxfp4_moe_forward(
       << cudaGetErrorString(status);
 }
 
+// Tensorcore W13 GEMM for MoE decode: per (token, top_k) pair compute
+// gate_up = w13[expert] @ hidden_fp8[token], using the SM120 mxf4xfp8
+// block-scaled MMA. Bias and SwiGLU live in the downstream
+// `sm12x_mxfp4_swiglu_mxfp8_quantize` helper -- this kernel is a pure GEMM.
+//
+// Grid: (num_pairs, gate_up_dim / 16). One pair = (token_idx, top_k_idx).
+// Block: 32 threads (single warp). The MMA shape is m16n8k32; here m=16 maps
+// to the weight's output-channel direction (16 outputs per block) and n=8
+// maps to the batch (activation) direction. Each pair has batch=1, so the
+// activation tile is padded with zeros for n=1..7. Compute the full m16xn8
+// MMA anyway -- the tensor unit is fast enough that the 7/8 column waste is
+// invisible relative to the weight bandwidth cost. Only thread_id==0 owns
+// the m=0 (real) outputs and writes them to global memory.
+//
+// gate_up output is fp32 in [num_tokens, top_k, gate_up_dim] layout so the
+// downstream SwiGLU+quantize kernel can consume it without a transpose.
+__global__ void mxfp4_moe_w13_tensorcore_kernel(
+    float* __restrict__ gate_up,
+    const uint8_t* __restrict__ hidden_fp8,
+    const uint8_t* __restrict__ hidden_scale,
+    const int* __restrict__ topk_ids,
+    const uint8_t* __restrict__ w13_weight,
+    const uint8_t* __restrict__ w13_scale,
+    int num_tokens,
+    int top_k,
+    int hidden,
+    int gate_up_dim,
+    int num_local_experts,
+    int weight_packed_k,
+    int weight_scale_k,
+    int hidden_scale_k,
+    int ep_rank) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
+  int const pair_idx = blockIdx.x;
+  int const n_tile_idx = blockIdx.y;
+  int const lane = threadIdx.x & (kWarpSize - 1);
+  if (pair_idx >= num_tokens * top_k) {
+    return;
+  }
+  int const token_idx = pair_idx / top_k;
+  int const top_k_idx = pair_idx % top_k;
+  int const n_base = n_tile_idx * 16;
+  int64_t const out_base =
+      (static_cast<int64_t>(token_idx) * top_k + top_k_idx) *
+      static_cast<int64_t>(gate_up_dim);
+
+  int const global_expert = topk_ids[pair_idx];
+  int const expert_lo = ep_rank * num_local_experts;
+  int const expert_hi = expert_lo + num_local_experts;
+  bool const local_expert =
+      (global_expert >= expert_lo) && (global_expert < expert_hi);
+
+  int const group_id = lane / 4;
+  int const thread_id = lane % 4;
+
+  if (!local_expert) {
+    // Out-of-rank pair: contribute zero so the downstream SwiGLU+quantize and
+    // W2 see a stable buffer.
+    if (thread_id == 0) {
+      int const row0 = n_base + group_id;
+      int const row1 = n_base + group_id + 8;
+      gate_up[out_base + row0] = 0.0f;
+      gate_up[out_base + row1] = 0.0f;
+    }
+    return;
+  }
+  int const local_expert_id = global_expert - expert_lo;
+
+  __shared__ __align__(128) uint8_t smem_a[16 * 32];
+  __shared__ __align__(128) uint8_t smem_b[8 * 32];
+
+  float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+  int64_t const expert_packed_base =
+      static_cast<int64_t>(local_expert_id) * gate_up_dim;
+  int64_t const expert_scale_base = expert_packed_base;
+
+  for (int k_block = 0; k_block < hidden / 32; ++k_block) {
+    // Load weight [16 N rows, 32 K] from packed FP4 -> nibble-expanded fp8.
+    for (int i = lane; i < 16 * 32; i += kWarpSize) {
+      int const row = i / 32;
+      int const col = i & 31;
+      uint8_t const packed =
+          w13_weight[(expert_packed_base + n_base + row) * weight_packed_k +
+                     k_block * 16 + col / 2];
+      uint8_t const nibble =
+          (col & 1) ? ((packed >> 4) & 0x0F) : (packed & 0x0F);
+      smem_a[i] = nibble << 2;
+    }
+    // Load activation [8 M rows, 32 K]; only M=0 has real fp8 data.
+    int64_t const a_base =
+        static_cast<int64_t>(token_idx) * hidden +
+        static_cast<int64_t>(k_block) * 32;
+    for (int i = lane; i < 8 * 32; i += kWarpSize) {
+      int const row = i / 32;
+      int const col = i & 31;
+      smem_b[i] = (row == 0) ? hidden_fp8[a_base + col] : 0;
+    }
+    __syncwarp();
+
+    uint32_t a_frag[4];
+    uint32_t b_frag[2];
+    int const a_row = (lane & 7) + ((lane >> 3) & 1) * 8;
+    int const a_col = (lane >> 4) * 16;
+    ldmatrix_x4_b16(
+        a_frag[0], a_frag[1], a_frag[2], a_frag[3],
+        smem_a + a_row * 32 + a_col);
+
+    int const b_row = lane & 7;
+    int const b_col = ((lane >> 3) & 1) * 16;
+    ldmatrix_x2_b16(b_frag[0], b_frag[1], smem_b + b_row * 32 + b_col);
+
+    uint8_t const sfa =
+        w13_scale[(expert_scale_base + n_base + group_id +
+                   (thread_id & 1) * 8) *
+                      weight_scale_k +
+                  k_block];
+    // Replicate the real token scale to all m-rows; m=1..7 rows have zero
+    // activations so the scale value does not affect their MMA contribution
+    // and a broadcast load is cheaper than a per-row gather.
+    uint8_t const sfb = hidden_scale[token_idx * hidden_scale_k + k_block];
+    sm120_mxfp4_mxfp8_mma(d, a_frag, b_frag, sfa, sfb);
+    __syncwarp();
+  }
+
+  // Only thread_id==0 owns the m=0 outputs; other thread_ids hold m=1..7
+  // which are zero by construction.
+  if (thread_id == 0) {
+    int const row0 = n_base + group_id;
+    int const row1 = n_base + group_id + 8;
+    gate_up[out_base + row0] = d[0];
+    gate_up[out_base + row1] = d[2];
+  }
+#else
+  if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+    gate_up[0] = 0.0f;
+  }
+#endif
+}
+
+void launch_sm12x_mxfp4_moe_w13_tensorcore(
+    TensorView gate_up,
+    TensorView hidden_fp8,
+    TensorView hidden_scale,
+    TensorView topk_ids,
+    TensorView w13_weight,
+    TensorView w13_scale,
+    int ep_rank,
+    cudaStream_t stream) {
+  int const num_tokens = static_cast<int>(hidden_fp8.size(0));
+  int const top_k = static_cast<int>(topk_ids.size(1));
+  int const hidden = static_cast<int>(hidden_fp8.size(1));
+  int const num_local_experts = static_cast<int>(w13_weight.size(0));
+  int const gate_up_dim = static_cast<int>(w13_weight.size(1));
+  int const weight_packed_k = static_cast<int>(w13_weight.size(2));
+  int const weight_scale_k = static_cast<int>(w13_scale.size(2));
+  int const hidden_scale_k = static_cast<int>(hidden_scale.size(1));
+
+  if (num_tokens == 0 || top_k == 0 || gate_up_dim == 0) {
+    return;
+  }
+
+  dim3 const grid(num_tokens * top_k, gate_up_dim / 16);
+  mxfp4_moe_w13_tensorcore_kernel<<<grid, kWarpSize, 0, stream>>>(
+      static_cast<float*>(gate_up.data_ptr()),
+      static_cast<const uint8_t*>(hidden_fp8.data_ptr()),
+      static_cast<const uint8_t*>(hidden_scale.data_ptr()),
+      static_cast<const int*>(topk_ids.data_ptr()),
+      static_cast<const uint8_t*>(w13_weight.data_ptr()),
+      static_cast<const uint8_t*>(w13_scale.data_ptr()),
+      num_tokens,
+      top_k,
+      hidden,
+      gate_up_dim,
+      num_local_experts,
+      weight_packed_k,
+      weight_scale_k,
+      hidden_scale_k,
+      ep_rank);
+
+  cudaError_t const status = cudaGetLastError();
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "sm12x_mxfp4_moe_w13_tensorcore launch failed: "
+      << cudaGetErrorString(status);
+}
+
 }  // namespace
 
 template <typename scalar_t>
@@ -1944,12 +2130,86 @@ void sm12x_mxfp8_mxfp4_dense(
       << cudaGetErrorString(status);
 }
 
+void sm12x_mxfp4_moe_w13_tensorcore(
+    TensorView gate_up,
+    TensorView hidden_fp8,
+    TensorView hidden_scale,
+    TensorView topk_ids,
+    TensorView w13_weight,
+    TensorView w13_scale,
+    int64_t ep_rank) {
+  CHECK_CUDA(gate_up);
+  CHECK_CUDA(hidden_fp8);
+  CHECK_CUDA(hidden_scale);
+  CHECK_CUDA(topk_ids);
+  CHECK_CUDA(w13_weight);
+  CHECK_CUDA(w13_scale);
+  CHECK_DEVICE(gate_up, hidden_fp8);
+  CHECK_DEVICE(gate_up, hidden_scale);
+  CHECK_DEVICE(gate_up, topk_ids);
+  CHECK_DEVICE(gate_up, w13_weight);
+  CHECK_DEVICE(gate_up, w13_scale);
+
+  CHECK_DIM(3, gate_up);
+  CHECK_DIM(2, hidden_fp8);
+  CHECK_DIM(2, hidden_scale);
+  CHECK_DIM(2, topk_ids);
+  CHECK_DIM(3, w13_weight);
+  CHECK_DIM(3, w13_scale);
+
+  TVM_FFI_ICHECK(gate_up.IsContiguous()) << "gate_up must be contiguous";
+  TVM_FFI_ICHECK(hidden_fp8.IsContiguous()) << "hidden_fp8 must be contiguous";
+  TVM_FFI_ICHECK(hidden_scale.IsContiguous())
+      << "hidden_scale must be contiguous";
+  TVM_FFI_ICHECK(topk_ids.IsContiguous()) << "topk_ids must be contiguous";
+  TVM_FFI_ICHECK(w13_weight.IsContiguous()) << "w13_weight must be contiguous";
+  TVM_FFI_ICHECK(w13_scale.IsContiguous()) << "w13_scale must be contiguous";
+
+  TVM_FFI_ICHECK_EQ(gate_up.dtype(), dl_float32);
+  TVM_FFI_ICHECK_EQ(hidden_fp8.dtype(), dl_float8_e4m3fn);
+  TVM_FFI_ICHECK_EQ(hidden_scale.dtype(), dl_uint8);
+  TVM_FFI_ICHECK_EQ(topk_ids.dtype(), dl_int32);
+  TVM_FFI_ICHECK_EQ(w13_weight.dtype(), dl_uint8);
+  TVM_FFI_ICHECK_EQ(w13_scale.dtype(), dl_uint8);
+
+  int const num_tokens = static_cast<int>(hidden_fp8.size(0));
+  int const top_k = static_cast<int>(topk_ids.size(1));
+  int const hidden = static_cast<int>(hidden_fp8.size(1));
+  int const num_local_experts = static_cast<int>(w13_weight.size(0));
+  int const gate_up_dim = static_cast<int>(w13_weight.size(1));
+  int const weight_packed_k = static_cast<int>(w13_weight.size(2));
+  int const weight_scale_k = static_cast<int>(w13_scale.size(2));
+  int const hidden_scale_k = static_cast<int>(hidden_scale.size(1));
+
+  TVM_FFI_ICHECK_EQ(topk_ids.size(0), num_tokens);
+  TVM_FFI_ICHECK_EQ(gate_up.size(0), num_tokens);
+  TVM_FFI_ICHECK_EQ(gate_up.size(1), top_k);
+  TVM_FFI_ICHECK_EQ(gate_up.size(2), gate_up_dim);
+  TVM_FFI_ICHECK_EQ(hidden_scale.size(0), num_tokens);
+  TVM_FFI_ICHECK_EQ(w13_scale.size(0), num_local_experts);
+  TVM_FFI_ICHECK_EQ(w13_scale.size(1), gate_up_dim);
+  TVM_FFI_ICHECK_EQ(weight_packed_k, hidden / 2);
+  TVM_FFI_ICHECK_EQ(weight_scale_k, hidden / kMxfp4Block);
+  TVM_FFI_ICHECK_EQ(hidden_scale_k, hidden / kMxfp4Block);
+  TVM_FFI_ICHECK_EQ(hidden % kMxfp4Block, 0);
+  TVM_FFI_ICHECK_EQ(gate_up_dim % 16, 0);
+  TVM_FFI_ICHECK_GE(ep_rank, 0);
+
+  cudaSetDevice(gate_up.device().device_id);
+  cudaStream_t const stream = get_stream(gate_up.device());
+  launch_sm12x_mxfp4_moe_w13_tensorcore(
+      gate_up, hidden_fp8, hidden_scale, topk_ids, w13_weight, w13_scale,
+      static_cast<int>(ep_rank), stream);
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm12x_mxfp4_moe_forward_scalar,
                               sm12x_mxfp4_moe_forward_scalar);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm12x_mxfp4_moe_forward_warp,
                               sm12x_mxfp4_moe_forward_warp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm12x_mxfp4_moe_forward,
                               sm12x_mxfp4_moe_forward);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm12x_mxfp4_moe_w13_tensorcore,
+                              sm12x_mxfp4_moe_w13_tensorcore);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm12x_mxfp4_mxfp8_quantize,
                               sm12x_mxfp4_mxfp8_quantize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm12x_mxfp4_swiglu_mxfp8_quantize,

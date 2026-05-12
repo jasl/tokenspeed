@@ -605,6 +605,103 @@ def sm12x_mxfp4_swiglu_mxfp8_quantize(
     return output, output_scale
 
 
+def sm12x_mxfp4_moe_w13_tensorcore(
+    hidden_fp8: torch.Tensor,
+    hidden_scale: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w13_scale: torch.Tensor,
+    *,
+    ep_rank: int = 0,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Tensorcore MoE W13 GEMM (no SwiGLU, no bias).
+
+    Inputs are FP8 e4m3 hidden activations with per-32 ue8m0 scales (produced
+    by ``sm12x_mxfp4_mxfp8_quantize``) and packed MXFP4 W13 weights. The output
+    is the raw gate/up logits in float32 layout ``[num_tokens, top_k,
+    gate_up_dim]``; the downstream ``sm12x_mxfp4_swiglu_mxfp8_quantize`` helper
+    is responsible for adding ``w13_bias``, applying SwiGLU, and quantising
+    back to FP8 for the W2 step.
+    """
+    if hidden_fp8.dim() != 2:
+        raise ValueError(f"hidden_fp8 must be 2-D, got {hidden_fp8.dim()}")
+    if hidden_scale.dim() != 2:
+        raise ValueError(f"hidden_scale must be 2-D, got {hidden_scale.dim()}")
+    if topk_ids.dim() != 2:
+        raise ValueError(f"topk_ids must be 2-D, got {topk_ids.dim()}")
+    if w13_weight.dim() != 3:
+        raise ValueError(f"w13_weight must be 3-D, got {w13_weight.dim()}")
+    if w13_scale.dim() != 3:
+        raise ValueError(f"w13_scale must be 3-D, got {w13_scale.dim()}")
+    if hidden_fp8.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"hidden_fp8 must use float8_e4m3fn, got {hidden_fp8.dtype}")
+    if hidden_scale.dtype != torch.uint8:
+        raise ValueError(f"hidden_scale must use torch.uint8, got {hidden_scale.dtype}")
+    if w13_weight.dtype != torch.uint8:
+        raise ValueError(f"w13_weight must use torch.uint8, got {w13_weight.dtype}")
+    if w13_scale.dtype != torch.uint8:
+        raise ValueError(f"w13_scale must use torch.uint8, got {w13_scale.dtype}")
+    if not hidden_fp8.is_cuda:
+        raise ValueError("hidden_fp8 must be a CUDA tensor")
+
+    num_tokens, hidden = hidden_fp8.shape
+    if topk_ids.shape[0] != num_tokens:
+        raise ValueError(
+            f"topk_ids first dim {topk_ids.shape[0]} must equal "
+            f"num_tokens {num_tokens}"
+        )
+    top_k = topk_ids.shape[1]
+    num_local_experts, gate_up_dim, weight_packed_k = w13_weight.shape
+    if weight_packed_k * 2 != hidden:
+        raise ValueError(
+            f"w13_weight packed_k {weight_packed_k} must equal hidden/2 "
+            f"({hidden // 2})"
+        )
+    if gate_up_dim % 16 != 0:
+        raise ValueError(f"gate_up_dim must be a multiple of 16, got {gate_up_dim}")
+    if hidden % 32 != 0:
+        raise ValueError(f"hidden must be a multiple of 32, got {hidden}")
+    if hidden_scale.shape != (num_tokens, hidden // 32):
+        raise ValueError(
+            f"hidden_scale must have shape ({num_tokens}, {hidden // 32}), "
+            f"got {tuple(hidden_scale.shape)}"
+        )
+    if w13_scale.shape != (num_local_experts, gate_up_dim, hidden // 32):
+        raise ValueError(
+            f"w13_scale must have shape ({num_local_experts}, {gate_up_dim}, "
+            f"{hidden // 32}), got {tuple(w13_scale.shape)}"
+        )
+
+    out_shape = (num_tokens, top_k, gate_up_dim)
+    if out is None:
+        out = torch.empty(out_shape, dtype=torch.float32, device=hidden_fp8.device)
+    else:
+        if out.shape != out_shape:
+            raise ValueError(f"out must have shape {out_shape}, got {tuple(out.shape)}")
+        if out.dtype != torch.float32:
+            raise ValueError(f"out must use torch.float32, got {out.dtype}")
+        if out.device != hidden_fp8.device:
+            raise ValueError("out must be on the hidden_fp8 device")
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
+
+    if num_tokens == 0 or top_k == 0:
+        return out
+
+    mod = _load_sm12x_mxfp4_moe_module()
+    mod.sm12x_mxfp4_moe_w13_tensorcore(
+        out,
+        hidden_fp8.contiguous(),
+        hidden_scale.contiguous(),
+        topk_ids.to(torch.int32).contiguous(),
+        w13_weight.contiguous(),
+        w13_scale.contiguous(),
+        int(ep_rank),
+    )
+    return out
+
+
 __all__ = [
     "sm12x_mxfp4_mxfp8_dense",
     "sm12x_mxfp4_mxfp8_mma_tile",
@@ -615,4 +712,5 @@ __all__ = [
     "sm12x_mxfp4_moe_forward",
     "sm12x_mxfp4_moe_forward_scalar",
     "sm12x_mxfp4_moe_forward_warp",
+    "sm12x_mxfp4_moe_w13_tensorcore",
 ]
