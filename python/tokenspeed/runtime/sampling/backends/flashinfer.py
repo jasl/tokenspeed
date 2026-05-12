@@ -277,7 +277,9 @@ class FlashInferSamplingBackend(SamplingBackend):
 
         if self.config.enable_output_logprobs:
 
-            write_output_logprobs(logits_output, logits, sampled)
+            write_output_logprobs(
+                logits_output, logits, sampled, sampling_info.top_logprobs_nums
+            )
 
         bs = logits.shape[0]
 
@@ -367,7 +369,10 @@ class FlashInferSamplingBackend(SamplingBackend):
         if self.config.enable_output_logprobs:
 
             write_output_logprobs(
-                logits_output, logits_output.next_token_logits, predict
+                logits_output,
+                logits_output.next_token_logits,
+                predict,
+                sampling_info.top_logprobs_nums,
             )
 
         return predict, accept_length

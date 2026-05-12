@@ -159,26 +159,27 @@ class Mxfp4TritonKernelBackend(MoEBackend):
         w13_weight, w13_flex, w13_scale = swizzle_mxfp4(
             layer.w13_weight, layer.w13_weight_scale, num_warps
         )
-        w2_weight, w2_flex, w2_scale = swizzle_mxfp4(
-            layer.w2_weight, layer.w2_weight_scale, num_warps
-        )
-
         layer.w13_precision_config = PrecisionConfig(
             flex_ctx=FlexCtx(rhs_data=w13_flex),
             b_mx_scale=w13_scale,
             b_microblock_size=MXFP_BLOCK_SIZE,
+        )
+        layer.w13_weight_triton_tensor = w13_weight
+        del layer.w13_weight
+        del layer.w13_weight_scale
+        torch.cuda.empty_cache()
+
+        w2_weight, w2_flex, w2_scale = swizzle_mxfp4(
+            layer.w2_weight, layer.w2_weight_scale, num_warps
         )
         layer.w2_precision_config = PrecisionConfig(
             flex_ctx=FlexCtx(rhs_data=w2_flex),
             b_mx_scale=w2_scale,
             b_microblock_size=MXFP_BLOCK_SIZE,
         )
-
-        layer.w13_weight_triton_tensor = w13_weight
         layer.w2_weight_triton_tensor = w2_weight
-        # Free original weights (replaced by shuffled versions)
-        del layer.w13_weight
         del layer.w2_weight
+        del layer.w2_weight_scale
         torch.cuda.empty_cache()
 
     def forward(

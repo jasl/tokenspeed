@@ -390,6 +390,43 @@ def mhc_pre(
     )
 
 
+def sm12x_mhc_pre(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from tokenspeed_kernel.thirdparty.cuda.deepseek_v4_attention import (
+        sm12x_mhc_pre as native_sm12x_mhc_pre,
+    )
+
+    return native_sm12x_mhc_pre(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_eps,
+        sinkhorn_iters,
+    )
+
+
+def sm12x_mhc_post(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+) -> torch.Tensor:
+    from tokenspeed_kernel.thirdparty.cuda.deepseek_v4_attention import (
+        sm12x_mhc_post as native_sm12x_mhc_post,
+    )
+
+    return native_sm12x_mhc_post(hidden_states, residual, post, comb)
+
+
 def mhc_post(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,

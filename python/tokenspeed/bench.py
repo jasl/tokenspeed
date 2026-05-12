@@ -77,6 +77,7 @@ logger = logging.getLogger(__name__)
 # Type alias: a single float applies to both ISL and OSL; a dict allows
 # specifying them independently via ``{"input": ..., "output": ...}``.
 RangeRatio = float | dict[str, float]
+PromptInput = str | list[int] | list[str] | list[list[int]]
 
 
 def _print_section_header(title: str, fill: str) -> None:
@@ -126,7 +127,7 @@ class StreamedResponseHandler:
 
 @dataclass
 class SampleRequest:
-    prompt: str
+    prompt: PromptInput
     prompt_len: int
     expected_output_len: int
     multi_modal_data: dict | list[dict] | None = None
@@ -138,7 +139,7 @@ class SampleRequest:
 class RequestFuncInput:
     """The input for the request function."""
 
-    prompt: str | list[str]
+    prompt: PromptInput
     api_url: str
     prompt_len: int
     output_len: int
@@ -1018,10 +1019,88 @@ def sample_random_requests(
     return samples
 
 
+def sample_token_ids_requests(
+    input_len: int,
+    output_len: int,
+    num_prompts: int,
+    range_ratio: RangeRatio,
+    dataset_path: str | None,
+    vocab_size: int,
+    token_offset: int = 1,
+    prefix_len: int = 0,
+    random_seed: int = 0,
+    request_id_prefix: str = "",
+) -> list[SampleRequest]:
+    if dataset_path is not None:
+        raise ValueError("Cannot use 'token_ids' dataset with --dataset-path.")
+    if num_prompts <= 0:
+        raise ValueError("--num-prompts must be positive.")
+    if input_len <= 0:
+        raise ValueError("--token-ids-input-len must be positive.")
+    if output_len <= 0:
+        raise ValueError("--token-ids-output-len must be positive.")
+    if vocab_size <= 0:
+        raise ValueError("--token-ids-vocab-size must be positive.")
+    if token_offset < 0:
+        raise ValueError("--token-ids-token-offset must be non-negative.")
+    if token_offset >= vocab_size:
+        raise ValueError("--token-ids-token-offset must be less than vocab size.")
+    if prefix_len < 0:
+        raise ValueError("--token-ids-prefix-len must be non-negative.")
+
+    input_range_ratio, output_range_ratio = _resolve_range_ratios(range_ratio)
+    if not (0.0 <= input_range_ratio < 1.0):
+        raise ValueError("input_range_ratio must be in [0, 1).")
+    if not (0.0 <= output_range_ratio < 1.0):
+        raise ValueError("output_range_ratio must be in [0, 1).")
+
+    input_low = max(1, math.floor(input_len * (1 - input_range_ratio)))
+    input_high = max(1, math.ceil(input_len * (1 + input_range_ratio)))
+    output_low = max(1, math.floor(output_len * (1 - output_range_ratio)))
+    output_high = max(1, math.ceil(output_len * (1 + output_range_ratio)))
+    if prefix_len > input_low:
+        raise ValueError(
+            "--token-ids-prefix-len must be no larger than the minimum sampled "
+            f"input length ({input_low})."
+        )
+
+    rng = np.random.default_rng(random_seed)
+    input_lens = rng.integers(input_low, input_high + 1, size=num_prompts)
+    output_lens = rng.integers(output_low, output_high + 1, size=num_prompts)
+    offsets = rng.integers(0, vocab_size - token_offset, size=num_prompts)
+    usable_vocab_size = vocab_size - token_offset
+
+    def make_token_sequence(start: int, length: int) -> list[int]:
+        token_ids = (start + np.arange(length)) % usable_vocab_size
+        return (token_ids + token_offset).astype(np.int64).tolist()
+
+    prefix_token_ids = make_token_sequence(0, prefix_len)
+    samples = []
+    for i, (sampled_input_len, sampled_output_len, offset) in enumerate(
+        zip(input_lens, output_lens, offsets, strict=True)
+    ):
+        suffix_len = int(sampled_input_len) - prefix_len
+        prompt = prefix_token_ids + make_token_sequence(int(offset), suffix_len)
+        samples.append(
+            SampleRequest(
+                prompt=prompt,
+                prompt_len=len(prompt),
+                expected_output_len=int(sampled_output_len),
+                request_id=request_id_prefix + str(i),
+            )
+        )
+
+    print(f"#Input tokens: {sum(x.prompt_len for x in samples)}")
+    print(f"#Output tokens: {sum(x.expected_output_len for x in samples)}")
+    return samples
+
+
 def get_samples(
-    args: argparse.Namespace, tokenizer: PreTrainedTokenizerBase
+    args: argparse.Namespace, tokenizer: PreTrainedTokenizerBase | None
 ) -> list[SampleRequest]:
     if args.dataset_name == "sharegpt":
+        if tokenizer is None:
+            raise ValueError("'sharegpt' dataset requires tokenizer initialization.")
         return sample_sharegpt_requests(
             dataset_path=args.dataset_path,
             num_requests=args.num_prompts,
@@ -1032,6 +1111,8 @@ def get_samples(
             skip_min_tokens_check=args.skip_min_tokens_check,
         )
     if args.dataset_name == "random":
+        if tokenizer is None:
+            raise ValueError("'random' dataset requires tokenizer initialization.")
         return sample_random_requests(
             input_len=args.random_input_len,
             output_len=args.random_output_len,
@@ -1040,6 +1121,19 @@ def get_samples(
             tokenizer=tokenizer,
             dataset_path=args.dataset_path,
             prefix_len=args.random_prefix_len,
+            random_seed=args.seed,
+            request_id_prefix=args.request_id_prefix,
+        )
+    if args.dataset_name == "token_ids":
+        return sample_token_ids_requests(
+            input_len=args.token_ids_input_len,
+            output_len=args.token_ids_output_len,
+            num_prompts=args.num_prompts,
+            range_ratio=args.token_ids_range_ratio,
+            dataset_path=args.dataset_path,
+            vocab_size=args.token_ids_vocab_size,
+            token_offset=args.token_ids_token_offset,
+            prefix_len=args.token_ids_prefix_len,
             random_seed=args.seed,
             request_id_prefix=args.request_id_prefix,
         )
@@ -1684,7 +1778,7 @@ def add_dataset_parser(parser: argparse.ArgumentParser) -> None:
         "--dataset-name",
         type=str,
         default="random",
-        choices=["sharegpt", "random"],
+        choices=["sharegpt", "random", "token_ids"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
@@ -1700,6 +1794,12 @@ def add_dataset_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--random-output-len", type=int, default=128)
     parser.add_argument("--random-range-ratio", type=float, default=0.0)
     parser.add_argument("--random-prefix-len", type=int, default=0)
+    parser.add_argument("--token-ids-input-len", type=int, default=1024)
+    parser.add_argument("--token-ids-output-len", type=int, default=128)
+    parser.add_argument("--token-ids-range-ratio", type=float, default=0.0)
+    parser.add_argument("--token-ids-prefix-len", type=int, default=0)
+    parser.add_argument("--token-ids-vocab-size", type=int, default=32000)
+    parser.add_argument("--token-ids-token-offset", type=int, default=1)
     parser.add_argument("--request-id-prefix", type=str, default="bench-")
 
 
@@ -1772,8 +1872,10 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError("--profile-num-steps requires --profile.")
     if args.input_len is not None:
         args.random_input_len = args.input_len
+        args.token_ids_input_len = args.input_len
     if args.output_len is not None:
         args.random_output_len = args.output_len
+        args.token_ids_output_len = args.output_len
         args.sharegpt_output_len = args.output_len
 
     if args.ramp_up_strategy is not None:
@@ -1821,11 +1923,14 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
 
     tokenizer = None
     tokenizer_id = None
-    if not args.skip_tokenizer_init:
+    if not args.skip_tokenizer_init and args.dataset_name != "token_ids":
         tokenizer_id = args.tokenizer or model_id
         tokenizer = get_tokenizer(tokenizer_id)
 
-    if args.dataset_name == "random" and args.backend in OPENAI_COMPATIBLE_BACKENDS:
+    if (
+        args.dataset_name in {"random", "token_ids"}
+        and args.backend in OPENAI_COMPATIBLE_BACKENDS
+    ):
         args.ignore_eos = True
 
     input_requests = get_samples(args, tokenizer)

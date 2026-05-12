@@ -99,6 +99,12 @@ class RequestState:
         self.output_token_logprobs_idx: list[int] | None = (
             [] if return_logprob else None
         )
+        self.output_top_logprobs_val: list[list[float]] | None = (
+            [] if return_logprob and top_logprobs_num > 0 else None
+        )
+        self.output_top_logprobs_idx: list[list[int]] | None = (
+            [] if return_logprob and top_logprobs_num > 0 else None
+        )
 
         # --- Streaming bookkeeping (internal) ---
         self._surr_offset: int | None = None
@@ -493,6 +499,17 @@ class OutputProcesser:
             if model_execution_results.output_logprobs is not None
             else None
         )
+        output_top_logprobs_val_list = (
+            model_execution_results.output_top_logprobs_val.tolist()
+            if model_execution_results.output_top_logprobs_val is not None
+            else None
+        )
+        output_top_logprobs_idx_list = (
+            model_execution_results.output_top_logprobs_idx.tolist()
+            if model_execution_results.output_top_logprobs_idx is not None
+            else None
+        )
+        output_top_logprobs_nums = model_execution_results.output_top_logprobs_nums
         pt = 0
         for i, rid in enumerate(forward_op.request_ids):
             output_length = model_execution_results.output_lengths[i].item()
@@ -504,6 +521,24 @@ class OutputProcesser:
                 if output_logprobs_list is not None
                 else None
             )
+            if (
+                output_top_logprobs_val_list is not None
+                and output_top_logprobs_idx_list is not None
+                and output_top_logprobs_nums is not None
+            ):
+                model_output_top_logprobs_val = []
+                model_output_top_logprobs_idx = []
+                for row in range(pt, pt + output_length):
+                    k = output_top_logprobs_nums[row]
+                    model_output_top_logprobs_val.append(
+                        output_top_logprobs_val_list[row][:k]
+                    )
+                    model_output_top_logprobs_idx.append(
+                        output_top_logprobs_idx_list[row][:k]
+                    )
+            else:
+                model_output_top_logprobs_val = None
+                model_output_top_logprobs_idx = None
             if self.spec_num_tokens is not None and is_decode_op:
                 pt += self.spec_num_tokens
             else:
@@ -553,6 +588,18 @@ class OutputProcesser:
                         model_output_logprobs[j]
                     )
                     request_state.output_token_logprobs_idx.append(model_output_id)
+                if (
+                    request_state.return_logprob
+                    and request_state.output_top_logprobs_val is not None
+                    and model_output_top_logprobs_val is not None
+                    and model_output_top_logprobs_idx is not None
+                ):
+                    request_state.output_top_logprobs_val.append(
+                        model_output_top_logprobs_val[j]
+                    )
+                    request_state.output_top_logprobs_idx.append(
+                        model_output_top_logprobs_idx[j]
+                    )
                 if term_idx == j:
                     # Grammar termination takes precedence over
                     # length/EOS/stop_str at the same step (matching
@@ -677,6 +724,8 @@ class OutputProcesser:
         output_extra_infos: list[dict] = []
         output_token_logprobs_val: list[list[float]] = []
         output_token_logprobs_idx: list[list[int]] = []
+        output_top_logprobs_val: list[list[list[float]]] = []
+        output_top_logprobs_idx: list[list[list[int]]] = []
 
         for i, rs in enumerate(output_states):
             # For finished requests, always output (unless already output)
@@ -752,9 +801,21 @@ class OutputProcesser:
                 output_token_logprobs_idx.append(
                     rs.output_token_logprobs_idx[-n_new:] if n_new > 0 else []
                 )
+                if rs.output_top_logprobs_val is not None:
+                    output_top_logprobs_val.append(
+                        rs.output_top_logprobs_val[-n_new:] if n_new > 0 else []
+                    )
+                    output_top_logprobs_idx.append(
+                        rs.output_top_logprobs_idx[-n_new:] if n_new > 0 else []
+                    )
+                else:
+                    output_top_logprobs_val.append([])
+                    output_top_logprobs_idx.append([])
             else:
                 output_token_logprobs_val.append([])
                 output_token_logprobs_idx.append([])
+                output_top_logprobs_val.append([])
+                output_top_logprobs_idx.append([])
 
         # Don't send empty batch to detokenizer
         if len(rids_to_send) == 0:
@@ -781,8 +842,8 @@ class OutputProcesser:
             output_token_logprobs_idx=output_token_logprobs_idx,
             input_top_logprobs_val=[],
             input_top_logprobs_idx=[],
-            output_top_logprobs_val=[],
-            output_top_logprobs_idx=[],
+            output_top_logprobs_val=output_top_logprobs_val,
+            output_top_logprobs_idx=output_top_logprobs_idx,
             input_token_ids_logprobs_val=[],
             input_token_ids_logprobs_idx=[],
             output_token_ids_logprobs_val=[],

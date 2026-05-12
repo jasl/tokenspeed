@@ -1,0 +1,53 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from tokenspeed_kernel.ops.moe.sm12x_mxfp4.native import (
+    sm12x_mxfp4_moe_forward,
+    sm12x_mxfp4_moe_forward_scalar,
+    sm12x_mxfp4_moe_forward_warp,
+    sm12x_mxfp4_mxfp8_dense,
+    sm12x_mxfp4_mxfp8_mma_tile,
+    sm12x_mxfp4_mxfp8_quantize,
+    sm12x_mxfp4_swiglu_mxfp8_quantize,
+    sm12x_mxfp8_mxfp4_dense,
+    sm12x_mxfp8_mxfp4_mma_tile,
+)
+from tokenspeed_kernel.ops.moe.sm12x_mxfp4.reference import (
+    mxfp4_dequantize_packed,
+    mxfp8_dequantize,
+    mxfp8_mxfp4_dense_reference,
+    sm12x_mxfp4_moe_reference_forward,
+)
+
+__all__ = [
+    "mxfp4_dequantize_packed",
+    "mxfp8_dequantize",
+    "mxfp8_mxfp4_dense_reference",
+    "sm12x_mxfp4_mxfp8_dense",
+    "sm12x_mxfp4_mxfp8_mma_tile",
+    "sm12x_mxfp8_mxfp4_dense",
+    "sm12x_mxfp8_mxfp4_mma_tile",
+    "sm12x_mxfp4_mxfp8_quantize",
+    "sm12x_mxfp4_swiglu_mxfp8_quantize",
+    "sm12x_mxfp4_moe_forward",
+    "sm12x_mxfp4_moe_forward_scalar",
+    "sm12x_mxfp4_moe_forward_warp",
+    "sm12x_mxfp4_moe_reference_forward",
+]

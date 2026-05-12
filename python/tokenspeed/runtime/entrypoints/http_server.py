@@ -364,6 +364,29 @@ async def get_load():
     return await _global_state.tokenizer_manager.get_load()
 
 
+@app.post("/tokenize", dependencies=[Depends(validate_json_request)])
+async def tokenize_request(raw_request: Request):
+    """Return token ids for an input prompt, matching vLLM's harness endpoint."""
+    tokenizer = (
+        _global_state.tokenizer_manager.tokenizer if _global_state is not None else None
+    )
+    if tokenizer is None:
+        raise HTTPException(status_code=400, detail="tokenizer is not initialized")
+
+    payload = await raw_request.json()
+    prompt = payload.get("prompt") if isinstance(payload, dict) else None
+    if isinstance(prompt, str):
+        token_ids = tokenizer.encode(prompt)
+    elif isinstance(prompt, list) and all(isinstance(token, int) for token in prompt):
+        token_ids = list(prompt)
+    else:
+        raise HTTPException(
+            status_code=400, detail="prompt must be a string or token ids"
+        )
+
+    return ORJSONResponse(content={"tokens": token_ids, "token_ids": token_ids})
+
+
 # example usage:
 # curl -s -X POST http://localhost:30000/set_internal_state -H "Content-Type: application/json" -d '{"server_args": {"max_micro_batch_size": 8}}'
 @app.api_route("/set_internal_state", methods=["POST", "PUT"])

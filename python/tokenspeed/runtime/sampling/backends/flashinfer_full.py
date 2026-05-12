@@ -37,6 +37,7 @@ from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.utils import (
     nan_guard_logits,
     top_k_top_p_renorm_torch,
+    write_output_top_logprobs,
 )
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
@@ -307,6 +308,9 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             logits_output.next_token_logprobs = raw_logprobs.gather(
                 -1, sampled.long().unsqueeze(-1)
             ).squeeze(-1)
+            write_output_top_logprobs(
+                logits_output, raw_logprobs, sampling_info.top_logprobs_nums
+            )
 
         # Accumulate sampled tokens into counts (greedy path accumulates too
         # so mixed later batches see the correct history).
@@ -449,6 +453,9 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             logits_output.next_token_logprobs = raw_logprobs.gather(
                 -1, predict.long().unsqueeze(-1)
             ).squeeze(-1)
+            write_output_top_logprobs(
+                logits_output, raw_logprobs, sampling_info.top_logprobs_nums
+            )
 
         return predict, accept_length
 

@@ -53,8 +53,9 @@ class LogitsProcessorOutput:
     # The logprobs of the next tokens.                              shape: [#seq]
     next_token_logprobs: torch.Tensor | None = None
     # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
-    next_token_top_logprobs_val: list | None = None
-    next_token_top_logprobs_idx: list | None = None
+    next_token_top_logprobs_val: torch.Tensor | None = None
+    next_token_top_logprobs_idx: torch.Tensor | None = None
+    next_token_top_logprobs_nums: list[int] | None = None
     # The logprobs and ids of the requested token ids in output positions. shape: [#seq, n] (n is the number of requested token ids)
     next_token_token_ids_logprobs_val: list | None = None
     next_token_token_ids_logprobs_idx: list | None = None

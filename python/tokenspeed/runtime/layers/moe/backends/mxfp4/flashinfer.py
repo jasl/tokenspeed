@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import tokenspeed_kernel
 import torch
 from tokenspeed_kernel.platform import current_platform
@@ -148,6 +150,52 @@ def _reorder_w1w3_to_w3w1(x: torch.Tensor, dim: int = -2) -> torch.Tensor:
     return out.view(view_dtype) if view_dtype is not None else out
 
 
+def _stack_permuted_expert_rows(
+    experts: torch.Tensor,
+    permute_indices: torch.Tensor,
+    *,
+    row_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    after_permute: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> torch.Tensor:
+    def _make_row(idx: int) -> torch.Tensor:
+        row = experts[idx]
+        if row_transform is not None:
+            row = row_transform(row)
+        row = row[permute_indices].contiguous()
+        if after_permute is not None:
+            row = after_permute(row)
+        return row
+
+    first = _make_row(0)
+    out = torch.empty(
+        (experts.shape[0], *first.shape),
+        dtype=first.dtype,
+        device=first.device,
+    )
+    out[0].copy_(first)
+    for idx in range(1, experts.shape[0]):
+        out[idx].copy_(_make_row(idx))
+    return out
+
+
+def _copy_permuted_expert_rows_(
+    experts: torch.Tensor,
+    permute_indices: torch.Tensor,
+    *,
+    row_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    after_permute: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> torch.Tensor:
+    for idx in range(experts.shape[0]):
+        row = experts[idx]
+        if row_transform is not None:
+            row = row_transform(row)
+        row = row[permute_indices].contiguous()
+        if after_permute is not None:
+            row = after_permute(row)
+        experts[idx].copy_(row.reshape_as(experts[idx]))
+    return experts
+
+
 class Mxfp4FlashinferMxfp4Backend(MoEBackend):
     supported_arches = frozenset({"sm100"})
 
@@ -273,104 +321,140 @@ class Mxfp4FlashinferMxfp4Backend(MoEBackend):
         #     (``kind="w13"``) interleave before shuffling.
         w13_layout = getattr(layer, "w13_input_layout", "concatenated")
         if w13_layout == "interleaved":
-            w13_weight_scale = _pair_swap_rows(w13_weight_scale, -2)
-            w13_weight = _pair_swap_rows(w13_weight, -2)
-            w13_bias = _pair_swap_rows(w13_bias, -1)
+
+            def w13_weight_row(expert):
+                return _pair_swap_rows(expert, -2).view(torch.uint8)
+
+            def w13_scale_row(expert):
+                return _pair_swap_rows(expert, -2).view(torch.uint8)
+
+            def w13_bias_row(expert):
+                return _pair_swap_rows(expert, -1).reshape(-1, 1)
+
             w13_permute_kind = "w2"
         elif w13_layout == "concatenated":
-            w13_weight_scale = _reorder_w1w3_to_w3w1(w13_weight_scale, -2)
-            w13_weight = _reorder_w1w3_to_w3w1(w13_weight, -2)
-            w13_bias = _reorder_w1w3_to_w3w1(w13_bias, -1)
+
+            def w13_weight_row(expert):
+                return _reorder_w1w3_to_w3w1(expert, -2).view(torch.uint8)
+
+            def w13_scale_row(expert):
+                return _reorder_w1w3_to_w3w1(expert, -2).view(torch.uint8)
+
+            def w13_bias_row(expert):
+                return _reorder_w1w3_to_w3w1(expert, -1).reshape(-1, 1)
+
             w13_permute_kind = "w13"
         else:
             raise ValueError(f"unknown w13_input_layout: {w13_layout!r}")
 
-        # Shuffle weights and scaling factors for transposed mma output
-        gemm1_weights_shuffled = []
-        gemm1_scales_shuffled = []
-        gemm2_weights_shuffled = []
-        gemm2_scales_shuffled = []
-        gemm1_bias_shuffled = []
-        gemm2_bias_shuffled = []
+        def w2_weight_row(expert):
+            return expert.view(torch.uint8)
+
+        def w2_scale_row(expert):
+            return expert.view(torch.uint8)
+
+        def w2_bias_row(expert):
+            return expert.reshape(-1, 1)
+
         epilogue_tile_m = 128
 
         w13_weight_perm = _get_flashinfer_mxfp4_device_permute_indices(
-            w13_weight[0].view(torch.uint8),
+            w13_weight_row(w13_weight[0]),
             epilogue_tile_m,
             kind=w13_permute_kind,
         )
         w13_scale_perm = _get_flashinfer_mxfp4_device_permute_indices(
-            w13_weight_scale[0].view(torch.uint8),
+            w13_scale_row(w13_weight_scale[0]),
             epilogue_tile_m,
             num_elts_per_sf=16,
             kind=w13_permute_kind,
         )
         w13_bias_perm = _get_flashinfer_mxfp4_device_permute_indices(
-            w13_bias[0].reshape(-1, 1), epilogue_tile_m
+            w13_bias_row(w13_bias[0]), epilogue_tile_m
         )
         w2_weight_perm = _get_flashinfer_mxfp4_device_permute_indices(
-            w2_weight[0].view(torch.uint8), epilogue_tile_m, kind="w2"
+            w2_weight_row(w2_weight[0]), epilogue_tile_m, kind="w2"
         )
         w2_scale_perm = _get_flashinfer_mxfp4_device_permute_indices(
-            w2_weight_scale[0].view(torch.uint8),
+            w2_scale_row(w2_weight_scale[0]),
             epilogue_tile_m,
             num_elts_per_sf=16,
             kind="w2",
         )
         w2_bias_perm = _get_flashinfer_mxfp4_device_permute_indices(
-            w2_bias[0].reshape(-1, 1), epilogue_tile_m
+            w2_bias_row(w2_bias[0]), epilogue_tile_m
         )
-
-        for idx in range(num_experts):
-            gemm1_weights_shuffled.append(
-                w13_weight[idx].view(torch.uint8)[w13_weight_perm].contiguous()
-            )
-            gemm1_scales_shuffled.append(
-                nvfp4_block_scale_interleave(
-                    w13_weight_scale[idx].view(torch.uint8)[w13_scale_perm].contiguous()
-                )
-            )
-            gemm1_bias_shuffled.append(
-                w13_bias[idx].reshape(-1, 1)[w13_bias_perm].contiguous()
-            )
-            gemm2_weights_shuffled.append(
-                w2_weight[idx].view(torch.uint8)[w2_weight_perm].contiguous()
-            )
-            gemm2_scales_shuffled.append(
-                nvfp4_block_scale_interleave(
-                    w2_weight_scale[idx].view(torch.uint8)[w2_scale_perm].contiguous()
-                )
-            )
-            gemm2_bias_shuffled.append(
-                w2_bias[idx].reshape(-1, 1)[w2_bias_perm].contiguous()
-            )
 
         layer.w13_weight = Parameter(
-            torch.stack(gemm1_weights_shuffled), requires_grad=False
+            _copy_permuted_expert_rows_(
+                w13_weight,
+                w13_weight_perm,
+                row_transform=w13_weight_row,
+            ),
+            requires_grad=False,
         )
+        del w13_weight
+        torch.cuda.empty_cache()
+
         layer.w13_weight_scale = Parameter(
-            torch.stack(gemm1_scales_shuffled)
+            _copy_permuted_expert_rows_(
+                w13_weight_scale,
+                w13_scale_perm,
+                row_transform=w13_scale_row,
+                after_permute=nvfp4_block_scale_interleave,
+            )
             .reshape(num_experts, 2 * ispp_padded, hidden_padded // sf_block_size)
             .view(torch.float8_e4m3fn),
             requires_grad=False,
         )
+        del w13_weight_scale
+        torch.cuda.empty_cache()
+
         layer.w2_weight = Parameter(
-            torch.stack(gemm2_weights_shuffled), requires_grad=False
+            _copy_permuted_expert_rows_(
+                w2_weight,
+                w2_weight_perm,
+                row_transform=w2_weight_row,
+            ),
+            requires_grad=False,
         )
+        del w2_weight
+        torch.cuda.empty_cache()
+
         layer.w2_weight_scale = Parameter(
-            torch.stack(gemm2_scales_shuffled)
+            _copy_permuted_expert_rows_(
+                w2_weight_scale,
+                w2_scale_perm,
+                row_transform=w2_scale_row,
+                after_permute=nvfp4_block_scale_interleave,
+            )
             .reshape(num_experts, hidden_padded, ispp_padded // sf_block_size)
             .view(torch.float8_e4m3fn),
             requires_grad=False,
         )
+        del w2_weight_scale
+        torch.cuda.empty_cache()
+
         layer.w13_weight_bias = Parameter(
-            torch.stack(gemm1_bias_shuffled).reshape(num_experts, -1),
+            _copy_permuted_expert_rows_(
+                w13_bias,
+                w13_bias_perm,
+                row_transform=w13_bias_row,
+            ).reshape(num_experts, -1),
             requires_grad=False,
         )
+        del w13_bias
+        torch.cuda.empty_cache()
+
         layer.w2_weight_bias = Parameter(
-            torch.stack(gemm2_bias_shuffled).reshape(num_experts, -1),
+            _copy_permuted_expert_rows_(
+                w2_bias,
+                w2_bias_perm,
+                row_transform=w2_bias_row,
+            ).reshape(num_experts, -1),
             requires_grad=False,
         )
+        del w2_bias
         torch.cuda.empty_cache()
 
     def _call_kernel(self, router_logits, x_quant, x_scale, layer, top_k, output):

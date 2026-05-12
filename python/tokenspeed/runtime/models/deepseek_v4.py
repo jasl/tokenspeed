@@ -184,6 +184,8 @@ def _dequant_fp8_weight(layer: nn.Module, shape: tuple[int, ...]) -> torch.Tenso
 def _fp8_act_quant_dequant(x: torch.Tensor, block_size: int = 128) -> torch.Tensor:
     """Simulate DeepSeek V4's block FP8 activation quantization."""
 
+    global _DEEPSEEK_V4_SM12X_FP8_QUANT_UNAVAILABLE
+
     if x.shape[-1] % block_size != 0:
         raise ValueError(
             f"DeepSeek V4 FP8 activation quantization expects K divisible by "
@@ -191,7 +193,35 @@ def _fp8_act_quant_dequant(x: torch.Tensor, block_size: int = 128) -> torch.Tens
         )
     orig_shape = x.shape
 
-    if x.is_cuda and block_size == DEEPSEEK_V4_FP8_BLOCK_SIZE:
+    if (
+        not _DEEPSEEK_V4_SM12X_FP8_QUANT_UNAVAILABLE
+        and x.is_cuda
+        and block_size == DEEPSEEK_V4_FP8_BLOCK_SIZE
+        and _platform.is_sm12x
+        and x.dtype in {torch.float32, torch.float16, torch.bfloat16}
+    ):
+        try:
+            from tokenspeed_kernel.ops.gemm.sm12x_fp8 import (
+                sm12x_mxfp8_block128_quant_dequant_ue8m0,
+            )
+
+            if len(orig_shape) == 2:
+                return sm12x_mxfp8_block128_quant_dequant_ue8m0(x)
+            x_2d = x.reshape(-1, orig_shape[-1])
+            return sm12x_mxfp8_block128_quant_dequant_ue8m0(x_2d).reshape(orig_shape)
+        except Exception as exc:
+            _DEEPSEEK_V4_SM12X_FP8_QUANT_UNAVAILABLE = True
+            logger.warning(
+                "DeepSeek V4 SM12x FP8 activation quant-dequant is unavailable; "
+                "falling back to PyTorch reference. "
+                f"reason={type(exc).__name__}: {exc}"
+            )
+
+    if (
+        x.is_cuda
+        and block_size == DEEPSEEK_V4_FP8_BLOCK_SIZE
+        and _deepseek_v4_trtllm_fp8_quant_enabled_for_platform()
+    ):
         x_2d = x.reshape(-1, orig_shape[-1]).contiguous()
         try:
             quantized, scale = trtllm_fp8_quantize_1x128(
@@ -228,12 +258,60 @@ def _fp8_linear(
     *,
     quantize_act: bool = True,
 ) -> torch.Tensor:
-    weight = _dequant_fp8_weight(layer, shape)
+    global _DEEPSEEK_V4_SM12X_FP8_WEIGHT_GEMV_UNAVAILABLE
+
+    raw_weight = layer.weight.view(*shape)
     x_eff = (
         _fp8_act_quant_dequant(x, DEEPSEEK_V4_FP8_BLOCK_SIZE)
-        if quantize_act and layer.weight.dtype == torch.float8_e4m3fn
+        if quantize_act and raw_weight.dtype == torch.float8_e4m3fn
         else x.float()
     )
+    scale = getattr(layer, "weight_scale_inv", None)
+    block_n, block_k = getattr(
+        getattr(layer, "quant_config", None),
+        "weight_block_size",
+        (DEEPSEEK_V4_FP8_BLOCK_SIZE, DEEPSEEK_V4_FP8_BLOCK_SIZE),
+    )
+    if (
+        not _DEEPSEEK_V4_SM12X_FP8_WEIGHT_GEMV_UNAVAILABLE
+        and _platform.is_sm12x
+        and len(shape) == 2
+        and x_eff.dim() == 2
+        and x_eff.shape[0] <= 16
+        and x_eff.is_cuda
+        and x.dtype == torch.bfloat16
+        and raw_weight.is_cuda
+        and raw_weight.dtype == torch.float8_e4m3fn
+        and scale is not None
+        and scale.is_cuda
+        and block_n == DEEPSEEK_V4_FP8_BLOCK_SIZE
+        and block_k == DEEPSEEK_V4_FP8_BLOCK_SIZE
+    ):
+        out_dim, in_dim = shape
+        if in_dim % DEEPSEEK_V4_FP8_BLOCK_SIZE == 0:
+            try:
+                from tokenspeed_kernel.ops.gemm.sm12x_fp8 import (
+                    sm12x_fp8_weight_gemv_ue8m0,
+                )
+
+                scale = scale.view(
+                    (out_dim + block_n - 1) // block_n,
+                    in_dim // block_k,
+                )
+                return sm12x_fp8_weight_gemv_ue8m0(
+                    x_eff.contiguous(),
+                    raw_weight.contiguous(),
+                    scale.contiguous(),
+                )
+            except Exception as exc:
+                _DEEPSEEK_V4_SM12X_FP8_WEIGHT_GEMV_UNAVAILABLE = True
+                logger.warning(
+                    "DeepSeek V4 SM12x FP8 weight GEMV is unavailable; "
+                    "falling back to cached FP32 weight matmul. "
+                    f"reason={type(exc).__name__}: {exc}"
+                )
+
+    weight = _dequant_fp8_weight(layer, shape)
     return torch.matmul(x_eff, weight.transpose(-2, -1)).to(x.dtype)
 
 
@@ -379,6 +457,29 @@ def _sinkhorn(mixes: torch.Tensor, iters: int, eps: float) -> torch.Tensor:
 
 
 _DEEPSEEK_V4_FAST_MHC_UNAVAILABLE = False
+_DEEPSEEK_V4_SM12X_MHC_UNAVAILABLE = False
+_DEEPSEEK_V4_SM12X_FP8_QUANT_UNAVAILABLE = False
+_DEEPSEEK_V4_SM12X_FP8_WEIGHT_GEMV_UNAVAILABLE = False
+_DEEPSEEK_V4_SM12X_OUTPUT_PROJ_UNAVAILABLE = False
+
+
+def _deepseek_v4_fast_mhc_enabled_for_platform() -> bool:
+    return not _platform.is_sm12x
+
+
+def _deepseek_v4_sm12x_mhc_enabled_for_platform() -> bool:
+    return _platform.is_sm12x
+
+
+def _deepseek_v4_sm12x_mhc_input_supported(residual: torch.Tensor) -> bool:
+    if residual.dim() < 2:
+        return False
+    token_count = residual.numel() // (residual.shape[-2] * residual.shape[-1])
+    return token_count <= 16
+
+
+def _deepseek_v4_trtllm_fp8_quant_enabled_for_platform() -> bool:
+    return not _platform.is_sm12x
 
 
 def _mhc_pre_reference(
@@ -436,11 +537,12 @@ def mhc_pre(
     hc_eps: float,
     sinkhorn_iters: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    global _DEEPSEEK_V4_FAST_MHC_UNAVAILABLE
+    global _DEEPSEEK_V4_FAST_MHC_UNAVAILABLE, _DEEPSEEK_V4_SM12X_MHC_UNAVAILABLE
 
     if (
         not _DEEPSEEK_V4_FAST_MHC_UNAVAILABLE
         and not global_server_args_dict.get("disable_deepseek_v4_fast_mhc", False)
+        and _deepseek_v4_fast_mhc_enabled_for_platform()
         and residual.is_cuda
     ):
         try:
@@ -461,6 +563,34 @@ def mhc_pre(
             _DEEPSEEK_V4_FAST_MHC_UNAVAILABLE = True
             logger.warning(
                 "DeepSeek V4 fast mHC pre is unavailable; falling back to "
+                f"PyTorch reference. reason={type(exc).__name__}: {exc}"
+            )
+
+    if (
+        not _DEEPSEEK_V4_SM12X_MHC_UNAVAILABLE
+        and not global_server_args_dict.get("disable_deepseek_v4_fast_mhc", False)
+        and _deepseek_v4_sm12x_mhc_enabled_for_platform()
+        and residual.is_cuda
+        and _deepseek_v4_sm12x_mhc_input_supported(residual)
+    ):
+        try:
+            from tokenspeed.runtime.layers.deepseek_v4_mhc import (
+                sm12x_mhc_pre,
+            )
+
+            return sm12x_mhc_pre(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_eps,
+                sinkhorn_iters,
+            )
+        except Exception as exc:
+            _DEEPSEEK_V4_SM12X_MHC_UNAVAILABLE = True
+            logger.warning(
+                "DeepSeek V4 SM12x mHC pre is unavailable; falling back to "
                 f"PyTorch reference. reason={type(exc).__name__}: {exc}"
             )
 
@@ -494,11 +624,12 @@ def mhc_post(
     post: torch.Tensor,
     comb: torch.Tensor,
 ) -> torch.Tensor:
-    global _DEEPSEEK_V4_FAST_MHC_UNAVAILABLE
+    global _DEEPSEEK_V4_FAST_MHC_UNAVAILABLE, _DEEPSEEK_V4_SM12X_MHC_UNAVAILABLE
 
     if (
         not _DEEPSEEK_V4_FAST_MHC_UNAVAILABLE
         and not global_server_args_dict.get("disable_deepseek_v4_fast_mhc", False)
+        and _deepseek_v4_fast_mhc_enabled_for_platform()
         and hidden_states.is_cuda
     ):
         try:
@@ -511,6 +642,27 @@ def mhc_post(
             _DEEPSEEK_V4_FAST_MHC_UNAVAILABLE = True
             logger.warning(
                 "DeepSeek V4 fast mHC post is unavailable; falling back to "
+                f"PyTorch reference. reason={type(exc).__name__}: {exc}"
+            )
+
+    if (
+        not _DEEPSEEK_V4_SM12X_MHC_UNAVAILABLE
+        and not global_server_args_dict.get("disable_deepseek_v4_fast_mhc", False)
+        and _deepseek_v4_sm12x_mhc_enabled_for_platform()
+        and hidden_states.is_cuda
+        and residual.is_cuda
+        and _deepseek_v4_sm12x_mhc_input_supported(residual)
+    ):
+        try:
+            from tokenspeed.runtime.layers.deepseek_v4_mhc import (
+                sm12x_mhc_post,
+            )
+
+            return sm12x_mhc_post(hidden_states, residual, post, comb)
+        except Exception as exc:
+            _DEEPSEEK_V4_SM12X_MHC_UNAVAILABLE = True
+            logger.warning(
+                "DeepSeek V4 SM12x mHC post is unavailable; falling back to "
                 f"PyTorch reference. reason={type(exc).__name__}: {exc}"
             )
 
@@ -643,14 +795,37 @@ def _deepseek_v4_indexer_topk_from_cache_batched(
     if num_tokens == 0:
         return topk
 
+    is_capturing = positions.is_cuda and torch.cuda.is_current_stream_capturing()
+    capture_max_len = (
+        _deepseek_v4_indexer_decode_max_len(
+            block_table,
+            cache_block_size,
+            compress_ratio,
+        )
+        if is_capturing
+        else None
+    )
+    shortcut = _deepseek_v4_indexer_decode_all_candidate_topk(
+        positions=positions,
+        compress_ratio=compress_ratio,
+        topk_tokens=topk_tokens,
+        capture_max_len=capture_max_len,
+        out=topk,
+    )
+    if shortcut is not None:
+        return shortcut
+
     compressed_lens = torch.div(
         positions.to(torch.int64) + 1,
         compress_ratio,
         rounding_mode="floor",
     ).clamp_min(0)
-    max_len = int(compressed_lens.max().item())
-    if max_len <= 0:
-        return topk
+    if is_capturing:
+        max_len = capture_max_len
+    else:
+        max_len = int(compressed_lens.max().item())
+        if max_len <= 0:
+            return topk
 
     offsets = torch.arange(max_len, device=positions.device, dtype=torch.int64)
     local = offsets[None, :].expand(num_tokens, -1)
@@ -661,17 +836,27 @@ def _deepseek_v4_indexer_topk_from_cache_batched(
     page_ids = block_table[req_idx[:, None], pages.long()].to(torch.int64)
     slots = page_ids * cache_block_size + page_offsets
 
-    k_flat = cache_reader(
-        cache_2d,
-        slots[valid],
-        block_size=cache_block_size,
-    )
-    k_padded = torch.zeros(
-        (num_tokens, max_len, index_q.shape[-1]),
-        device=positions.device,
-        dtype=k_flat.dtype,
-    )
-    k_padded[valid] = k_flat
+    if is_capturing:
+        k_padded = cache_reader(
+            cache_2d,
+            slots.reshape(-1),
+            block_size=cache_block_size,
+        ).reshape(num_tokens, max_len, index_q.shape[-1])
+        k_padded = torch.where(
+            valid.unsqueeze(-1), k_padded, torch.zeros_like(k_padded)
+        )
+    else:
+        k_flat = cache_reader(
+            cache_2d,
+            slots[valid],
+            block_size=cache_block_size,
+        )
+        k_padded = torch.zeros(
+            (num_tokens, max_len, index_q.shape[-1]),
+            device=positions.device,
+            dtype=k_flat.dtype,
+        )
+        k_padded[valid] = k_flat
 
     scores = torch.bmm(index_q.float(), k_padded.float().transpose(1, 2)).relu_()
     logits = torch.bmm(weights.float().unsqueeze(1), scores).squeeze(1)
@@ -693,7 +878,11 @@ def _deepseek_v4_indexer_topk_from_cache_batched(
             topk[row_mask, :selected] = token_topk.to(torch.int32)
         return topk
 
-    if logits.is_cuda and topk_tokens in (512, 1024, 2048):
+    if (
+        logits.is_cuda
+        and _deepseek_v4_fast_topk_enabled_for_platform()
+        and topk_tokens in (512, 1024, 2048)
+    ):
         from tokenspeed_kernel.thirdparty.trtllm import fast_topk_v2
 
         fast_topk_v2(
@@ -712,6 +901,55 @@ def _deepseek_v4_indexer_topk_from_cache_batched(
         torch.full_like(indices, -1),
     ).to(torch.int32)
     topk[:, :selected] = indices
+    return topk
+
+
+def _deepseek_v4_indexer_decode_all_candidate_topk(
+    *,
+    positions: torch.Tensor,
+    compress_ratio: int,
+    topk_tokens: int,
+    capture_max_len: int | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    num_tokens = positions.numel()
+    topk = (
+        torch.empty(
+            (num_tokens, topk_tokens),
+            device=positions.device,
+            dtype=torch.int32,
+        )
+        if out is None
+        else out[:num_tokens]
+    )
+    topk.fill_(-1)
+    if num_tokens == 0:
+        return topk
+
+    compressed_lens = torch.div(
+        positions.to(torch.int64) + 1,
+        compress_ratio,
+        rounding_mode="floor",
+    ).clamp_min(0)
+    if positions.is_cuda and torch.cuda.is_current_stream_capturing():
+        if capture_max_len is None:
+            return None
+        max_len = capture_max_len
+    else:
+        max_len = int(compressed_lens.max().item())
+        if max_len <= 0:
+            return topk
+    if max_len > topk_tokens:
+        return None
+
+    offsets = torch.arange(max_len, device=positions.device, dtype=torch.int64)
+    local = offsets[None, :].expand(num_tokens, -1)
+    valid = local < compressed_lens[:, None]
+    topk[:, :max_len] = torch.where(
+        valid,
+        local,
+        torch.full_like(local, -1),
+    ).to(torch.int32)
     return topk
 
 
@@ -763,6 +1001,7 @@ def _deepseek_v4_indexer_prefill_topk_chunks(
 def _deepseek_v4_deepgemm_fp4_indexer_available(index_q: torch.Tensor) -> bool:
     return (
         deep_gemm is not None
+        and _deepseek_v4_deepgemm_fp4_indexer_enabled_for_platform()
         and index_q.is_cuda
         and index_q.dim() >= 3
         and index_q.shape[-2] in (32, 64)
@@ -771,6 +1010,14 @@ def _deepseek_v4_deepgemm_fp4_indexer_available(index_q: torch.Tensor) -> bool:
         and getattr(deep_gemm, "fp8_fp4_paged_mqa_logits", None) is not None
         and getattr(deep_gemm, "get_paged_mqa_logits_metadata", None) is not None
     )
+
+
+def _deepseek_v4_deepgemm_fp4_indexer_enabled_for_platform() -> bool:
+    return not _platform.is_sm12x
+
+
+def _deepseek_v4_fast_topk_enabled_for_platform() -> bool:
+    return not _platform.is_sm12x
 
 
 def _deepseek_v4_indexer_mxfp4_cache_view(
@@ -1940,6 +2187,254 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         return y
 
 
+class DeepseekV4Sm12xMoEExperts(nn.Module):
+    def __init__(
+        self,
+        *,
+        num_experts: int,
+        num_local_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        mapping: Mapping,
+        prefix: str,
+    ) -> None:
+        super().__init__()
+        self.prefix = prefix
+        self.num_experts = num_experts
+        self.num_local_experts = num_local_experts
+        self.top_k = top_k
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.mapping = mapping
+        self._weights_finalized = False
+        self._output_buffer: torch.Tensor | None = None
+        self._intermediate_buffer: torch.Tensor | None = None
+
+        if hidden_size % DEEPSEEK_V4_MXFP4_BLOCK_SIZE != 0:
+            raise ValueError("DeepSeek V4 SM12x MoE hidden size must align to MXFP4.")
+        if intermediate_size % DEEPSEEK_V4_MXFP4_BLOCK_SIZE != 0:
+            raise ValueError(
+                "DeepSeek V4 SM12x MoE intermediate size must align to MXFP4."
+            )
+
+        weight_attrs = {"weight_loader": self.weight_loader}
+        self.w13_weight = nn.Parameter(
+            torch.zeros(
+                num_local_experts,
+                2 * intermediate_size,
+                hidden_size // 2,
+                dtype=torch.uint8,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(self.w13_weight, weight_attrs)
+
+        self.w13_weight_scale = nn.Parameter(
+            torch.zeros(
+                num_local_experts,
+                2 * intermediate_size,
+                hidden_size // DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
+                dtype=torch.uint8,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(self.w13_weight_scale, weight_attrs)
+
+        self.w2_weight = nn.Parameter(
+            torch.zeros(
+                num_local_experts,
+                hidden_size,
+                intermediate_size // 2,
+                dtype=torch.uint8,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(self.w2_weight, weight_attrs)
+
+        self.w2_weight_scale = nn.Parameter(
+            torch.zeros(
+                num_local_experts,
+                hidden_size,
+                intermediate_size // DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
+                dtype=torch.uint8,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(self.w2_weight_scale, weight_attrs)
+
+        self.w13_weight_bias = nn.Parameter(
+            torch.zeros(
+                num_local_experts,
+                2 * intermediate_size,
+                dtype=torch.bfloat16,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(self.w13_weight_bias, weight_attrs)
+
+        self.w2_weight_bias = nn.Parameter(
+            torch.zeros(num_local_experts, hidden_size, dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        set_weight_attrs(self.w2_weight_bias, weight_attrs)
+
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        shard_id: str,
+        local_expert_id: int,
+    ) -> None:
+        expert_data = param.data[local_expert_id]
+        if shard_id in ("w1", "w3"):
+            if not (
+                param is self.w13_weight
+                or param is self.w13_weight_scale
+                or param is self.w13_weight_bias
+            ):
+                raise ValueError(f"Unexpected SM12x MoE w13 shard target: {shard_id}")
+            shard_offset = 0 if shard_id == "w1" else self.intermediate_size
+            expert_data = expert_data.narrow(0, shard_offset, self.intermediate_size)
+        elif shard_id == "w2":
+            if not (
+                param is self.w2_weight
+                or param is self.w2_weight_scale
+                or param is self.w2_weight_bias
+            ):
+                raise ValueError(f"Unexpected SM12x MoE w2 shard target: {shard_id}")
+        else:
+            raise ValueError(f"Unsupported DeepSeek V4 SM12x MoE shard id: {shard_id}")
+
+        if expert_data.dtype == torch.uint8 and loaded_weight.dtype == getattr(
+            torch, "float8_e8m0fnu", None
+        ):
+            loaded_weight = loaded_weight.view(torch.uint8)
+        if expert_data.shape != loaded_weight.shape:
+            raise ValueError(
+                f"DeepSeek V4 SM12x MoE expert weight shape mismatch for "
+                f"{self.prefix}: parameter shard {tuple(expert_data.shape)} "
+                f"vs checkpoint {tuple(loaded_weight.shape)}"
+            )
+        expert_data.copy_(loaded_weight)
+
+    @staticmethod
+    def _as_float32_parameter(param: nn.Parameter) -> nn.Parameter:
+        return nn.Parameter(param.data.to(torch.float32), requires_grad=False)
+
+    def finalize_weights(self) -> None:
+        if self._weights_finalized:
+            return
+        self.w13_weight_bias = self._as_float32_parameter(self.w13_weight_bias)
+        self.w2_weight_bias = self._as_float32_parameter(self.w2_weight_bias)
+        self._weights_finalized = True
+
+    @staticmethod
+    def _check_runtime_supported(hidden_states: torch.Tensor) -> None:
+        if not hidden_states.is_cuda:
+            return
+        capability = torch.cuda.get_device_capability(hidden_states.device)
+        if capability not in ((12, 0), (12, 1)):
+            raise NotImplementedError(
+                "DeepSeek V4 SM12x MXFP4 MoE requires SM120 or SM121 GPUs."
+            )
+
+    @staticmethod
+    def _forward_impl() -> tuple[Callable[..., torch.Tensor], bool]:
+        if os.getenv("TOKENSPEED_SM12X_MXFP4_REFERENCE_FORWARD") == "1":
+            from tokenspeed_kernel.ops.moe.sm12x_mxfp4 import (
+                sm12x_mxfp4_moe_reference_forward,
+            )
+
+            return sm12x_mxfp4_moe_reference_forward, False
+
+        from tokenspeed_kernel.ops.moe.sm12x_mxfp4 import sm12x_mxfp4_moe_forward
+
+        return sm12x_mxfp4_moe_forward, True
+
+    def _get_work_buffers(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = hidden_states.shape[0]
+        capacity = max(num_tokens, _deepseek_v4_mega_moe_max_num_tokens())
+        output_shape = (capacity, self.hidden_size)
+        intermediate_shape = (capacity, self.top_k, self.intermediate_size)
+
+        if (
+            self._output_buffer is None
+            or self._output_buffer.device != hidden_states.device
+            or self._output_buffer.dtype != hidden_states.dtype
+            or self._output_buffer.shape[0] < capacity
+            or self._output_buffer.shape[1] != self.hidden_size
+        ):
+            self._output_buffer = torch.empty(
+                output_shape,
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+
+        if (
+            self._intermediate_buffer is None
+            or self._intermediate_buffer.device != hidden_states.device
+            or self._intermediate_buffer.shape[0] < capacity
+            or self._intermediate_buffer.shape[1] != self.top_k
+            or self._intermediate_buffer.shape[2] != self.intermediate_size
+        ):
+            self._intermediate_buffer = torch.empty(
+                intermediate_shape,
+                device=hidden_states.device,
+                dtype=torch.float32,
+            )
+
+        return (
+            self._output_buffer[:num_tokens],
+            self._intermediate_buffer[:num_tokens],
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        *,
+        activation_clamp: float | None,
+    ) -> torch.Tensor:
+        assert self._weights_finalized, (
+            "DeepseekV4Sm12xMoEExperts.finalize_weights() must run via "
+            "post_load_weights() before forward()"
+        )
+        self._check_runtime_supported(hidden_states)
+        if topk_ids.dtype != torch.int32:
+            topk_ids = topk_ids.to(torch.int32)
+
+        forward_impl, supports_work_buffers = self._forward_impl()
+        kwargs: dict[str, Any] = {}
+        if supports_work_buffers:
+            output, intermediate = self._get_work_buffers(hidden_states)
+            kwargs["output"] = output
+            kwargs["intermediate"] = intermediate
+
+        return forward_impl(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            self.w13_weight,
+            self.w13_weight_scale,
+            self.w2_weight,
+            self.w2_weight_scale,
+            w13_bias=self.w13_weight_bias,
+            w2_bias=self.w2_weight_bias,
+            activation="swiglu",
+            swiglu_alpha=None,
+            swiglu_limit=activation_clamp,
+            swiglu_beta=None,
+            ep_rank=self.mapping.moe.ep_rank,
+            ep_size=self.mapping.moe.ep_size,
+            **kwargs,
+        )
+
+
 class DeepseekV4MoE(nn.Module):
     def __init__(
         self,
@@ -1962,7 +2457,9 @@ class DeepseekV4MoE(nn.Module):
             )
         from tokenspeed.runtime.layers.moe.utils import get_moe_backend
 
-        self.use_mega_moe = get_moe_backend().is_mega_moe()
+        moe_backend = get_moe_backend()
+        self.use_mega_moe = moe_backend.is_mega_moe()
+        self.use_sm12x_mxfp4 = moe_backend.is_sm12x_mxfp4()
         if self.use_mega_moe:
             if _deepseek_v4_get_mega_deep_gemm() is None:
                 raise RuntimeError(
@@ -1981,6 +2478,24 @@ class DeepseekV4MoE(nn.Module):
                 raise ValueError(
                     "DeepSeek V4 MegaMoE requires n_routed_experts divisible by "
                     "EP size."
+                )
+        if self.use_sm12x_mxfp4:
+            if not _platform.is_sm12x:
+                raise ValueError(
+                    "DeepSeek V4 SM12x MXFP4 backend requires SM120 or SM121."
+                )
+            if mapping.moe.tp_size != 1:
+                raise ValueError(
+                    "DeepSeek V4 SM12x MXFP4 backend does not support mixed TP/EP."
+                )
+            if global_server_args_dict.get("ep_num_redundant_experts", 0):
+                raise ValueError(
+                    "DeepSeek V4 SM12x MXFP4 backend does not support redundant EP experts."
+                )
+            if config.n_routed_experts % mapping.moe.ep_size != 0:
+                raise ValueError(
+                    "DeepSeek V4 SM12x MXFP4 backend requires n_routed_experts "
+                    "divisible by EP size."
                 )
         self.hash_indices_dtype = torch.int64 if self.use_mega_moe else torch.int32
         self.gate = DeepseekV4MoEGate(
@@ -2006,6 +2521,17 @@ class DeepseekV4MoE(nn.Module):
 
         if self.use_mega_moe:
             self.experts = DeepseekV4MegaMoEExperts(
+                num_experts=config.n_routed_experts,
+                num_local_experts=config.n_routed_experts // mapping.moe.ep_size,
+                top_k=config.num_experts_per_tok,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                mapping=mapping,
+                prefix=add_prefix("experts", prefix),
+            )
+            self.topk = None
+        elif self.use_sm12x_mxfp4:
+            self.experts = DeepseekV4Sm12xMoEExperts(
                 num_experts=config.n_routed_experts,
                 num_local_experts=config.n_routed_experts // mapping.moe.ep_size,
                 top_k=config.num_experts_per_tok,
@@ -2094,7 +2620,7 @@ class DeepseekV4MoE(nn.Module):
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0 and not self.use_mega_moe:
             return hidden_states
-        if self.use_mega_moe:
+        if self.use_mega_moe or self.use_sm12x_mxfp4:
             if hidden_states.shape[0] == 0:
                 topk_weights = hidden_states.new_empty(
                     (0, self.config.num_experts_per_tok), dtype=torch.float32
@@ -2102,16 +2628,20 @@ class DeepseekV4MoE(nn.Module):
                 topk_ids = torch.empty(
                     (0, self.config.num_experts_per_tok),
                     device=hidden_states.device,
-                    dtype=torch.int64,
+                    dtype=torch.int64 if self.use_mega_moe else torch.int32,
                 )
             else:
                 with deepseek_v4_profile_scope("moe_select_experts"):
                     topk_weights, topk_ids, _ = self._select_experts(
                         hidden_states, input_ids
                     )
-            with deepseek_v4_profile_scope("moe_mega_experts"):
-                if topk_ids.dtype != torch.int64:
-                    topk_ids = topk_ids.to(torch.int64)
+            profile_scope = (
+                "moe_mega_experts" if self.use_mega_moe else "moe_sm12x_experts"
+            )
+            with deepseek_v4_profile_scope(profile_scope):
+                topk_ids_dtype = torch.int64 if self.use_mega_moe else torch.int32
+                if topk_ids.dtype != topk_ids_dtype:
+                    topk_ids = topk_ids.to(topk_ids_dtype)
                 if self.routed_scaling_factor != 1.0:
                     topk_weights = topk_weights * self.routed_scaling_factor
                 routed = self.experts(
@@ -2122,9 +2652,12 @@ class DeepseekV4MoE(nn.Module):
                 )
             if self.shared_experts is not None:
                 with deepseek_v4_profile_scope("moe_shared_experts"):
-                    shared = self._forward_shared_experts_for_mega_moe(
-                        hidden_states, global_num_tokens_per_rank
-                    )
+                    if self.use_mega_moe:
+                        shared = self._forward_shared_experts_for_mega_moe(
+                            hidden_states, global_num_tokens_per_rank
+                        )
+                    else:
+                        shared = self.shared_experts(hidden_states)
                 routed = routed + shared
             return routed
         with deepseek_v4_profile_scope("moe_select_experts"):
@@ -2384,7 +2917,10 @@ class DeepseekV4Indexer(nn.Module):
         if metadata is None:
             raise RuntimeError("DeepSeek V4 indexer requires forward metadata")
         indexer_state = pool.get_indexer_state_buffer(layer_index)
-        indexer_state_block_table = metadata.indexer_state_block_table
+        indexer_state_block_table = getattr(metadata, "indexer_state_block_table", None)
+        indexer_state_base_logical_page = getattr(
+            metadata, "indexer_state_base_logical_page", None
+        )
         if indexer_state_block_table is not None:
             indexer_state_block_size = pool.get_indexer_state_block_size(layer_index)
             indexer_state_slot_mapping = _group_slot_mapping_from_raw(
@@ -2392,7 +2928,7 @@ class DeepseekV4Indexer(nn.Module):
                 metadata.token_to_req_indices[: positions.numel()],
                 indexer_state_block_table,
                 indexer_state_block_size,
-                base_offsets=metadata.indexer_state_base_logical_page,
+                base_offsets=indexer_state_base_logical_page,
             )
         else:
             indexer_state_block_table = metadata.block_table
@@ -2409,7 +2945,7 @@ class DeepseekV4Indexer(nn.Module):
                 state_cache=indexer_state,
                 state_block_table=indexer_state_block_table,
                 state_block_size=indexer_state_block_size,
-                state_base_logical_page=metadata.indexer_state_base_logical_page,
+                state_base_logical_page=indexer_state_base_logical_page,
                 write_compressed_cache=False,
             )
         with deepseek_v4_profile_scope("indexer_compressed_slot_mapping"):
@@ -2430,7 +2966,7 @@ class DeepseekV4Indexer(nn.Module):
                 positions=positions,
                 compressor_slot_mapping=indexer_state_slot_mapping,
                 block_table=indexer_state_block_table,
-                block_table_base_offsets=metadata.indexer_state_base_logical_page,
+                block_table_base_offsets=indexer_state_base_logical_page,
                 compressor_block_size=indexer_state_block_size,
                 rms_norm_weight=self.compressor.norm.weight,
                 rms_norm_eps=self.compressor.norm.variance_epsilon,
@@ -2441,6 +2977,20 @@ class DeepseekV4Indexer(nn.Module):
                 use_fp4_cache=self.use_fp4_cache,
                 compress_ratio=self.compress_ratio,
             )
+        if ctx.forward_mode is not None and ctx.forward_mode.is_decode():
+            topk_out = (
+                self.topk_buffer.get(positions.numel(), positions.device)
+                if self.topk_buffer is not None
+                else None
+            )
+            topk = _deepseek_v4_indexer_decode_all_candidate_topk(
+                positions=positions,
+                compress_ratio=self.compress_ratio,
+                topk_tokens=self.topk_tokens,
+                out=topk_out,
+            )
+            if topk is not None:
+                return topk
         with deepseek_v4_profile_scope("indexer_wq_b"):
             index_q, _ = self.wq_b(qr)
             index_q = index_q.view(-1, self.n_head, self.head_dim)
@@ -2504,7 +3054,7 @@ class DeepseekV4Indexer(nn.Module):
                 if self.topk_buffer is not None
                 else None
             )
-            return _deepseek_v4_indexer_topk_from_cache_batched(
+            topk = _deepseek_v4_indexer_topk_from_cache_batched(
                 cache_reader=cache_reader,
                 cache_2d=pool.get_indexer_kv_buffer_2d(layer_index),
                 positions=positions,
@@ -2517,6 +3067,7 @@ class DeepseekV4Indexer(nn.Module):
                 topk_tokens=self.topk_tokens,
                 out=topk_out,
             )
+            return topk
 
         indexer_cache = pool.get_indexer_kv_buffer_2d(layer_index)
         topk_chunks = []
@@ -2984,7 +3535,76 @@ class DeepseekV4Attention(nn.Module):
         attn_output: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
+        global _DEEPSEEK_V4_SM12X_OUTPUT_PROJ_UNAVAILABLE
+
         heads_per_group = self.num_local_heads // self.num_local_groups
+        wo_a_scale = getattr(self.wo_a, "weight_scale_inv", None)
+        if (
+            not _DEEPSEEK_V4_SM12X_OUTPUT_PROJ_UNAVAILABLE
+            and _platform.is_sm12x
+            and attn_output.is_cuda
+            and positions.is_cuda
+            and attn_output.dim() == 3
+            and attn_output.shape[0] <= 16
+            and attn_output.dtype == torch.bfloat16
+            and self.wo_a.weight.is_cuda
+            and self.wo_a.weight.dtype == torch.float8_e4m3fn
+            and wo_a_scale is not None
+            and wo_a_scale.is_cuda
+            and self.o_lora_rank % DEEPSEEK_V4_FP8_BLOCK_SIZE == 0
+            and (heads_per_group * self.head_dim) % DEEPSEEK_V4_FP8_BLOCK_SIZE == 0
+        ):
+            try:
+                from tokenspeed_kernel.ops.attention.deepseek_v4 import (
+                    deepseek_v4_fp8_einsum_sm12x_triton,
+                    deepseek_v4_fused_inv_rope_fp8_quant_triton,
+                )
+
+                if (
+                    deepseek_v4_fp8_einsum_sm12x_triton is None
+                    or deepseek_v4_fused_inv_rope_fp8_quant_triton is None
+                ):
+                    raise RuntimeError("SM12x Triton projection kernels unavailable")
+                grouped_fp8, grouped_scale = (
+                    deepseek_v4_fused_inv_rope_fp8_quant_triton(
+                        attn_output,
+                        positions,
+                        self._cos_sin_cache(),
+                        n_groups=self.num_local_groups,
+                        heads_per_group=heads_per_group,
+                        nope_dim=self.nope_head_dim,
+                        rope_dim=self.qk_rope_head_dim,
+                    )
+                )
+                z = torch.empty(
+                    (
+                        attn_output.shape[0],
+                        self.num_local_groups,
+                        self.o_lora_rank,
+                    ),
+                    dtype=attn_output.dtype,
+                    device=attn_output.device,
+                )
+                deepseek_v4_fp8_einsum_sm12x_triton(
+                    grouped_fp8,
+                    grouped_scale,
+                    self.wo_a.weight,
+                    wo_a_scale,
+                    z,
+                )
+                return self._fp8_linear(
+                    self.wo_b,
+                    z.flatten(1),
+                    (self.wo_b.output_size, self.wo_b.input_size_per_partition),
+                )
+            except Exception as exc:
+                _DEEPSEEK_V4_SM12X_OUTPUT_PROJ_UNAVAILABLE = True
+                logger.warning(
+                    "DeepSeek V4 SM12x attention output projection kernel is "
+                    "unavailable; falling back to BF16 inverse-RoPE/bmm. "
+                    f"reason={type(exc).__name__}: {exc}"
+                )
+
         grouped = deepseek_v4_inv_rope_reference(
             attn_output,
             positions,
@@ -3485,6 +4105,8 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             if isinstance(module, DeepseekV4Compressor):
                 module.process_weights_after_loading()
             elif isinstance(module, DeepseekV4MegaMoEExperts):
+                module.finalize_weights()
+            elif isinstance(module, DeepseekV4Sm12xMoEExperts):
                 module.finalize_weights()
             elif isinstance(module, MoELayer):
                 module.process_weights_after_loading(module)

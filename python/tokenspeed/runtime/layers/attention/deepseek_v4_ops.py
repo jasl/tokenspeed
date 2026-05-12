@@ -88,13 +88,30 @@ def _has_tokenspeed_op() -> bool:
     return has_op()
 
 
+def _deepseek_v4_tensor_is_sm12x_cuda(tensor: torch.Tensor) -> bool:
+    if not tensor.is_cuda:
+        return False
+    try:
+        major, _minor = torch.cuda.get_device_capability(tensor.device)
+    except Exception:
+        return False
+    return major == 12
+
+
 def has_fused_qnorm_rope_kv_insert() -> bool:
     return _has_tokenspeed_op()
 
 
-def _require_op():
+def _available_op():
     tokenspeed_op = _get_tokenspeed_op()
     if tokenspeed_op is not None and _has_tokenspeed_op():
+        return tokenspeed_op
+    return None
+
+
+def _require_op():
+    tokenspeed_op = _available_op()
+    if tokenspeed_op is not None:
         return tokenspeed_op
     raise DeepseekV4AttentionOpUnavailable(
         f"DeepSeek V4 fused SWA cache insert op {QNORM_ROPE_KV_INSERT_OP} "
@@ -123,17 +140,141 @@ def fused_qnorm_rope_kv_insert(
     - positions: absolute token positions
     """
 
-    op = _require_op()
+    if _deepseek_v4_tensor_is_sm12x_cuda(q):
+        op = _available_op()
+        if op is None:
+            _fused_qnorm_rope_kv_insert_reference(
+                q,
+                kv,
+                swa_kv_cache_2d,
+                slot_mapping,
+                positions,
+                cos_sin_cache,
+                rms_norm_eps,
+                block_size,
+            )
+            return
+    else:
+        op = _require_op()
+
     op(
         q,
         kv,
         swa_kv_cache_2d,
-        slot_mapping,
+        slot_mapping.to(torch.int64),
         positions.to(torch.int64),
         cos_sin_cache,
         rms_norm_eps,
         block_size,
     )
+
+
+def _fused_qnorm_rope_kv_insert_reference(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    swa_kv_cache_2d: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    rms_norm_eps: float,
+    block_size: int,
+) -> None:
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError(f"q must be float16 or bfloat16, got {q.dtype}")
+    if kv.dtype != q.dtype:
+        raise TypeError(f"kv dtype {kv.dtype} must match q dtype {q.dtype}")
+    if q.dim() != 3 or q.shape[-1] != DEEPSEEK_V4_HEAD_DIM:
+        raise ValueError(f"q must be [tokens, heads, 512], got {tuple(q.shape)}")
+    if kv.dim() != 2 or kv.shape[-1] != DEEPSEEK_V4_HEAD_DIM:
+        raise ValueError(f"kv must be [tokens, 512], got {tuple(kv.shape)}")
+    if kv.shape[0] != q.shape[0]:
+        raise ValueError(
+            f"q and kv token counts must match, got {q.shape[0]} and {kv.shape[0]}"
+        )
+    if swa_kv_cache_2d.dtype != torch.uint8:
+        raise TypeError(f"swa_kv_cache_2d must be uint8, got {swa_kv_cache_2d.dtype}")
+    if swa_kv_cache_2d.dim() != 2:
+        raise ValueError(
+            f"swa_kv_cache_2d must be [blocks, block_bytes], got {tuple(swa_kv_cache_2d.shape)}"
+        )
+    min_block_bytes = block_size * (
+        DEEPSEEK_V4_SWA_TOKEN_STRIDE + DEEPSEEK_V4_SWA_SCALE_DIM
+    )
+    if swa_kv_cache_2d.shape[1] < min_block_bytes:
+        raise ValueError(
+            f"swa_kv_cache_2d block bytes must be at least {min_block_bytes}, "
+            f"got {swa_kv_cache_2d.shape[1]}"
+        )
+    if positions.numel() != q.shape[0]:
+        raise ValueError(
+            f"positions must cover all q rows, got {positions.numel()} and {q.shape[0]}"
+        )
+    if slot_mapping.numel() > q.shape[0]:
+        raise ValueError(
+            f"slot_mapping cannot be longer than q, got {slot_mapping.numel()} and {q.shape[0]}"
+        )
+    if cos_sin_cache.dtype != torch.float32:
+        raise TypeError(f"cos_sin_cache must be float32, got {cos_sin_cache.dtype}")
+    if cos_sin_cache.dim() != 2 or cos_sin_cache.shape[1] != DEEPSEEK_V4_ROPE_DIM:
+        raise ValueError(
+            f"cos_sin_cache must be [positions, {DEEPSEEK_V4_ROPE_DIM}], "
+            f"got {tuple(cos_sin_cache.shape)}"
+        )
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+
+    positions_i64 = positions.to(torch.int64)
+    q_float = q.float()
+    q_scale = torch.rsqrt(q_float.square().mean(dim=-1, keepdim=True) + rms_norm_eps)
+    q.copy_(
+        _apply_gptj_rope_tail_rows(
+            q_float * q_scale,
+            positions_i64,
+            cos_sin_cache,
+            DEEPSEEK_V4_ROPE_DIM,
+        ).to(q.dtype)
+    )
+
+    if slot_mapping.numel() == 0:
+        return
+
+    kv_rope = _apply_gptj_rope_tail_rows(
+        kv.float(),
+        positions_i64,
+        cos_sin_cache,
+        DEEPSEEK_V4_ROPE_DIM,
+    ).to(kv.dtype)
+
+    slot_mapping_i64 = slot_mapping.to(torch.int64)
+    num_nope_blocks = DEEPSEEK_V4_NOPE_DIM // DEEPSEEK_V4_FP8_QUANT_BLOCK
+    for token_idx, slot in enumerate(slot_mapping_i64.tolist()):
+        if slot < 0:
+            continue
+        block_idx = slot // block_size
+        pos_in_block = slot % block_size
+        block = swa_kv_cache_2d[block_idx]
+        token_base = pos_in_block * DEEPSEEK_V4_SWA_TOKEN_STRIDE
+        scale_base = (
+            block_size * DEEPSEEK_V4_SWA_TOKEN_STRIDE
+            + pos_in_block * DEEPSEEK_V4_SWA_SCALE_DIM
+        )
+        row = kv_rope[token_idx]
+        for qblock in range(num_nope_blocks):
+            start = qblock * DEEPSEEK_V4_FP8_QUANT_BLOCK
+            qbytes, scale_byte = _fp8_e4m3_ue8m0_bytes(
+                row[start : start + DEEPSEEK_V4_FP8_QUANT_BLOCK].float()
+            )
+            block[
+                token_base + start : token_base + start + DEEPSEEK_V4_FP8_QUANT_BLOCK
+            ].copy_(qbytes)
+            block[scale_base + qblock] = scale_byte
+        block[scale_base + num_nope_blocks : scale_base + DEEPSEEK_V4_SWA_SCALE_DIM] = 0
+        rope_bytes = row[DEEPSEEK_V4_NOPE_DIM:].contiguous().view(torch.uint8)
+        block[
+            token_base
+            + DEEPSEEK_V4_NOPE_DIM : token_base
+            + DEEPSEEK_V4_SWA_TOKEN_STRIDE
+        ].copy_(rope_bytes)
 
 
 def _apply_gptj_rope_tail(
@@ -248,11 +389,13 @@ def _e2m1_nibbles(x: torch.Tensor) -> torch.Tensor:
 
 
 def _e2m1_values(nibbles: torch.Tensor) -> torch.Tensor:
-    table = nibbles.new_tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
+    code = (nibbles & 0x7).to(torch.float32)
+    magnitude = torch.where(
+        code <= 4.0,
+        code * 0.5,
+        torch.where(code == 5.0, 3.0, torch.where(code == 6.0, 4.0, 6.0)),
     )
-    magnitude = table[(nibbles & 0x7).long()]
-    sign = torch.where((nibbles & 0x8) != 0, -1.0, 1.0)
+    sign = 1.0 - ((nibbles & 0x8) != 0).to(torch.float32) * 2.0
     return magnitude * sign
 
 
@@ -602,6 +745,9 @@ def _mxfp4_e2m1_ue8m0_quantize_rows(
 
 
 def _deepseek_v4_hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
+    if _deepseek_v4_use_torch_hadamard_fallback(x):
+        return _deepseek_v4_hadamard_rotate_torch(x)
+
     try:
         from tokenspeed_kernel.thirdparty.fast_hadamard_transform import (
             hadamard_transform,
@@ -618,6 +764,36 @@ def _deepseek_v4_hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
         scale=shape[-1] ** -0.5,
     )
     return rotated.reshape(shape)
+
+
+def _deepseek_v4_use_torch_hadamard_fallback(x: torch.Tensor) -> bool:
+    if not x.is_cuda:
+        return False
+    try:
+        from tokenspeed_kernel.platform import current_platform
+
+        return bool(getattr(current_platform(), "is_sm12x", False))
+    except Exception:
+        return False
+
+
+def _deepseek_v4_hadamard_rotate_torch(x: torch.Tensor) -> torch.Tensor:
+    shape = x.shape
+    width = shape[-1]
+    if width <= 0 or width & (width - 1) != 0:
+        raise ValueError(f"Hadamard rotate requires power-of-two dim, got {width}")
+
+    y = x.to(torch.bfloat16).reshape(-1, width).float()
+    h = 1
+    while h < width:
+        y = y.reshape(-1, width // (h * 2), h * 2)
+        lo = y[..., :h].clone()
+        hi = y[..., h:].clone()
+        y[..., :h] = lo + hi
+        y[..., h:] = lo - hi
+        y = y.reshape(-1, width)
+        h *= 2
+    return (y * (width**-0.5)).to(torch.bfloat16).reshape(shape)
 
 
 def deepseek_v4_inv_rope_reference(

@@ -13,7 +13,10 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -106,6 +109,124 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             num_reqs,
             workspace_width,
             head_dim,
+        )
+
+    def _use_sm12x_attention_fallback(self) -> bool:
+        platform = current_platform()
+        return bool(getattr(platform, "is_sm12x", False))
+
+    def _use_sparse_mla_fp8_cache_cuda(self) -> bool:
+        env = os.getenv("TOKENSPEED_DEEPSEEK_V4_CUDA_SPARSE_MLA_CACHE")
+        if env is not None:
+            return env == "1"
+        return self._use_sm12x_attention_fallback()
+
+    def _use_sparse_mla_online_softmax(self) -> bool:
+        env = os.getenv("TOKENSPEED_DEEPSEEK_V4_CUDA_SPARSE_MLA_ONLINE_SOFTMAX")
+        if env is not None:
+            return env == "1"
+        return self._use_sm12x_attention_fallback()
+
+    def _forward_sparse_mla_reference(
+        self,
+        *,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        indices: torch.Tensor,
+        sm_scale: float,
+        attn_sink: torch.Tensor,
+        topk_length: torch.Tensor,
+    ) -> torch.Tensor:
+        if os.getenv("TOKENSPEED_DEEPSEEK_V4_CUDA_SPARSE_MLA") == "1" and q.is_cuda:
+            max_topk = int(
+                os.getenv("TOKENSPEED_DEEPSEEK_V4_CUDA_SPARSE_MLA_MAX_TOPK", "192")
+            )
+            if indices.shape[-1] <= max_topk:
+                try:
+                    from tokenspeed_kernel.ops.attention.deepseek_v4 import (
+                        deepseek_v4_sparse_mla_cuda,
+                    )
+                except Exception as exc:
+                    raise DeepseekV4AttentionOpUnavailable(
+                        "DeepSeek V4 CUDA sparse MLA attention is unavailable. "
+                        "Build/install `tokenspeed-kernel/python` before enabling "
+                        "`TOKENSPEED_DEEPSEEK_V4_CUDA_SPARSE_MLA=1`."
+                    ) from exc
+                return deepseek_v4_sparse_mla_cuda(
+                    q=q,
+                    kv=kv,
+                    indices=indices,
+                    sm_scale=sm_scale,
+                    attn_sink=attn_sink,
+                    topk_length=topk_length,
+                )
+        try:
+            from tokenspeed_kernel.ops.attention.deepseek_v4 import (
+                deepseek_v4_sparse_mla_reference,
+            )
+        except Exception as exc:
+            raise DeepseekV4AttentionOpUnavailable(
+                "DeepSeek V4 SM12x sparse MLA attention fallback is unavailable. "
+                "Build/install `tokenspeed-kernel/python` before serving V4 on SM12x."
+            ) from exc
+        return deepseek_v4_sparse_mla_reference(
+            q=q,
+            kv=kv,
+            indices=indices,
+            sm_scale=sm_scale,
+            attn_sink=attn_sink,
+            topk_length=topk_length,
+        )
+
+    def _forward_sparse_mla_fp8_cache_cuda(
+        self,
+        *,
+        q: torch.Tensor,
+        swa_cache: torch.Tensor,
+        swa_indices: torch.Tensor,
+        swa_lens: torch.Tensor,
+        swa_block_size: int,
+        compressed_cache: torch.Tensor | None,
+        extra_indices: torch.Tensor | None,
+        extra_lens: torch.Tensor | None,
+        compressed_block_size: int,
+        sm_scale: float,
+        attn_sink: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if not self._use_sparse_mla_fp8_cache_cuda() or not q.is_cuda:
+            return None
+
+        extra_width = extra_indices.shape[-1] if extra_indices is not None else 0
+        total_width = swa_indices.shape[-1] + extra_width
+        max_topk = int(
+            os.getenv("TOKENSPEED_DEEPSEEK_V4_CUDA_SPARSE_MLA_CACHE_MAX_TOPK", "1024")
+        )
+        if total_width > max_topk:
+            return None
+
+        try:
+            from tokenspeed_kernel.ops.attention.deepseek_v4 import (
+                deepseek_v4_sparse_mla_fp8_cache_cuda,
+            )
+        except Exception as exc:
+            raise DeepseekV4AttentionOpUnavailable(
+                "DeepSeek V4 CUDA sparse MLA FP8-cache attention is unavailable. "
+                "Build/install `tokenspeed-kernel/python` before enabling "
+                "`TOKENSPEED_DEEPSEEK_V4_CUDA_SPARSE_MLA_CACHE=1`."
+            ) from exc
+        return deepseek_v4_sparse_mla_fp8_cache_cuda(
+            q=q,
+            swa_cache=swa_cache,
+            swa_indices=swa_indices,
+            swa_lens=swa_lens,
+            swa_block_size=swa_block_size,
+            compressed_cache=compressed_cache,
+            extra_indices=extra_indices,
+            extra_lens=extra_lens,
+            compressed_block_size=compressed_block_size,
+            sm_scale=sm_scale,
+            attn_sink=attn_sink,
+            online_softmax=self._use_sparse_mla_online_softmax(),
         )
 
     def _query_lens(
@@ -421,13 +542,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             raise RuntimeError(
                 "forward_deepseek_v4_decode only supports ForwardMode.DECODE"
             )
-        try:
-            from flash_mla import flash_mla_with_kvcache
-        except Exception as exc:
-            raise DeepseekV4AttentionOpUnavailable(
-                "DeepSeek V4 decode requires FlashMLA latent attention. "
-                "Build/install `tokenspeed-kernel/python` with FlashMLA."
-            ) from exc
 
         q_padded = self._pad_query(q, padded_heads).contiguous()
         swa_indices, swa_lens = self._get_decode_swa_metadata(
@@ -454,6 +568,49 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 token_to_kv_pool.get_compressed_kv_buffer_2d(layer_id),
                 compressed_block_size,
             )
+
+        if self._use_sm12x_attention_fallback():
+            out = self._forward_sparse_mla_fp8_cache_cuda(
+                q=q_padded,
+                swa_cache=swa_cache,
+                swa_indices=swa_indices,
+                swa_lens=swa_lens,
+                swa_block_size=token_to_kv_pool.swa_block_size,
+                compressed_cache=compressed_cache,
+                extra_indices=extra_indices,
+                extra_lens=extra_lens,
+                compressed_block_size=compressed_block_size,
+                sm_scale=softmax_scale,
+                attn_sink=attn_sink,
+            )
+            if out is not None:
+                return out[:, :num_local_heads]
+            kv_workspace, indices, lens = self._prefill_workspace(
+                positions=positions,
+                token_to_kv_pool=token_to_kv_pool,
+                layer_id=layer_id,
+                compress_ratio=compress_ratio,
+                window_size=window_size,
+                head_dim=head_dim,
+                topk_indices=topk_indices,
+            )
+            out = self._forward_sparse_mla_reference(
+                q=q_padded,
+                kv=kv_workspace,
+                indices=indices,
+                sm_scale=softmax_scale,
+                attn_sink=attn_sink,
+                topk_length=lens,
+            )
+            return out[:, :num_local_heads]
+
+        try:
+            from flash_mla import flash_mla_with_kvcache
+        except Exception as exc:
+            raise DeepseekV4AttentionOpUnavailable(
+                "DeepSeek V4 decode requires FlashMLA latent attention. "
+                "Build/install `tokenspeed-kernel/python` with FlashMLA."
+            ) from exc
 
         out, _ = flash_mla_with_kvcache(
             q=q_padded.unsqueeze(1),
@@ -636,13 +793,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             raise RuntimeError(
                 "forward_deepseek_v4_prefill only supports extend/prefill modes"
             )
-        try:
-            from flash_mla import flash_mla_sparse_fwd
-        except Exception as exc:
-            raise DeepseekV4AttentionOpUnavailable(
-                "DeepSeek V4 prefill requires FlashMLA sparse attention. "
-                "Build/install `tokenspeed-kernel/python` with FlashMLA."
-            ) from exc
 
         with deepseek_v4_profile_scope(f"attn_{kind}_prefill_pad_q"):
             q_padded = self._pad_query(q, padded_heads).contiguous()
@@ -656,6 +806,26 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 head_dim=head_dim,
                 topk_indices=topk_indices,
             )
+        if self._use_sm12x_attention_fallback():
+            with deepseek_v4_profile_scope(f"attn_{kind}_prefill_sm12x_sparse"):
+                out = self._forward_sparse_mla_reference(
+                    q=q_padded,
+                    kv=kv_workspace,
+                    indices=indices,
+                    sm_scale=softmax_scale,
+                    attn_sink=attn_sink,
+                    topk_length=lens,
+                )
+            return out[:, :num_local_heads]
+
+        try:
+            from flash_mla import flash_mla_sparse_fwd
+        except Exception as exc:
+            raise DeepseekV4AttentionOpUnavailable(
+                "DeepSeek V4 prefill requires FlashMLA sparse attention. "
+                "Build/install `tokenspeed-kernel/python` with FlashMLA."
+            ) from exc
+
         with deepseek_v4_profile_scope(f"attn_{kind}_prefill_flashmla"):
             out, _, _ = flash_mla_sparse_fwd(
                 q=q_padded,

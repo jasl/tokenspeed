@@ -145,6 +145,18 @@ class PlatformInfo:
         return self.is_nvidia and self.arch_version.major == 10
 
     @property
+    def is_sm12x(self) -> bool:
+        return self.is_nvidia and self.arch_version.major == 12
+
+    @property
+    def is_sm120(self) -> bool:
+        return self.is_nvidia and self.arch_version == ArchVersion(12, 0)
+
+    @property
+    def is_sm121(self) -> bool:
+        return self.is_nvidia and self.arch_version == ArchVersion(12, 1)
+
+    @property
     def is_ampere(self) -> bool:
         return self.is_nvidia and self.arch_version.major == 8
 

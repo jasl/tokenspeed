@@ -499,6 +499,7 @@ class EventLoop:
         self,
         forward_op,
         sampling_params_list,
+        top_logprobs_nums,
         execution_plan,
         dp_metadata=None,
         stats=None,
@@ -536,6 +537,7 @@ class EventLoop:
                 self.model_executor.execute_forward_op_with_log(
                     forward_op,
                     sampling_params_list,
+                    top_logprobs_nums,
                     dp_global_num_tokens=dp_global_num_tokens,
                     dp_global_bs=dp_global_bs,
                     dp_all_decode_or_idle=dp_all_decode_or_idle,
@@ -564,6 +566,7 @@ class EventLoop:
                     self.model_executor.execute_forward_op_with_log(
                         forward_op,
                         sampling_params_list,
+                        top_logprobs_nums,
                         dp_global_num_tokens=dp_global_num_tokens,
                         dp_global_bs=dp_global_bs,
                         dp_all_decode_or_idle=dp_all_decode_or_idle,
@@ -587,6 +590,7 @@ class EventLoop:
                     self.model_executor.execute_forward_op_with_log(
                         forward_op,
                         sampling_params_list,
+                        top_logprobs_nums,
                         dp_global_num_tokens=dp_global_num_tokens,
                         dp_global_bs=dp_global_bs,
                         dp_all_decode_or_idle=dp_all_decode_or_idle,
@@ -953,10 +957,12 @@ class EventLoop:
 
             if forward_op is not None:
                 sampling_params_list = self._gather_sampling_params(forward_op)
+                top_logprobs_nums = self._gather_top_logprobs_nums(forward_op)
                 grammar_inputs = self._gather_grammar_state(forward_op)
                 results, on_first_token = self._dispatch_forward(
                     forward_op,
                     sampling_params_list,
+                    top_logprobs_nums,
                     execution_plan,
                     dp_metadata=dp_metadata,
                     stats=stats,
@@ -986,6 +992,15 @@ class EventLoop:
         return [
             self.output_processor.rid_to_state[rid].sampling_params
             for rid in forward_op.request_ids
+        ]
+
+    def _gather_top_logprobs_nums(self, forward_op) -> list[int]:
+        return [
+            int(state.top_logprobs_num) if state.return_logprob else 0
+            for state in (
+                self.output_processor.rid_to_state[rid]
+                for rid in forward_op.request_ids
+            )
         ]
 
     def _gather_grammar_state(self, forward_op) -> GrammarStepInputs | None:
@@ -1058,6 +1073,7 @@ class EventLoop:
                 # KeyError when we look up rids that are still in the current
                 # forward_op.
                 sampling_params_list = self._gather_sampling_params(forward_op)
+                top_logprobs_nums = self._gather_top_logprobs_nums(forward_op)
                 grammar_inputs = self._gather_grammar_state(forward_op)
 
             # DP sync: all ranks must participate even when idle.
@@ -1121,6 +1137,7 @@ class EventLoop:
                 curr_results, _ = self._dispatch_forward(
                     forward_op,
                     sampling_params_list,
+                    top_logprobs_nums,
                     execution_plan,
                     dp_metadata=dp_metadata,
                     stats=stats,

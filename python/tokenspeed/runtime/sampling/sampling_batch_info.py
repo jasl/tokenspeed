@@ -74,6 +74,10 @@ class SamplingBatchInfo:
     # index_select inside the captured graph.
     valid_cache_lengths: torch.Tensor | None = None
 
+    # Per-request output top-logprob counts. None/0 means only sampled-token
+    # logprobs are needed.
+    top_logprobs_nums: list[int] | None = None
+
     # Device
     device: str = "cuda"
 
