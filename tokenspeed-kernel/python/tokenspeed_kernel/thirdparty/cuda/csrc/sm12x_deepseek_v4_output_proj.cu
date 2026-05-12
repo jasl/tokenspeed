@@ -1,4 +1,12 @@
-// Copyright (c) 2026 LightSeek Foundation
+// Portions Copyright (c) 2025 DeepSeek (MIT). Adapted from DeepGEMM
+// `deep_gemm/include/deep_gemm/impls/sm120_fp8_einsum.cuh`
+// (https://github.com/deepseek-ai/DeepGEMM, PR #324, branch
+// codex/sm120-paged-mqa-tiled): the SM120 `bhr,hdr->bhd` FP8 einsum
+// kernel and its fp8x4-vectorized dot-product helpers are reused
+// verbatim and rewrapped behind tokenspeed's tvm-ffi binding.
+//
+// Tokenspeed adaptations (Copyright (c) 2026 LightSeek Foundation) are
+// MIT-licensed; see the project LICENSE for the full text.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -19,13 +27,21 @@
 //   b_scale : [num_groups, out_rank/128, hidden/128]      UE8M0 (uint8) or float32
 //   output  : [num_tokens, num_groups, out_rank]          bfloat16
 //
-// This kernel targets the DeepSeek V4 Flash decode shape (small num_tokens,
-// num_groups ~= 8, hidden ~= 2048, out_rank ~= 1024) where the operation is
-// memory-bound. The schedule mirrors the existing
-// `fp8_weight_gemv_ue8m0_kernel` in `sm12x_fp8_quantize.cu`: one CUDA block
-// per (group, token, out_col) computes a single dot product over `hidden`
-// with block-128 scale composition, then reduces across 128 threads via
-// `block_sum_128`.
+// Schedule: one CUDA block per (token, group, d_tile) where d_tile spans
+// kOutputTileD=128 consecutive out_rank columns; the block has
+// kOutputTileD threads and each thread independently accumulates the full
+// hidden-dimension reduction for its (token, group, d) cell. Loads of `a`
+// and `b` are fp8x4-vectorized; the block-128 scales (per-token row, per
+// out_rank/128 weight tile) are folded into the FMA accumulation per
+// scale group.
+//
+// Two earlier designs were rejected and one cooperative-tile MMA design
+// only reached ~0.5x of the Triton baseline (see
+// docs/notes/2026-05-09-ds4-sm12x-rejected-experiments.md). The
+// per-thread GEMV-style design ported here side-steps the tensor-core
+// path entirely -- at decode shape (small `tokens` batch) the M axis is
+// too small for MMA tiles to pay for themselves; a thread-per-output-cell
+// GEMV with fp8x4 loads and L1/L2-friendly weight access wins.
 
 #include <cmath>
 #include <cstdint>
@@ -40,43 +56,15 @@ using tvm::ffi::TensorView;
 
 namespace {
 
-constexpr int kBlockK = 128;
-constexpr int kWarpSize = 32;
-constexpr int kWarpsPerBlock = 4;
-
-__device__ __forceinline__ float warp_sum(float value) {
-  unsigned int const mask = 0xFFFFFFFFu;
-#pragma unroll
-  for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
-    value += __shfl_down_sync(mask, value, offset);
-  }
-  return value;
-}
-
-__device__ __forceinline__ float block_sum_128(float value) {
-  __shared__ float warp_partials[kWarpsPerBlock];
-  int const lane = threadIdx.x % kWarpSize;
-  int const warp = threadIdx.x / kWarpSize;
-  value = warp_sum(value);
-  if (lane == 0) {
-    warp_partials[warp] = value;
-  }
-  __syncthreads();
-
-  value = threadIdx.x < kWarpsPerBlock ? warp_partials[lane] : 0.0f;
-  if (warp == 0) {
-    value = warp_sum(value);
-  }
-  return value;
-}
+constexpr int kBlockK = 128;             // block-128 scale group
+constexpr int kOutputTileD = 128;        // out_rank cols computed per block
 
 __device__ __forceinline__ float decode_ue8m0_scale(uint8_t encoded) {
-  // UE8M0 unbiased exponent -> float: shift to fp32 exponent field.
   uint32_t bits = static_cast<uint32_t>(encoded) << 23;
   return __uint_as_float(bits);
 }
 
-__device__ __forceinline__ float load_b_scale(
+__device__ __forceinline__ float load_b_scale_value(
     const void* __restrict__ scales,
     int64_t offset,
     bool scales_are_ue8m0) {
@@ -86,7 +74,66 @@ __device__ __forceinline__ float load_b_scale(
   return static_cast<const float*>(scales)[offset];
 }
 
-__global__ void deepseek_v4_grouped_fp8_gemv_kernel(
+// Per-thread dot kernel along the hidden reduction axis. Vectorized
+// fp8x4 loads (32 bits per LDG) cut the LDG count by 4x versus the
+// scalar variant; tail handling supports hidden_dim that is not a
+// multiple of 128.
+//
+// Layout assumes `a_stride_r == 1` and `b_stride_r == 1` -- i.e. the
+// hidden dim is contiguous in both operands. The host-side validation
+// enforces this.
+__device__ __forceinline__ float sm120_fp8_einsum_dot_fp8x4(
+    const __nv_fp8_e4m3* a,
+    const __nv_fp8_e4m3* b,
+    const float* sfa,
+    int64_t sfa_stride_r,
+    const void* sfb_packed,
+    int64_t sfb_stride_r,
+    bool sfb_is_ue8m0,
+    int hidden_dim) {
+  float accum = 0.0f;
+  int const num_full_scale_blocks = hidden_dim / kBlockK;
+  for (int scale_idx = 0; scale_idx < num_full_scale_blocks; ++scale_idx) {
+    float const sa = sfa[scale_idx * sfa_stride_r];
+    float const sb =
+        load_b_scale_value(sfb_packed, scale_idx * sfb_stride_r, sfb_is_ue8m0);
+    float const scale = sa * sb;
+    int const r_start = scale_idx * kBlockK;
+#pragma unroll
+    for (int r_offset = 0; r_offset < kBlockK; r_offset += 4) {
+      int const r_idx = r_start + r_offset;
+      auto const a_values = static_cast<float4>(
+          *reinterpret_cast<const __nv_fp8x4_e4m3*>(a + r_idx));
+      auto const b_values = static_cast<float4>(
+          *reinterpret_cast<const __nv_fp8x4_e4m3*>(b + r_idx));
+      accum = fmaf(a_values.x, b_values.x * scale, accum);
+      accum = fmaf(a_values.y, b_values.y * scale, accum);
+      accum = fmaf(a_values.z, b_values.z * scale, accum);
+      accum = fmaf(a_values.w, b_values.w * scale, accum);
+    }
+  }
+  int const tail_start = num_full_scale_blocks * kBlockK;
+  if (tail_start >= hidden_dim) {
+    return accum;
+  }
+  float const tail_sa = sfa[num_full_scale_blocks * sfa_stride_r];
+  float const tail_sb = load_b_scale_value(
+      sfb_packed, num_full_scale_blocks * sfb_stride_r, sfb_is_ue8m0);
+  float const tail_scale = tail_sa * tail_sb;
+  for (int r_idx = tail_start; r_idx < hidden_dim; r_idx += 4) {
+    auto const a_values = static_cast<float4>(
+        *reinterpret_cast<const __nv_fp8x4_e4m3*>(a + r_idx));
+    auto const b_values = static_cast<float4>(
+        *reinterpret_cast<const __nv_fp8x4_e4m3*>(b + r_idx));
+    accum = fmaf(a_values.x, b_values.x * tail_scale, accum);
+    accum = fmaf(a_values.y, b_values.y * tail_scale, accum);
+    accum = fmaf(a_values.z, b_values.z * tail_scale, accum);
+    accum = fmaf(a_values.w, b_values.w * tail_scale, accum);
+  }
+  return accum;
+}
+
+__global__ void deepseek_v4_grouped_fp8_einsum_kernel(
     nv_bfloat16* __restrict__ output,
     const __nv_fp8_e4m3* __restrict__ a,
     const float* __restrict__ a_scales,
@@ -96,63 +143,65 @@ __global__ void deepseek_v4_grouped_fp8_gemv_kernel(
     int num_groups,
     int hidden_dim,
     int out_dim,
-    int hidden_blocks,
-    int b_scale_out_blocks,
+    int num_d_tiles,
     int64_t a_stride_token,
     int64_t a_stride_group,
     int64_t a_stride_hidden,
     int64_t a_scale_stride_token,
     int64_t a_scale_stride_group,
     int64_t a_scale_stride_block,
+    int64_t b_stride_group,
+    int64_t b_stride_out,
+    int64_t b_stride_hidden,
+    int64_t b_scale_stride_group,
+    int64_t b_scale_stride_out,
+    int64_t b_scale_stride_hidden,
     int64_t out_stride_token,
     int64_t out_stride_group,
     int64_t out_stride_rank,
     bool b_scales_are_ue8m0) {
-  int const n = blockIdx.x;
-  int const t = blockIdx.y;
-  int const g = blockIdx.z;
-  int const tid = threadIdx.x;
-
-  if (n >= out_dim || t >= num_tokens || g >= num_groups) {
+  int const tile_idx = blockIdx.x;
+  int const d_tile_idx = tile_idx % num_d_tiles;
+  int const h_idx = (tile_idx / num_d_tiles) % num_groups;
+  int const b_idx = tile_idx / (num_d_tiles * num_groups);
+  int const d_idx = d_tile_idx * kOutputTileD + threadIdx.x;
+  if (b_idx >= num_tokens || d_idx >= out_dim) {
     return;
   }
 
-  // Per-(t,g,n) base pointers.
-  const __nv_fp8_e4m3* a_tg =
-      a + t * a_stride_token + g * a_stride_group;
-  const float* a_scale_tg =
-      a_scales + t * a_scale_stride_token + g * a_scale_stride_group;
-  // b is contiguous in [G, N, K]; row stride = hidden_dim.
-  const __nv_fp8_e4m3* b_gn =
-      b + (static_cast<int64_t>(g) * out_dim + n) * hidden_dim;
-  int64_t const b_scale_n_block = n / kBlockK;
-  int64_t const b_scale_base =
-      (static_cast<int64_t>(g) * b_scale_out_blocks + b_scale_n_block)
-          * hidden_blocks;
+  const __nv_fp8_e4m3* a_base = a + static_cast<int64_t>(b_idx) * a_stride_token
+                                + static_cast<int64_t>(h_idx) * a_stride_group;
+  const __nv_fp8_e4m3* b_base = b + static_cast<int64_t>(h_idx) * b_stride_group
+                                + static_cast<int64_t>(d_idx) * b_stride_out;
+  const float* sfa_base = a_scales
+                          + static_cast<int64_t>(b_idx) * a_scale_stride_token
+                          + static_cast<int64_t>(h_idx) * a_scale_stride_group;
+  int64_t const sfb_out_tile = d_idx / kBlockK;
+  int64_t const sfb_byte_base = static_cast<int64_t>(h_idx) * b_scale_stride_group
+                                + sfb_out_tile * b_scale_stride_out;
+  void const* sfb_packed = b_scales_are_ue8m0
+      ? static_cast<const void*>(
+            static_cast<const uint8_t*>(b_scales) + sfb_byte_base)
+      : static_cast<const void*>(
+            static_cast<const float*>(b_scales) + sfb_byte_base);
 
-  float accum = 0.0f;
-  for (int kb = 0; kb < hidden_blocks; ++kb) {
-    float const a_s = a_scale_tg[kb * a_scale_stride_block];
-    float const b_s =
-        load_b_scale(b_scales, b_scale_base + kb, b_scales_are_ue8m0);
-    float const scale = a_s * b_s;
+  float const accum = sm120_fp8_einsum_dot_fp8x4(
+      a_base,
+      b_base,
+      sfa_base,
+      a_scale_stride_block,
+      sfb_packed,
+      b_scale_stride_hidden,
+      b_scales_are_ue8m0,
+      hidden_dim);
 
-    int const k = kb * kBlockK + tid;
-    float const a_v = static_cast<float>(a_tg[k * a_stride_hidden]);
-    float const b_v = static_cast<float>(b_gn[k]);
-    accum += a_v * b_v * scale;
-  }
-
-  accum = block_sum_128(accum);
-  if (tid == 0) {
-    int64_t const out_idx = static_cast<int64_t>(t) * out_stride_token
-                            + static_cast<int64_t>(g) * out_stride_group
-                            + static_cast<int64_t>(n) * out_stride_rank;
-    output[out_idx] = __float2bfloat16(accum);
-  }
+  int64_t const out_idx = static_cast<int64_t>(b_idx) * out_stride_token
+                          + static_cast<int64_t>(h_idx) * out_stride_group
+                          + static_cast<int64_t>(d_idx) * out_stride_rank;
+  output[out_idx] = __float2bfloat16(accum);
 }
 
-void launch_deepseek_v4_grouped_fp8_gemv(
+void launch_deepseek_v4_grouped_fp8_einsum(
     TensorView output,
     TensorView a,
     TensorView a_scales,
@@ -167,12 +216,10 @@ void launch_deepseek_v4_grouped_fp8_gemv(
   if (num_tokens == 0 || num_groups == 0 || out_dim == 0) {
     return;
   }
-  int const hidden_blocks = hidden_dim / kBlockK;
-  int const b_scale_out_blocks =
-      static_cast<int>(b_scales.size(1));
+  int const num_d_tiles = (out_dim + kOutputTileD - 1) / kOutputTileD;
+  int const grid_dim = num_tokens * num_groups * num_d_tiles;
 
-  dim3 const grid(out_dim, num_tokens, num_groups);
-  deepseek_v4_grouped_fp8_gemv_kernel<<<grid, kBlockK, 0, stream>>>(
+  deepseek_v4_grouped_fp8_einsum_kernel<<<grid_dim, kOutputTileD, 0, stream>>>(
       static_cast<nv_bfloat16*>(output.data_ptr()),
       static_cast<const __nv_fp8_e4m3*>(a.data_ptr()),
       static_cast<const float*>(a_scales.data_ptr()),
@@ -182,14 +229,19 @@ void launch_deepseek_v4_grouped_fp8_gemv(
       num_groups,
       hidden_dim,
       out_dim,
-      hidden_blocks,
-      b_scale_out_blocks,
+      num_d_tiles,
       a.stride(0),
       a.stride(1),
       a.stride(2),
       a_scales.stride(0),
       a_scales.stride(1),
       a_scales.stride(2),
+      b.stride(0),
+      b.stride(1),
+      b.stride(2),
+      b_scales.stride(0),
+      b_scales.stride(1),
+      b_scales.stride(2),
       output.stride(0),
       output.stride(1),
       output.stride(2),
@@ -212,7 +264,7 @@ void sm12x_deepseek_v4_grouped_fp8_gemv(
   // buffers laid out as [G, T, ...] by the fused inverse-RoPE + FP8 quant
   // kernel; only check that they are CUDA tensors and respect strides at the
   // kernel level. `b` (wo_a weight) and `b_scales` must be contiguous so the
-  // kernel can index them with a single base + offset.
+  // per-block scale base offset is well-defined.
   CHECK_CUDA(output);
   CHECK_CUDA(a);
   CHECK_CUDA(a_scales);
@@ -240,30 +292,26 @@ void sm12x_deepseek_v4_grouped_fp8_gemv(
   int64_t const num_groups = a.size(1);
   int64_t const hidden_dim = a.size(2);
   int64_t const out_dim = b.size(1);
-  int64_t const hidden_blocks = hidden_dim / kBlockK;
-  int64_t const b_scale_out_blocks = b_scales.size(1);
 
   TVM_FFI_ICHECK_GE(num_tokens, 0);
   TVM_FFI_ICHECK_GT(num_groups, 0);
   TVM_FFI_ICHECK_GT(hidden_dim, 0);
   TVM_FFI_ICHECK_GT(out_dim, 0);
-  TVM_FFI_ICHECK_EQ(hidden_dim % kBlockK, 0)
-      << "hidden_dim must be divisible by 128";
-  TVM_FFI_ICHECK_EQ(out_dim % kBlockK, 0)
-      << "out_dim must be divisible by 128";
 
   TVM_FFI_ICHECK_EQ(b.size(0), num_groups);
   TVM_FFI_ICHECK_EQ(b.size(2), hidden_dim);
   TVM_FFI_ICHECK_EQ(a.stride(2), 1)
       << "a hidden dim must be contiguous (stride==1)";
+  TVM_FFI_ICHECK_EQ(b.stride(2), 1)
+      << "b hidden dim must be contiguous (stride==1)";
 
   TVM_FFI_ICHECK_EQ(a_scales.size(0), num_tokens);
   TVM_FFI_ICHECK_EQ(a_scales.size(1), num_groups);
-  TVM_FFI_ICHECK_EQ(a_scales.size(2), hidden_blocks);
+  TVM_FFI_ICHECK_EQ(a_scales.size(2), (hidden_dim + kBlockK - 1) / kBlockK);
 
   TVM_FFI_ICHECK_EQ(b_scales.size(0), num_groups);
-  TVM_FFI_ICHECK_EQ(b_scale_out_blocks, (out_dim + kBlockK - 1) / kBlockK);
-  TVM_FFI_ICHECK_EQ(b_scales.size(2), hidden_blocks);
+  TVM_FFI_ICHECK_EQ(b_scales.size(1), (out_dim + kBlockK - 1) / kBlockK);
+  TVM_FFI_ICHECK_EQ(b_scales.size(2), (hidden_dim + kBlockK - 1) / kBlockK);
 
   TVM_FFI_ICHECK_EQ(output.size(0), num_tokens);
   TVM_FFI_ICHECK_EQ(output.size(1), num_groups);
@@ -275,7 +323,7 @@ void sm12x_deepseek_v4_grouped_fp8_gemv(
 
   cudaSetDevice(output.device().device_id);
   cudaStream_t const stream = get_stream(output.device());
-  launch_deepseek_v4_grouped_fp8_gemv(
+  launch_deepseek_v4_grouped_fp8_einsum(
       output, a, a_scales, b, b_scales, stream, b_scales_are_ue8m0);
 }
 
