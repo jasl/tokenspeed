@@ -354,24 +354,54 @@ returns standard `[routes, output_channels]` output. The old grouped dense,
 route-expansion, grouped SwiGLU/requant, and grouped W2/reduce APIs/tests were
 removed because they only supported the rejected M-grouped padding design.
 
+The attention output-projection island (`T1-γ`) is landed end-to-end. CUDA-native
+`sm12x_deepseek_v4_inv_rope_fp8_quant_kernel` (REG:24) and
+`deepseek_v4_grouped_fp8_einsum_kernel` (REG:39) replaced the previous
+Triton pair via `_project_attention_output` dispatch (commits `486ccc1`,
+`7eb2845`, `aff5c53`, `0831acd`, `2b4fbf9`, `84773aa`). The CUDA-vs-reference
+correctness gate is the only test net (Triton siblings deleted), and the
+microbench harness stays as a regression watchdog.
+
+The graph-capture island (`T1-α`) is now also landed for the decode forward
+pass. Two CPU<->CUDA sync sites added by the PoC dispatch were removed:
+`read_deepseek_v4_indexer_fp8_cache` was rewritten to a single vectorized
+gather (commit `aa88a47`), and `_prefill_workspace` picks `max_gather_len` /
+`compressed_base` from config-derived upper bounds during capture so the
+gather/combine kernels see a stable workspace shape (commit `57534ba`). The
+SM12x sparse-MLA CUDA fast path's default `max_topk=1024` gate also turned out
+to be tighter than DSv4-Flash's CSA layer width (`swa_w=128` + `extra_w=8192`
+= `8320`), which made every decode silently fall through to the BF16 reference
+path; the default gate is now removed and the env knob retained as an explicit
+kill switch (commit `d3212ac`). With these in place, `--max-cudagraph-capture-size
+2 --disable-cuda-graph-padding --disable-prefill-graph` captures cleanly on the
+SM120 workstation for `bs=1` and `bs=2`, and a `1024x1024 c1` smoke bench at
+`<remote-workspace>/tokenspeed_t1_gamma_bench_20260513_033719` reports
+`17.76` output tok/s and mean TPOT `52.89` ms. The matched eager-mode bench at
+`<remote-workspace>/tokenspeed_t1_gamma_bench_20260513_032336` reports only
+`6.94` tok/s / `140.76` ms with the same fast path engaged, confirming that
+the win is from eliding per-layer kernel launch overhead across the captured
+graph rather than from the kernel itself. The pre-T1-α eager number with the
+gate active and the slow reference path engaged was `14.54` tok/s. The 100
+tok/s vLLM-revenge target stays well out of reach until the MoE island lands.
+
 ## Next Step
 
-The next high-yield route is to build the SM12x DeepSeek V4 decode island in
-two structural passes before more scalar kernel tuning:
+The attention output-projection island (`T1-γ`) and the decode graph-capture
+island (`T1-α`) are both delivered. The next high-yield route is the MoE
+island (`T3-α`):
 
-1. Attention output projection island: fused inverse-RoPE + FP8 quant + SM12x
-   FP8 `wo_a` einsum, gated to SM120/SM121 decode-sized tensors and falling back
-   to the existing BF16 reference path on any mismatch.
-2. MoE island: move the current SM12x MXFP4 expert path toward a #324/MegaMoE
-   shape using CUTLASS/CuTe DSL where it helps NVIDIA maintainability: stable
-   route buffers, no heavy route padding, and a persistent or padding-aware
-   W13/SwiGLU/W2 schedule. The immediate MoE prototype should use the validated
-   weight-major FP4xFP8 tile to compute output-channel tiles for up to eight
-   local routes at a time, instead of reviving the rejected M-grouped route
-   padding path.
+- Move the current SM12x MXFP4 expert path toward a #324/MegaMoE shape using
+  CUTLASS/CuTe DSL where it helps NVIDIA maintainability: stable route buffers,
+  no heavy route padding, and a persistent or padding-aware W13/SwiGLU/W2
+  schedule. The immediate prototype should use the validated weight-major
+  FP4xFP8 tile (`sm12x_mxfp4_mxfp8_dense`) to compute output-channel tiles for
+  up to eight local routes at a time, instead of reviving the rejected
+  M-grouped route padding path.
+- Stand the new MoE backend up as `--moe-backend sm12x_mxfp4_persistent` so it
+  can be evaluated against the current `sm12x_mxfp4` baseline without
+  destabilising the runtime path.
 
-Current profiles still show MoE gate/down as a large local target, but MoE alone
-cannot explain the 4x vLLM gap. The vLLM branch's advantage is a graphable DS4
-dataflow, so the attention island is the first bounded implementation step and
-the #324-style CuTe/CUTLASS MoE rewrite follows it. The CuTile route is rejected
+A follow-up sparse MLA island (`T2-α`) is also on deck for once T3-α lands:
+split SWA / C4 / C128 dataflow so each layer kind has a focused CUDA kernel
+instead of the current shared linear-walk path. The CuTile route stays rejected
 for now; do not add CuTile dependencies or switches.
