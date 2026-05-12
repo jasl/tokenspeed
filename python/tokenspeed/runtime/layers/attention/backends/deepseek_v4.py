@@ -665,15 +665,37 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             raise RuntimeError("DeepSeek V4 prefill requires forward metadata")
         num_reqs = metadata.seq_lens.numel()
         gather_lens = self._prefill_gather_lens(window_size=window_size)
-        max_gather_len = int(gather_lens.max().item()) if num_reqs else 1
         compressed_lens = (
             torch.div(metadata.seq_lens, compress_ratio, rounding_mode="floor")
             if compress_ratio > 1
             else torch.zeros_like(metadata.seq_lens)
         )
-        compressed_base = (
-            int(compressed_lens.max().item()) if compress_ratio > 1 and num_reqs else 0
+
+        # Workspace widths must be picked **before** the gather/combine
+        # kernels run so the cached buffer has the correct stride. Under
+        # CUDA-graph capture there is no CPU<->CUDA sync available, so use
+        # config-derived upper bounds; the kernels still walk `gather_lens`
+        # / produce `lens` per-token so over-allocating only wastes a few
+        # workspace rows.
+        capturing = (
+            positions.is_cuda
+            and torch.cuda.is_available()
+            and torch.cuda.is_current_stream_capturing()
         )
+        if capturing:
+            max_gather_len = max(1, window_size)
+            compressed_base = (
+                max(1, (self.context_len + compress_ratio - 1) // compress_ratio)
+                if compress_ratio > 1
+                else 0
+            )
+        else:
+            max_gather_len = int(gather_lens.max().item()) if num_reqs else 1
+            compressed_base = (
+                int(compressed_lens.max().item())
+                if compress_ratio > 1 and num_reqs
+                else 0
+            )
         workspace_width = max(1, compressed_base + max_gather_len)
         kv_workspace = self._get_prefill_workspace(
             num_reqs=num_reqs,
