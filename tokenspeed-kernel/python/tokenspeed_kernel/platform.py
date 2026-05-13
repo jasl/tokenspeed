@@ -47,7 +47,15 @@ __all__ = [
     "CapabilityRequirement",
     "Platform",
     "current_platform",
+    "ensure_sm12x_supported_device",
+    "SUPPORTED_SM12X_VARIANTS",
 ]
+
+
+# SM12x compute capabilities this project has validated kernels against.
+# Update with explicit evidence (build + tests + microbench + oracle) before
+# adding a new variant -- the entire SM12x route is intentionally narrow.
+SUPPORTED_SM12X_VARIANTS = frozenset({(12, 0), (12, 1)})
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +151,29 @@ class PlatformInfo:
     @property
     def is_blackwell(self) -> bool:
         return self.is_nvidia and self.arch_version.major == 10
+
+    @property
+    def is_sm12x(self) -> bool:
+        return self.is_nvidia and self.arch_version.major == 12
+
+    @property
+    def is_sm120(self) -> bool:
+        return self.is_nvidia and self.arch_version == ArchVersion(12, 0)
+
+    @property
+    def is_sm121(self) -> bool:
+        return self.is_nvidia and self.arch_version == ArchVersion(12, 1)
+
+    @property
+    def is_sm12x_supported(self) -> bool:
+        """Whitelist of SM12x variants this project has validated.
+
+        Currently SM120 (RTX Pro / GeForce 50-series) and SM121 (GB10). Any
+        other SM12.x device returns ``False`` — kernel dispatch sites should
+        prefer this property over :pyattr:`is_sm12x` so an unvalidated future
+        revision (e.g. SM12.2) cannot silently take an SM12x code path.
+        """
+        return self.is_sm120 or self.is_sm121
 
     @property
     def is_ampere(self) -> bool:
@@ -713,3 +744,53 @@ def _hip_host_get_device_pointer(host_ptr: int) -> int:
             f"hipHostGetDevicePointer returned null for registered host pointer 0x{host_ptr:x}"
         )
     return device_ptr.value
+
+
+# ---------------------------------------------------------------------------
+# SM12x device guard
+# ---------------------------------------------------------------------------
+
+
+@lru_cache(maxsize=None)
+def _device_capability_cached(device_index: int) -> tuple[int, int]:
+    """Cache ``torch.cuda.get_device_capability`` per device index."""
+    return torch.cuda.get_device_capability(device_index)
+
+
+def ensure_sm12x_supported_device(
+    device: torch.device | int | None = None,
+) -> None:
+    """Raise ``RuntimeError`` if ``device`` is not a validated SM12x variant.
+
+    Designed as a defense-in-depth guard at the entry of SM12x-specific
+    kernel wrappers in ``tokenspeed_kernel.thirdparty.cuda.*``. The dispatch
+    site upstream of the wrapper should already gate on
+    :pyattr:`PlatformInfo.is_sm12x_supported`; this helper protects against
+    direct calls and against the dispatch site being modified to be loose.
+
+    ``device`` may be:
+      - ``None`` (use the current CUDA device)
+      - ``int`` (treated as a device index)
+      - :class:`torch.device` (must be a CUDA device)
+    """
+    if device is None:
+        device_index = torch.cuda.current_device()
+    elif isinstance(device, torch.device):
+        if device.type != "cuda":
+            raise RuntimeError(f"SM12x kernels require a CUDA device, got {device}")
+        device_index = (
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
+    else:
+        device_index = int(device)
+
+    major, minor = _device_capability_cached(device_index)
+    if (major, minor) not in SUPPORTED_SM12X_VARIANTS:
+        name = torch.cuda.get_device_name(device_index)
+        raise RuntimeError(
+            "SM12x kernel requires a supported variant "
+            f"({', '.join(f'SM{m}.{n}' for m, n in sorted(SUPPORTED_SM12X_VARIANTS))}); "
+            f"got SM{major}.{minor} on device {device_index} ({name!r}). "
+            "Add the new variant to SUPPORTED_SM12X_VARIANTS after validating "
+            "build + tests + microbench + oracle on it."
+        )

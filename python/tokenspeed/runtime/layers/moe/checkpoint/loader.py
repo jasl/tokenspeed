@@ -30,6 +30,22 @@ from tokenspeed.runtime.layers.moe.checkpoint.schema import ExpertCheckpointSche
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 
 
+def _preserve_e8m0_scale_bytes(
+    mapped_name: str,
+    param: nn.Parameter,
+    loaded_weight: torch.Tensor,
+) -> torch.Tensor:
+    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    if (
+        "weight_scale" in mapped_name
+        and e8m0_dtype is not None
+        and loaded_weight.dtype == e8m0_dtype
+        and param.dtype == torch.uint8
+    ):
+        return loaded_weight.view(torch.uint8)
+    return loaded_weight
+
+
 @dataclass(frozen=True)
 class CheckpointPlanEntry:
     param_name: str
@@ -274,6 +290,9 @@ class MoECheckpointLoader:
             if param is None:
                 continue
 
+            loaded_weight = _preserve_e8m0_scale_bytes(
+                mapped_name, param, loaded_weight
+            )
             param.weight_loader(
                 param,
                 loaded_weight,
@@ -328,8 +347,11 @@ class MoECheckpointLoader:
                 continue
 
             tensor_to_load = loaded_weight
+            tensor_to_load = _preserve_e8m0_scale_bytes(
+                mapped_name, param, tensor_to_load
+            )
             if plan_entry.split_dim is not None:
-                tensor_to_load = loaded_weight.chunk(
+                tensor_to_load = tensor_to_load.chunk(
                     plan_entry.split_chunks, dim=plan_entry.split_dim
                 )[plan_entry.split_index]
 

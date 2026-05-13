@@ -77,6 +77,7 @@ class MoeBackend(Enum):
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
+    SM12X_MXFP4 = "sm12x_mxfp4"
     DEEP_GEMM_MEGA_MOE = "deep_gemm_mega_moe"
     MEGA_MOE = "mega_moe"
 
@@ -103,6 +104,9 @@ class MoeBackend(Enum):
 
     def is_flashinfer_mxfp4(self):
         return self == MoeBackend.FLASHINFER_MXFP4
+
+    def is_sm12x_mxfp4(self):
+        return self == MoeBackend.SM12X_MXFP4
 
     def is_deep_gemm_mega_moe(self):
         return self in (MoeBackend.DEEP_GEMM_MEGA_MOE, MoeBackend.MEGA_MOE)

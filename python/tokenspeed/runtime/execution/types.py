@@ -55,6 +55,9 @@ class ModelExecutionResult:
     # Populated unconditionally by the sampling backend so it's always
     # available if any request asks for it.
     output_logprobs: torch.Tensor | None = None
+    output_top_logprobs_val: torch.Tensor | None = None
+    output_top_logprobs_idx: torch.Tensor | None = None
+    output_top_logprobs_nums: list[int] | None = None
 
     def sync(self) -> None:
         assert self.copy_event is not None

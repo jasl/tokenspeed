@@ -171,7 +171,8 @@ class CudaGraphWrapper:
 
     Callers always use the same interface::
 
-        output_tokens, output_lengths, output_logprobs = runner(
+        output_tokens, output_lengths, output_logprobs, output_top_logprobs_val,
+        output_top_logprobs_idx, output_top_logprobs_nums = runner(
             bs, ctx, sampling_info, req_to_page,
             extend_with_prefix=..., extend_prefix_lens=...,
         )
@@ -377,7 +378,8 @@ class CudaGraphWrapper:
                 self.sampling_backend.prepare_capture(
                     bs=bs, num_tokens_per_req=self.max_tokens_per_req
                 )
-            run_once()
+            with torch.cuda.stream(self.stream):
+                run_once()
 
         # Clear any per-pool state that warm-up dirtied at pool row 0,
         # so the graph captures reads against a clean baseline.
@@ -730,6 +732,8 @@ class CudaGraphWrapper:
         path was taken.
         """
         use_graph = self._can_use_graph(bs, ctx)
+        if use_graph and sampling_info.top_logprobs_nums:
+            use_graph = max(sampling_info.top_logprobs_nums) <= 0
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
 
         if use_graph and padded_bs != bs:
@@ -805,9 +809,14 @@ class CudaGraphWrapper:
             with nvtx_range("graph_replay", color="red"):
                 self.graphs[padded_bs].replay()
 
-            output_tokens, output_lengths, output_logprobs = self.output_buffers[
-                padded_bs
-            ]
+            (
+                output_tokens,
+                output_lengths,
+                output_logprobs,
+                output_top_logprobs_val,
+                output_top_logprobs_idx,
+                output_top_logprobs_nums,
+            ) = self.output_buffers[padded_bs]
 
             result = (
                 output_tokens[: bs * self.max_tokens_per_req],
@@ -815,6 +824,21 @@ class CudaGraphWrapper:
                 (
                     output_logprobs[: bs * self.max_tokens_per_req]
                     if output_logprobs is not None
+                    else None
+                ),
+                (
+                    output_top_logprobs_val[: bs * self.max_tokens_per_req]
+                    if output_top_logprobs_val is not None
+                    else None
+                ),
+                (
+                    output_top_logprobs_idx[: bs * self.max_tokens_per_req]
+                    if output_top_logprobs_idx is not None
+                    else None
+                ),
+                (
+                    output_top_logprobs_nums[: bs * self.max_tokens_per_req]
+                    if output_top_logprobs_nums is not None
                     else None
                 ),
             )

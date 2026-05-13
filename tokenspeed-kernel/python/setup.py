@@ -48,6 +48,9 @@ REQUIREMENTS_DIR = ROOT / "requirements"
 THIRDPARTY_DIR = ROOT / "tokenspeed_kernel" / "thirdparty"
 BASE_VERSION = "0.1.0"
 BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
+SKIP_SATISFIED_BUILD_REQUIREMENTS_ENV = (
+    "TOKENSPEED_KERNEL_SKIP_SATISFIED_BUILD_REQUIREMENTS"
+)
 VALID_BACKENDS = {"cuda", "rocm"}
 
 # CUDA kernels source and output directories
@@ -255,8 +258,69 @@ def _refresh_python_install_paths() -> None:
     importlib.invalidate_caches()
 
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _backend_build_requirements_satisfied(requirements_path: Path) -> bool:
+    try:
+        from importlib import metadata
+
+        from packaging.requirements import Requirement
+    except ImportError as exc:
+        print(f"Cannot check existing build requirements ({exc}); installing")
+        return False
+
+    missing = []
+    for requirement_text in _read_requirements(requirements_path):
+        if requirement_text.startswith("-"):
+            continue
+        try:
+            requirement = Requirement(requirement_text)
+        except Exception as exc:
+            print(
+                "Cannot parse build requirement "
+                f"{requirement_text!r} ({exc}); installing"
+            )
+            return False
+        if requirement.marker is not None and not requirement.marker.evaluate():
+            continue
+        try:
+            installed_version = metadata.version(requirement.name)
+        except metadata.PackageNotFoundError:
+            missing.append(requirement.name)
+            continue
+        if requirement.specifier and installed_version not in requirement.specifier:
+            missing.append(
+                f"{requirement.name}{requirement.specifier} "
+                f"(installed {installed_version})"
+            )
+
+    if missing:
+        print(
+            "Build requirements are not fully satisfied: " + ", ".join(sorted(missing))
+        )
+        return False
+    return True
+
+
 def _install_backend_build_requirements(verbose=False) -> None:
     backend = _selected_backend()
+    requirements_path = REQUIREMENTS_DIR / f"{backend}.txt"
+    if _env_flag(SKIP_SATISFIED_BUILD_REQUIREMENTS_ENV):
+        satisfied = _backend_build_requirements_satisfied(requirements_path)
+        if satisfied:
+            print(
+                f"{SKIP_SATISFIED_BUILD_REQUIREMENTS_ENV}=1 and {backend} "
+                "build requirements are already satisfied; skipping pip install"
+            )
+            _refresh_python_install_paths()
+            return
+        print(
+            f"{SKIP_SATISFIED_BUILD_REQUIREMENTS_ENV}=1 but {backend} build "
+            "requirements are missing or mismatched; installing"
+        )
+
     print(f"Installing {backend} build requirements before native build")
     subprocess.check_call(
         [
@@ -265,7 +329,7 @@ def _install_backend_build_requirements(verbose=False) -> None:
             "pip",
             "install",
             "-r",
-            str(REQUIREMENTS_DIR / f"{backend}.txt"),
+            str(requirements_path),
             "--no-build-isolation",
         ]
         + _pip_verbose_args(verbose)
@@ -388,6 +452,27 @@ KERNEL_GROUPS = [
         [],
     ),
     (
+        "sm12x_mxfp4_moe",
+        [
+            CUDA_CSRC_DIR / "sm12x_mxfp4_moe.cu",
+        ],
+        [],
+    ),
+    (
+        "sm12x_fp8_quantize",
+        [
+            CUDA_CSRC_DIR / "sm12x_fp8_quantize.cu",
+        ],
+        [],
+    ),
+    (
+        "sm12x_deepseek_v4_output_proj",
+        [
+            CUDA_CSRC_DIR / "sm12x_deepseek_v4_output_proj.cu",
+        ],
+        [],
+    ),
+    (
         "kvcacheio",
         [
             CUDA_CSRC_DIR / "kvcacheio_transfer.cu",
@@ -417,10 +502,17 @@ class CudaKernelBuilder:
 
     # Target GPU architectures: detect from the CUDA driver or use env var override.
     # FLASHINFER_CUDA_ARCH_LIST is accepted for compatibility, but TokenSpeed
-    # docs prefer TOKENSPEED_CUDA_ARCH=100 on GB200.
+    # docs prefer TOKENSPEED_CUDA_ARCH_LIST or TOKENSPEED_CUDA_ARCH.
     def _normalize_cuda_arch(self, arch):
-        has_suffix = arch.endswith("a")
-        arch_clean = arch.rstrip("a")
+        arch = arch.strip()
+        suffix = ""
+        if arch and arch[-1].isalpha():
+            suffix = arch[-1]
+            arch_clean = arch[:-1]
+            if suffix not in {"a", "f"}:
+                raise ValueError(f"Unsupported CUDA architecture suffix: {arch}")
+        else:
+            arch_clean = arch
         if "." in arch_clean:
             major_s, minor_s = arch_clean.split(".", 1)
             major = int(major_s)
@@ -428,17 +520,19 @@ class CudaKernelBuilder:
         else:
             major = int(arch_clean[:-1])
             minor = int(arch_clean[-1])
-        suffix = "a" if has_suffix or major >= 9 else ""
+        if not suffix and (major, minor) in {(9, 0), (10, 0)}:
+            suffix = "a"
         return f"{major}{minor}{suffix}"
 
     def _detect_cuda_archs(self):
         archs = set()
 
-        arch_list = os.environ.get("FLASHINFER_CUDA_ARCH_LIST", "")
-        if arch_list:
-            for arch in arch_list.split():
-                archs.add(self._normalize_cuda_arch(arch))
-            return archs
+        for env_name in ("TOKENSPEED_CUDA_ARCH_LIST", "FLASHINFER_CUDA_ARCH_LIST"):
+            arch_list = os.environ.get(env_name, "")
+            if arch_list:
+                for arch in arch_list.split():
+                    archs.add(self._normalize_cuda_arch(arch))
+                return archs
 
         direct = os.environ.get("TOKENSPEED_CUDA_ARCH", "")
         if direct:

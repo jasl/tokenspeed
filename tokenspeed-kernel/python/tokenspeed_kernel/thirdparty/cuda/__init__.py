@@ -39,6 +39,16 @@ from tokenspeed_kernel.thirdparty.cuda.sampling_chain import (
     chain_speculative_sampling_target_only,
     verify_chain_greedy,
 )
+from tokenspeed_kernel.thirdparty.cuda.sm12x_fp8 import sm12x_mxfp8_block128_quantize
+from tokenspeed_kernel.thirdparty.cuda.sm12x_mxfp4 import (
+    sm12x_mxfp4_moe_forward,
+    sm12x_mxfp4_moe_forward_warp,
+    sm12x_mxfp4_mxfp8_dense,
+    sm12x_mxfp4_mxfp8_quantize,
+    sm12x_mxfp4_swiglu_mxfp8_quantize,
+    sm12x_mxfp8_mxfp4_dense,
+    sm12x_mxfp8_mxfp4_mma_tile,
+)
 
 __all__ = [
     "apply_rope_with_cos_sin_cache_inplace",
@@ -52,6 +62,14 @@ __all__ = [
     "routing_flash",
     "silu_and_mul_fuse_block_quant",
     "silu_and_mul_fuse_nvfp4_quant",
+    "sm12x_mxfp4_moe_forward",
+    "sm12x_mxfp4_moe_forward_warp",
+    "sm12x_mxfp4_mxfp8_dense",
+    "sm12x_mxfp4_mxfp8_quantize",
+    "sm12x_mxfp4_swiglu_mxfp8_quantize",
+    "sm12x_mxfp8_block128_quantize",
+    "sm12x_mxfp8_mxfp4_dense",
+    "sm12x_mxfp8_mxfp4_mma_tile",
     "softplus_sqrt_topk_flash",
     "verify_chain_greedy",
 ]

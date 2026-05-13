@@ -171,7 +171,9 @@ class GreedySamplingBackend(SamplingBackend):
 
         if self.config.enable_output_logprobs:
 
-            write_output_logprobs(logits_output, logits, tokens)
+            write_output_logprobs(
+                logits_output, logits, tokens, sampling_info.top_logprobs_nums
+            )
 
         # Greedy backend allocates no sampling buffers — derive bs from logits.
         bs = logits.shape[0]
@@ -223,7 +225,10 @@ class GreedySamplingBackend(SamplingBackend):
         if self.config.enable_output_logprobs:
 
             write_output_logprobs(
-                logits_output, logits_output.next_token_logits, predict
+                logits_output,
+                logits_output.next_token_logits,
+                predict,
+                sampling_info.top_logprobs_nums,
             )
 
         return predict, accept_length

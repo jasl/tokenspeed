@@ -18,23 +18,50 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from tokenspeed_kernel.profiling import bootstrap_profiling_from_env
+_KERNEL_EXPORTS = {
+    "mha_decode_with_kvcache": (
+        "tokenspeed_kernel.ops.attention",
+        "mha_decode_with_kvcache",
+    ),
+    "mha_prefill": ("tokenspeed_kernel.ops.attention", "mha_prefill"),
+    "mha_prefill_with_kvcache": (
+        "tokenspeed_kernel.ops.attention",
+        "mha_prefill_with_kvcache",
+    ),
+    "mm": ("tokenspeed_kernel.ops.gemm", "mm"),
+    "moe_combine": ("tokenspeed_kernel.ops.moe", "moe_combine"),
+    "moe_dispatch": ("tokenspeed_kernel.ops.moe", "moe_dispatch"),
+    "moe_experts": ("tokenspeed_kernel.ops.moe", "moe_experts"),
+    "moe_fused": ("tokenspeed_kernel.ops.moe", "moe_fused"),
+    "moe_route": ("tokenspeed_kernel.ops.moe", "moe_route"),
+}
 
-bootstrap_profiling_from_env()
 
-from tokenspeed_kernel.ops.attention import (
-    mha_decode_with_kvcache,
-    mha_prefill,
-    mha_prefill_with_kvcache,
-)
-from tokenspeed_kernel.ops.gemm import mm
-from tokenspeed_kernel.ops.moe import (
-    moe_combine,
-    moe_dispatch,
-    moe_experts,
-    moe_fused,
-    moe_route,
-)
+def _missing_optional_triton(exc: ModuleNotFoundError) -> bool:
+    return exc.name in {"tokenspeed_triton", "triton"}
+
+
+try:
+    from tokenspeed_kernel.profiling import bootstrap_profiling_from_env
+except ModuleNotFoundError as exc:
+    if not _missing_optional_triton(exc):
+        raise
+else:
+    bootstrap_profiling_from_env()
+
+
+def __getattr__(name: str):
+    if name not in _KERNEL_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    import importlib
+
+    module_name, attr_name = _KERNEL_EXPORTS[name]
+    module = importlib.import_module(module_name)
+    value = getattr(module, attr_name)
+    globals()[name] = value
+    return value
+
 
 __all__ = [
     "mm",

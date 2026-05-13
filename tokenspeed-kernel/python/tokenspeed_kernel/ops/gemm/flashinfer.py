@@ -33,6 +33,7 @@ platform = current_platform()
 _fp8_dtype = Platform.get().fp8e4m3fn.dtype
 
 _fp4_dtypes: frozenset[torch.dtype] = frozenset({torch.uint8, torch.float4_e2m1fn_x2})
+__all__ = ["tinygemm_bf16"]
 
 # ---- FlashInfer block-scaled FP8 ----------------------------------------
 
@@ -41,10 +42,7 @@ tinygemm_bf16 = error_fn
 
 if platform.is_hopper_plus:
     try:
-        from flashinfer.gemm import (
-            gemm_fp8_nt_groupwise,
-            tinygemm_bf16,
-        )
+        from flashinfer.gemm import gemm_fp8_nt_groupwise, tinygemm_bf16
     except ImportError:
         pass
 
@@ -57,6 +55,7 @@ if gemm_fp8_nt_groupwise is not error_fn:
         solution="flashinfer",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 9),
             vendors=frozenset({"nvidia"}),
         ),
         dtypes={_fp8_dtype},
