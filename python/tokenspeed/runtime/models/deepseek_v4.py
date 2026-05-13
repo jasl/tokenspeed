@@ -1494,6 +1494,56 @@ def _deepseek_v4_maybe_execute_in_parallel(
     return result0, result1
 
 
+def _deepseek_v4_execute_in_parallel(
+    default_fn: Callable[[], Any],
+    aux_fns: list[Callable[[], Any] | None],
+    start_event: torch.cuda.Event | None,
+    done_events: list[torch.cuda.Event | None],
+    aux_streams: list[torch.cuda.Stream | None] | None,
+    enable: bool,
+) -> tuple[Any, list[Any]]:
+    """N-way fan-out execution of default_fn || aux_fns[i].
+
+    Mirrors :func:`vllm.utils.multi_stream_utils.execute_in_parallel`. When
+    ``enable`` is False or any required stream/event is None, falls back to
+    sequential execution on the current stream. ``aux_fns[i]`` may be ``None``
+    to skip the i-th slot (no stream switch, no event record); its entry in
+    ``aux_results`` is ``None``.
+    """
+    n = len(aux_fns)
+    aux_results: list[Any] = [None] * n
+    if (
+        not enable
+        or aux_streams is None
+        or start_event is None
+        or any(s is None for s in aux_streams)
+        or any(e is None for e in done_events)
+    ):
+        default_result = default_fn()
+        for i, fn in enumerate(aux_fns):
+            if fn is not None:
+                aux_results[i] = fn()
+        return default_result, aux_results
+
+    pending: list[torch.cuda.Event] = []
+    start_event.record()
+    for i, fn in enumerate(aux_fns):
+        if fn is None:
+            continue
+        stream = aux_streams[i]
+        done = done_events[i]
+        assert stream is not None and done is not None  # narrowed above
+        with torch.cuda.stream(stream):
+            start_event.wait()
+            aux_results[i] = fn()
+            done.record()
+        pending.append(done)
+
+    default_result = default_fn()
+    for ev in pending:
+        ev.wait()
+    return default_result, aux_results
+
 def _deepseek_v4_attn_aux_stream_mode() -> str:
     """Resolve the SM12x attention aux-stream mode.
 
@@ -1515,17 +1565,37 @@ def _deepseek_v4_should_enable_attn_aux_stream() -> bool:
     return bool(_platform.is_sm12x_supported)
 
 
-def _deepseek_v4_allocate_attn_aux_stream() -> torch.cuda.Stream | None:
-    """Allocate the attention aux stream when SM12x and env enabled.
+def _deepseek_v4_allocate_attn_aux_streams(count: int) -> list[torch.cuda.Stream] | None:
+    """Allocate ``count`` CUDA streams for the attention overlap, or None.
 
-    Returns ``None`` for non-SM12x platforms or when the env says ``off`` so the
+    Returns ``None`` when the overlap is disabled for this platform/env so the
     legacy synchronous code path stays bit-for-bit identical.
     """
+    if count <= 0:
+        return None
     if not _deepseek_v4_should_enable_attn_aux_stream():
         return None
     if not torch.cuda.is_available():
         return None
-    return torch.cuda.Stream()
+    return [torch.cuda.Stream() for _ in range(count)]
+
+
+def _deepseek_v4_multi_stream_token_threshold() -> int:
+    """Token-count gate for the pre-projection multi-stream overlap.
+
+    Mirrors vLLM's ``VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD`` (default 1024):
+    when ``num_tokens <= threshold`` the aux GEMMs overlap with the heavier
+    ``fused_wqa_wkv``; otherwise the main GEMM is large enough to fill the GPU
+    on its own and overlap is harmful. Override with
+    ``TOKENSPEED_DSV4_MULTI_STREAM_TOKEN_THRESHOLD``.
+    """
+    try:
+        value = int(
+            os.environ.get("TOKENSPEED_DSV4_MULTI_STREAM_TOKEN_THRESHOLD", "1024")
+        )
+    except ValueError:
+        return 1024
+    return max(0, value)
 
 
 _DEEPSEEK_V4_MEGA_DEEP_GEMM = None
@@ -2971,6 +3041,26 @@ class DeepseekV4Compressor(nn.Module):
             self.ape.data.copy_(_deepseek_v4_reorder_c4_ape_2604(self.ape.data))
         self._ape_reordered = True
 
+    def compute_kv_score(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run the fused_wkv_wgate matmul, returning the un-split kv_score.
+
+        Exposed as a public hook so the pre-projection multi-stream cluster in
+        :class:`DeepseekV4Attention` can launch the GEMM on an aux stream in
+        parallel with the heavier ``fused_wqa_wkv`` GEMM, then feed the result
+        back via ``forward(..., precomputed_kv_score=...)``.
+        """
+        weight_shape = (
+            self.fused_wkv_wgate.output_size_per_partition,
+            self.fused_wkv_wgate.input_size,
+        )
+        weight = self.fused_wkv_wgate.weight.view(*weight_shape)
+        if weight.dtype == torch.float8_e4m3fn:
+            weight = _dequant_fp8_weight(self.fused_wkv_wgate, weight_shape)
+        kv_score = _deepseek_v4_bf16_linear_fp32(hidden_states, weight)
+        if kv_score is None:
+            kv_score = torch.matmul(hidden_states.float(), weight.float().T)
+        return kv_score
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -2985,6 +3075,7 @@ class DeepseekV4Compressor(nn.Module):
         state_block_size: int | None = None,
         state_base_logical_page: torch.Tensor | None = None,
         write_compressed_cache: bool = True,
+        precomputed_kv_score: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         pool = ctx.token_to_kv_pool
         metadata = ctx.attn_backend.forward_metadata
@@ -2995,18 +3086,12 @@ class DeepseekV4Compressor(nn.Module):
             if not write_compressed_cache
             else f"compressor_c{self.compress_ratio}"
         )
-        with deepseek_v4_profile_scope(f"{profile_prefix}_dequant_weight"):
-            weight_shape = (
-                self.fused_wkv_wgate.output_size_per_partition,
-                self.fused_wkv_wgate.input_size,
-            )
-            weight = self.fused_wkv_wgate.weight.view(*weight_shape)
-            if weight.dtype == torch.float8_e4m3fn:
-                weight = _dequant_fp8_weight(self.fused_wkv_wgate, weight_shape)
-        with deepseek_v4_profile_scope(f"{profile_prefix}_matmul"):
-            kv_score = _deepseek_v4_bf16_linear_fp32(hidden_states, weight)
-            if kv_score is None:
-                kv_score = torch.matmul(hidden_states.float(), weight.float().T)
+        if precomputed_kv_score is not None:
+            kv_score = precomputed_kv_score
+        else:
+            with deepseek_v4_profile_scope(f"{profile_prefix}_matmul"):
+                kv_score = self.compute_kv_score(hidden_states)
+        with deepseek_v4_profile_scope(f"{profile_prefix}_split"):
             kv, score = kv_score.split([self.coff * self.head_dim] * 2, dim=-1)
         if state_cache is None:
             state_cache = pool.get_compressor_state_buffer(layer_index)
@@ -3120,6 +3205,28 @@ class DeepseekV4Indexer(nn.Module):
         self.topk_buffer = topk_buffer
         self.softmax_scale = self.head_dim**-0.5
 
+    def compute_weights_proj(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run ``weights_proj``, returning the projected weights tensor.
+
+        Companion to :meth:`DeepseekV4Compressor.compute_kv_score` — exposed so
+        the pre-projection multi-stream cluster in :class:`DeepseekV4Attention`
+        can launch this GEMM on an aux stream and pass the result back via
+        ``forward(..., precomputed_weights=...)``.
+        """
+        weights, _ = self.weights_proj(hidden_states)
+        return weights
+
+    def compute_inner_compressor_kv_score(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        """Delegate to the indexer's internal compressor matmul.
+
+        Lets the pre-projection multi-stream cluster pre-compute the indexer's
+        compressor kv_score on an aux stream and feed it back via the
+        ``precomputed_indexer_kv_score`` parameter on :meth:`forward`.
+        """
+        return self.compressor.compute_kv_score(hidden_states)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -3129,6 +3236,8 @@ class DeepseekV4Indexer(nn.Module):
         out_cache_loc: torch.Tensor,
         layer_index: int,
         cos_sin_cache: torch.Tensor,
+        precomputed_weights: torch.Tensor | None = None,
+        precomputed_indexer_kv_score: torch.Tensor | None = None,
     ) -> torch.Tensor:
         pool = ctx.token_to_kv_pool
         metadata = ctx.attn_backend.forward_metadata
@@ -3165,6 +3274,7 @@ class DeepseekV4Indexer(nn.Module):
                 state_block_size=indexer_state_block_size,
                 state_base_logical_page=indexer_state_base_logical_page,
                 write_compressed_cache=False,
+                precomputed_kv_score=precomputed_indexer_kv_score,
             )
         with deepseek_v4_profile_scope("indexer_compressed_slot_mapping"):
             indexer_block_size = pool.get_indexer_block_size(layer_index)
@@ -3212,8 +3322,11 @@ class DeepseekV4Indexer(nn.Module):
         with deepseek_v4_profile_scope("indexer_wq_b"):
             index_q, _ = self.wq_b(qr)
             index_q = index_q.view(-1, self.n_head, self.head_dim)
-        with deepseek_v4_profile_scope("indexer_weights_proj"):
-            weights, _ = self.weights_proj(hidden_states)
+        if precomputed_weights is not None:
+            weights = precomputed_weights
+        else:
+            with deepseek_v4_profile_scope("indexer_weights_proj"):
+                weights = self.compute_weights_proj(hidden_states)
         packed_index_q = None
         packed_weights = None
         if self.use_fp4_cache:
@@ -3347,12 +3460,19 @@ class DeepseekV4Attention(nn.Module):
         layer_index: int,
         quant_config: QuantizationConfig | None,
         prefix: str,
-        aux_stream: torch.cuda.Stream | None = None,
+        aux_streams: list[torch.cuda.Stream] | None = None,
         topk_buffer: _DeepseekV4TopKBuffer | None = None,
     ) -> None:
         super().__init__()
         self.layer_index = layer_index
-        self.aux_stream = aux_stream
+        # ``aux_streams`` holds (up to) 3 CUDA streams shared across all
+        # attention layers. Stream [0] is reused for the post-projection
+        # overlap (run_indexer || compressor + swa); streams [0..2] feed the
+        # pre-projection 3-way fan-out of the input GEMMs. ``None`` ⇒ no
+        # overlap, sequential fallback. See _deepseek_v4_allocate_attn_aux_streams.
+        self.aux_streams: list[torch.cuda.Stream] | None = aux_streams
+        # Backward-compat alias used by the existing post-projection overlap.
+        self.aux_stream = aux_streams[0] if aux_streams else None
         if self.aux_stream is not None:
             self.ln_events: list[torch.cuda.Event | None] = [
                 torch.cuda.Event(),
@@ -3360,6 +3480,18 @@ class DeepseekV4Attention(nn.Module):
             ]
         else:
             self.ln_events = [None, None]
+        # Pre-projection multi-stream fan-out: one start event +
+        # one done event per aux slot. Only allocated when at least one
+        # aux stream is available so non-SM12x stays bit-for-bit unchanged.
+        if aux_streams is not None and len(aux_streams) >= 1:
+            self.pre_proj_start_event: torch.cuda.Event | None = torch.cuda.Event()
+            self.pre_proj_done_events: list[torch.cuda.Event | None] = [
+                torch.cuda.Event() for _ in range(len(aux_streams))
+            ]
+        else:
+            self.pre_proj_start_event = None
+            self.pre_proj_done_events = [None, None, None]
+        self.multi_stream_token_threshold = _deepseek_v4_multi_stream_token_threshold()
         use_fp4_indexer_cache = _attention_use_fp4_indexer_cache(config)
         self.layout = deepseek_v4_attention_layout(
             config,
@@ -3466,9 +3598,14 @@ class DeepseekV4Attention(nn.Module):
     def _split_qr_kv(self, qr_kv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
 
-    def _project_q_kv(
-        self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _project_q_kv_matmul(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run only the ``fused_wqa_wkv`` GEMM, returning the un-split qr_kv.
+
+        Split out from :meth:`_project_q_kv` so the pre-projection
+        multi-stream cluster can drive this on the default stream while the
+        lighter input GEMMs (compressor kv_score, indexer weights_proj,
+        indexer.compressor kv_score) run on aux streams in parallel.
+        """
         qr_kv_shape = (
             self.fused_wqa_wkv.output_size_per_partition,
             self.fused_wqa_wkv.input_size,
@@ -3488,6 +3625,17 @@ class DeepseekV4Attention(nn.Module):
                 hidden_states,
                 qr_kv_shape,
             )
+        return qr_kv
+
+    def _project_q_kv_finalize(
+        self, qr_kv: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply Q/KV norms + the ``wq_b`` GEMM, returning ``(q, kv, qr)``.
+
+        Companion to :meth:`_project_q_kv_matmul`. Always runs on the default
+        stream after the pre-projection fan-in (or sequentially when overlap
+        is disabled).
+        """
         qr, kv = self._split_qr_kv(qr_kv)
         if self.use_fused_qkv_rmsnorm and qr.is_cuda and qr.shape[0] > 0:
             qr_norm = torch.empty(
@@ -3518,6 +3666,13 @@ class DeepseekV4Attention(nn.Module):
         )
         q = q.view(-1, self.num_local_heads, self.head_dim)
         return q, kv, qr
+
+    def _project_q_kv(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sequential Q/KV projection (no aux-stream overlap)."""
+        qr_kv = self._project_q_kv_matmul(hidden_states)
+        return self._project_q_kv_finalize(qr_kv)
 
     def _make_padded_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return torch.empty(
@@ -3979,8 +4134,79 @@ class DeepseekV4Attention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states
         profile_prefix = f"attn_{self.attention_kind}"
+        # Pre-projection multi-stream cluster: when at least one aux stream is
+        # available and we are at or below the token threshold (decode shape),
+        # fan ``fused_wqa_wkv`` out on the default stream against the three
+        # lighter input GEMMs (compressor.compute_kv_score,
+        # indexer.compute_weights_proj, indexer.compute_inner_compressor_kv_score)
+        # on aux streams. Precomputed tensors are threaded back into the
+        # compressor / indexer call sites below so we do not recompute them.
+        precomputed_kv_score: torch.Tensor | None = None
+        precomputed_weights: torch.Tensor | None = None
+        precomputed_indexer_kv_score: torch.Tensor | None = None
+        num_tokens = int(hidden_states.shape[0])
+        multi_stream_enabled = (
+            self.pre_proj_start_event is not None
+            and self.aux_streams is not None
+            and len(self.aux_streams) >= 1
+            and 0 < num_tokens <= self.multi_stream_token_threshold
+        )
         with deepseek_v4_profile_scope(f"{profile_prefix}_project_q_kv"):
-            q, kv, qr = self._project_q_kv(hidden_states)
+            if multi_stream_enabled:
+                aux_fns: list[Callable[[], Any] | None] = [None, None, None]
+                if self.compressor is not None:
+                    compressor_ref = self.compressor
+
+                    def _aux_compressor_kv_score() -> torch.Tensor:
+                        with deepseek_v4_profile_scope(
+                            f"{profile_prefix}_aux_compressor_kv_score"
+                        ):
+                            return compressor_ref.compute_kv_score(hidden_states)
+
+                    aux_fns[0] = _aux_compressor_kv_score
+                if self.indexer is not None:
+                    indexer_ref = self.indexer
+
+                    def _aux_indexer_weights() -> torch.Tensor:
+                        with deepseek_v4_profile_scope(
+                            f"{profile_prefix}_aux_indexer_weights"
+                        ):
+                            return indexer_ref.compute_weights_proj(hidden_states)
+
+                    def _aux_indexer_compressor_kv_score() -> torch.Tensor:
+                        with deepseek_v4_profile_scope(
+                            f"{profile_prefix}_aux_indexer_compressor_kv_score"
+                        ):
+                            return indexer_ref.compute_inner_compressor_kv_score(
+                                hidden_states
+                            )
+
+                    aux_fns[1] = _aux_indexer_weights
+                    aux_fns[2] = _aux_indexer_compressor_kv_score
+
+                def _default_fused_wqa_wkv() -> torch.Tensor:
+                    with deepseek_v4_profile_scope(
+                        f"{profile_prefix}_project_q_kv_matmul"
+                    ):
+                        return self._project_q_kv_matmul(hidden_states)
+
+                qr_kv, aux_results = _deepseek_v4_execute_in_parallel(
+                    _default_fused_wqa_wkv,
+                    aux_fns,
+                    self.pre_proj_start_event,
+                    self.pre_proj_done_events,
+                    self.aux_streams,
+                    enable=True,
+                )
+                precomputed_kv_score = aux_results[0]
+                precomputed_weights = aux_results[1]
+                precomputed_indexer_kv_score = aux_results[2]
+                with deepseek_v4_profile_scope(
+                    f"{profile_prefix}_project_q_kv_finalize"
+                ):
+                    q, kv, qr = self._project_q_kv_finalize(qr_kv)
+            else:
+                q, kv, qr = self._project_q_kv(hidden_states)
         pool = ctx.token_to_kv_pool
         metadata = ctx.attn_backend.forward_metadata
         if metadata is None:
@@ -4018,6 +4244,7 @@ class DeepseekV4Attention(nn.Module):
                     out_cache_loc=out_cache_loc,
                     layer_index=self.layer_index,
                     cos_sin_cache=self._cos_sin_cache(),
+                    precomputed_kv_score=precomputed_kv_score,
                 )
 
         topk_indices = None
@@ -4034,6 +4261,8 @@ class DeepseekV4Attention(nn.Module):
                         out_cache_loc=out_cache_loc,
                         layer_index=self.layer_index,
                         cos_sin_cache=self._cos_sin_cache(),
+                        precomputed_weights=precomputed_weights,
+                        precomputed_indexer_kv_score=precomputed_indexer_kv_score,
                     )
 
             def insert_and_compress() -> None:
@@ -4126,7 +4355,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         mapping: Mapping,
         quant_config: QuantizationConfig | None,
         prefix: str,
-        aux_stream: torch.cuda.Stream | None = None,
+        aux_streams: list[torch.cuda.Stream] | None = None,
         topk_buffer: _DeepseekV4TopKBuffer | None = None,
     ) -> None:
         super().__init__()
@@ -4145,7 +4374,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             layer_id,
             quant_config,
             add_prefix("attn", prefix),
-            aux_stream=aux_stream,
+            aux_streams=aux_streams,
             topk_buffer=topk_buffer,
         )
         self.ffn = DeepseekV4MoE(
@@ -4297,12 +4526,20 @@ class DeepseekV4Model(nn.Module):
         self.hc_mult = config.hc_mult
         self.hc_eps = config.hc_eps
         self.rms_norm_eps = config.rms_norm_eps
-        # Attention overlap: post-projection (run_indexer || swa_cache +
-        # compressor) for HCA / (compressor || swa_cache) for CSA. Enabled by
-        # default on SM12x via _deepseek_v4_should_enable_attn_aux_stream();
-        # disabled elsewhere. Override with
-        # ``TOKENSPEED_DSV4_ATTN_AUX_STREAM=on|off|auto``.
-        self.attention_aux_stream = _deepseek_v4_allocate_attn_aux_stream()
+        # Attention overlap streams. Three streams are allocated up-front so a
+        # single pool can drive both the pre-projection fan-out (fused_wqa_wkv
+        # on default + compressor kv_score / indexer weights_proj /
+        # indexer.compressor kv_score on aux 0/1/2) and the post-projection
+        # overlap (which reuses stream[0]). Enabled by default on SM12x,
+        # disabled elsewhere — see _deepseek_v4_should_enable_attn_aux_stream().
+        # Override via env TOKENSPEED_DSV4_ATTN_AUX_STREAM=on|off|auto.
+        self.attention_aux_streams = _deepseek_v4_allocate_attn_aux_streams(3)
+        # Backward-compat alias used by some tests / introspection.
+        self.attention_aux_stream = (
+            self.attention_aux_streams[0]
+            if self.attention_aux_streams is not None
+            else None
+        )
         self.topk_indices_buffer = _DeepseekV4TopKBuffer(int(config.index_topk))
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -4320,7 +4557,7 @@ class DeepseekV4Model(nn.Module):
                     mapping,
                     quant_config,
                     add_prefix(f"layers.{layer_id}", prefix),
-                    aux_stream=self.attention_aux_stream,
+                    aux_streams=self.attention_aux_streams,
                     topk_buffer=self.topk_indices_buffer,
                 )
                 for layer_id in range(config.num_hidden_layers)
