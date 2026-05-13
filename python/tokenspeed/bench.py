@@ -52,7 +52,7 @@ import sys
 import time
 import traceback
 import warnings
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Coroutine
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -67,7 +67,23 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from tokenspeed.runtime.utils.env import envs
 
-AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
+# Streaming HTTP timeout. ``total=6h`` keeps the session umbrella generous so
+# whole-run benches don't get cut off, but the per-socket sub-timeouts let any
+# single request abort cleanly when the server stops sending chunks. Without
+# ``sock_read``, a single stuck stream-response future deadlocks the entire
+# ``asyncio.gather`` at high concurrency.
+AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(
+    total=6 * 60 * 60,
+    sock_connect=30,
+    sock_read=120,
+)
+# Per-request hard ceiling so a single misbehaving stream cannot block the
+# whole gather. 600s comfortably covers a 2048-token decode at typical TPOTs
+# in the 30-50 ms range. Override via env when running unusually long
+# sequences.
+PER_REQUEST_TIMEOUT_SEC = float(
+    os.environ.get("TOKENSPEED_BENCH_PER_REQUEST_TIMEOUT_SEC", "600")
+)
 DEFAULT_NUM_PROMPTS = 1000
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
@@ -169,6 +185,35 @@ class RequestFuncOutput:
     error: str = ""
     start_time: float = 0.0
     input_audio_duration: float = 0.0  # in seconds
+
+
+async def await_with_per_request_timeout(
+    coro: Coroutine[Any, Any, RequestFuncOutput],
+    *,
+    prompt_len: int,
+    pbar: tqdm | None = None,
+) -> RequestFuncOutput:
+    """Run a request coroutine under :data:`PER_REQUEST_TIMEOUT_SEC`.
+
+    Wraps the per-request ``asyncio.wait_for`` so a single stuck stream
+    cannot deadlock the outer ``asyncio.gather`` in :func:`benchmark`.  On
+    :class:`asyncio.TimeoutError`, returns a standard
+    :class:`RequestFuncOutput` with ``success=False`` so the gather can
+    complete and the metrics output reports the failure normally.
+    """
+    try:
+        return await asyncio.wait_for(coro, timeout=PER_REQUEST_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        output = RequestFuncOutput()
+        output.prompt_len = prompt_len
+        output.success = False
+        output.error = (
+            f"per-request timeout {PER_REQUEST_TIMEOUT_SEC:.1f}s "
+            "(TOKENSPEED_BENCH_PER_REQUEST_TIMEOUT_SEC)"
+        )
+        if pbar is not None:
+            pbar.update(1)
+        return output
 
 
 class TaskType(Enum):
@@ -1556,7 +1601,12 @@ async def benchmark(
 
     async def limited_request_func(request_func_input, session, pbar):
         async with semaphore:
-            return await request_func(request_func_input, session=session, pbar=pbar)
+            coro = request_func(request_func_input, session=session, pbar=pbar)
+            return await await_with_per_request_timeout(
+                coro,
+                prompt_len=request_func_input.prompt_len,
+                pbar=pbar,
+            )
 
     print("Starting main benchmark run...")
     benchmark_start_time = time.perf_counter()
