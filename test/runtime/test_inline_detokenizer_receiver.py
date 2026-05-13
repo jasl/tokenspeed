@@ -927,6 +927,30 @@ class TestInlineLogprobPassThrough(unittest.TestCase):
         )
         self.assertEqual([entry[1] for entry in meta["output_token_logprobs"]], [1, 2])
 
+    def test_text_logprob_decode_uses_one_sequence_per_token(self):
+        class FakeTokenizer:
+            def __init__(self):
+                self.batch_decode_args = None
+
+            def batch_decode(self, token_ids):
+                self.batch_decode_args = token_ids
+                return [f"tok:{ids[0]}" for ids in token_ids]
+
+        tok = FakeTokenizer()
+        mgr = _StubTokenizerManager(tok, enable_inline_detokenizer=True)
+
+        decoded = mgr.output_processor.logprobs_processor.detokenize_logprob_tokens(
+            [-0.5, -0.6],
+            [101, 102],
+            decode_to_text=True,
+        )
+
+        self.assertEqual(tok.batch_decode_args, [[101], [102]])
+        self.assertEqual(
+            decoded,
+            [(-0.5, 101, "tok:101"), (-0.6, 102, "tok:102")],
+        )
+
     def test_top_logprobs_flow_through_inline_branch_when_requested(self):
         mgr = _StubTokenizerManager(self.tok, enable_inline_detokenizer=True)
         state = _mk_logprob_state(rid="r1", top_logprobs_num=2)

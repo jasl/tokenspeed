@@ -18,16 +18,46 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import importlib
+
 from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
 
+
+def _optional_import(module_name: str, *, required: bool = False) -> None:
+    try:
+        importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        missing_requested_module = exc.name == module_name or (
+            exc.name is not None
+            and (
+                exc.name.startswith(f"{module_name}.")
+                or module_name.startswith(f"{exc.name}.")
+            )
+        )
+        if missing_requested_module and not required:
+            return
+        raise
+    except ImportError:
+        if required:
+            raise
+        return
+
+
 with redirect_triton_to_tokenspeed_triton():
-    import triton_kernels  # noqa: F401
-    import triton_kernels.matmul  # noqa: F401
-    import triton_kernels.matmul_details  # noqa: F401
-    import triton_kernels.matmul_details.opt_flags  # noqa: F401
-    import triton_kernels.numerics  # noqa: F401
-    import triton_kernels.swiglu  # noqa: F401
-    import triton_kernels.tensor  # noqa: F401
-    import triton_kernels.tensor_details  # noqa: F401
-    import triton_kernels.tensor_details.layout  # noqa: F401
-    import triton_kernels.topk  # noqa: F401
+    for _module_name in (
+        "triton_kernels",
+        "triton_kernels.matmul",
+        "triton_kernels.matmul_details",
+        "triton_kernels.matmul_details.opt_flags",
+        "triton_kernels.matmul_ogs",
+        "triton_kernels.numerics",
+        "triton_kernels.numerics_details",
+        "triton_kernels.routing",
+        "triton_kernels.swiglu",
+        "triton_kernels.tensor",
+        "triton_kernels.tensor_details",
+        "triton_kernels.tensor_details.layout",
+        "triton_kernels.topk",
+        "triton_kernels.topk_details",
+    ):
+        _optional_import(_module_name, required=(_module_name == "triton_kernels"))

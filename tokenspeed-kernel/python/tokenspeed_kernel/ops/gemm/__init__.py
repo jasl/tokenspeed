@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import os
 
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.numerics.reference.gemm  # noqa: F401
@@ -82,6 +83,40 @@ def _online_quantize_mxfp8(
     """
     block_k = block_size[1]
 
+    def use_sm12x_cuda_quantize() -> bool:
+        if os.getenv(
+            "TOKENSPEED_SM12X_MXFP8_CUDA_QUANTIZE", ""
+        ).strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return False
+        return (
+            kernel_name == "triton_mm_fp8_blockscale"
+            and _platform.is_nvidia
+            and _platform.arch_version.major >= 12
+            and A.is_cuda
+            and A.dim() == 2
+            and block_k == 128
+            and A.shape[-1] % 128 == 0
+            and A.dtype in {torch.float32, torch.float16, torch.bfloat16}
+        )
+
+    def torch_group_quant_fp8() -> tuple[torch.Tensor, torch.Tensor]:
+        groups = A.float().reshape(-1, A.shape[-1] // block_k, block_k)
+        scales = groups.abs().amax(dim=-1).clamp_min(1.0e-10)
+        scales = scales / torch.finfo(_fp8_dtype).max
+        qA = torch.clamp(
+            groups / scales.unsqueeze(-1),
+            torch.finfo(_fp8_dtype).min,
+            torch.finfo(_fp8_dtype).max,
+        ).to(_fp8_dtype)
+        qA = qA.reshape_as(A).contiguous()
+        A_scales = scales.reshape(*A.shape[:-1], -1).contiguous()
+        return qA, A_scales
+
     def ensure_row_major_scales(
         qA: torch.Tensor,
         A_scales: torch.Tensor,
@@ -122,6 +157,15 @@ def _online_quantize_mxfp8(
             )
         )
     elif kernel_name == "triton_mm_fp8_blockscale":
+        if use_sm12x_cuda_quantize():
+            from tokenspeed_kernel.ops.gemm.sm12x_fp8 import (
+                sm12x_mxfp8_block128_quantize,
+            )
+
+            return sm12x_mxfp8_block128_quantize(A)
+        if _platform.is_nvidia and _platform.arch_version.major >= 12:
+            return torch_group_quant_fp8()
+
         from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
 
         return ensure_row_major_scales(
