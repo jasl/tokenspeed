@@ -1494,6 +1494,40 @@ def _deepseek_v4_maybe_execute_in_parallel(
     return result0, result1
 
 
+def _deepseek_v4_attn_aux_stream_mode() -> str:
+    """Resolve the SM12x attention aux-stream mode.
+
+    Returns one of ``auto`` / ``on`` / ``off``. ``auto`` (default) means the
+    attention overlap engages on SM12x and stays off elsewhere — this matches
+    vLLM's pattern where multi-stream is disabled on ROCm/Hopper to avoid hang
+    issues, and the SM12x decode path is the one that benefits.
+    """
+    return os.environ.get("TOKENSPEED_DSV4_ATTN_AUX_STREAM", "auto").strip().lower()
+
+
+def _deepseek_v4_should_enable_attn_aux_stream() -> bool:
+    mode = _deepseek_v4_attn_aux_stream_mode()
+    if mode in ("off", "0", "false", "no"):
+        return False
+    if mode in ("on", "1", "true", "yes"):
+        return True
+    # auto
+    return bool(_platform.is_sm12x_supported)
+
+
+def _deepseek_v4_allocate_attn_aux_stream() -> torch.cuda.Stream | None:
+    """Allocate the attention aux stream when SM12x and env enabled.
+
+    Returns ``None`` for non-SM12x platforms or when the env says ``off`` so the
+    legacy synchronous code path stays bit-for-bit identical.
+    """
+    if not _deepseek_v4_should_enable_attn_aux_stream():
+        return None
+    if not torch.cuda.is_available():
+        return None
+    return torch.cuda.Stream()
+
+
 _DEEPSEEK_V4_MEGA_DEEP_GEMM = None
 _DEEPSEEK_V4_MEGA_DEEP_GEMM_CHECKED = False
 _DEEPSEEK_V4_MEGA_DEEP_GEMM_REQUIRED = (
@@ -4263,10 +4297,12 @@ class DeepseekV4Model(nn.Module):
         self.hc_mult = config.hc_mult
         self.hc_eps = config.hc_eps
         self.rms_norm_eps = config.rms_norm_eps
-        # Attention overlap (compressor/CSA on aux stream) is opt-in; the
-        # synchronous reference path is the default until a wider correctness
-        # sweep confirms the overlap path.
-        self.attention_aux_stream = None
+        # Attention overlap: post-projection (run_indexer || swa_cache +
+        # compressor) for HCA / (compressor || swa_cache) for CSA. Enabled by
+        # default on SM12x via _deepseek_v4_should_enable_attn_aux_stream();
+        # disabled elsewhere. Override with
+        # ``TOKENSPEED_DSV4_ATTN_AUX_STREAM=on|off|auto``.
+        self.attention_aux_stream = _deepseek_v4_allocate_attn_aux_stream()
         self.topk_indices_buffer = _DeepseekV4TopKBuffer(int(config.index_topk))
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
