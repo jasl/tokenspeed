@@ -21,11 +21,13 @@
 from tokenspeed.runtime.layers.moe.backends.mxfp4.flashinfer import (
     Mxfp4FlashinferMxfp4Backend,
 )
+from tokenspeed.runtime.layers.moe.backends.mxfp4.sm12x import Mxfp4Sm12xBackend
 from tokenspeed.runtime.layers.moe.backends.mxfp4.triton_kernel import (
     Mxfp4TritonKernelBackend,
 )
 
 __all__ = [
     "Mxfp4FlashinferMxfp4Backend",
+    "Mxfp4Sm12xBackend",
     "Mxfp4TritonKernelBackend",
 ]

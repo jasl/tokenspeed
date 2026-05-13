@@ -52,6 +52,7 @@ if fp8_gemm_nt is not None:
         solution="deep_gemm",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
+            max_arch_version=ArchVersion(10, 9),
             vendors=frozenset({"nvidia"}),
         ),
         dtypes={_fp8_dtype},

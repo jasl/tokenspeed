@@ -20,13 +20,49 @@
 
 from __future__ import annotations
 
-# Backend registration (side-effect imports)
-import tokenspeed_kernel.ops.attention.flash_attn  # noqa: F401
-import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton  # noqa: F401
+from contextlib import contextmanager
+
 import torch
-from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
+
+try:
+    from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
+except ModuleNotFoundError as exc:
+    if exc.name not in {"tokenspeed_triton", "triton"}:
+        raise
+
+    class ShapeCapture:
+        @classmethod
+        def get(cls) -> "ShapeCapture":
+            return cls()
+
+        def record(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+    @contextmanager
+    def kernel_scope(*args, **kwargs):
+        del args, kwargs
+        yield
+
+
+def _optional_backend_import(module_name: str) -> None:
+    try:
+        __import__(module_name)
+    except ModuleNotFoundError as exc:
+        if exc.name in {
+            "flash_attn",
+            "flashinfer",
+            "tokenspeed_triton",
+            "triton",
+        }:
+            return
+        raise
+
+
+# Backend registration (side-effect imports)
+_optional_backend_import("tokenspeed_kernel.ops.attention.flash_attn")
+_optional_backend_import("tokenspeed_kernel.ops.attention.flashinfer")
+_optional_backend_import("tokenspeed_kernel.ops.attention.triton")
 
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
 

@@ -72,12 +72,47 @@ def write_output_logprobs(
     logits_output: LogitsProcessorOutput,
     logits: torch.Tensor,
     tokens: torch.Tensor,
+    top_logprobs_nums: list[int] | None = None,
 ) -> None:
-    """Fill logits_output.next_token_logprobs; callers gate on the enable flag."""
+    """Fill output logprob tensors; callers gate on the enable flag."""
     raw_logprobs = torch.log_softmax(logits, dim=-1)
     logits_output.next_token_logprobs = raw_logprobs.gather(
         -1, tokens.long().unsqueeze(-1)
     ).squeeze(-1)
+    write_output_top_logprobs(logits_output, raw_logprobs, top_logprobs_nums)
+
+
+def write_output_top_logprobs(
+    logits_output: LogitsProcessorOutput,
+    raw_logprobs: torch.Tensor,
+    top_logprobs_nums: list[int] | None,
+) -> None:
+    """Attach top-k logprobs from already-normalized output logprobs."""
+    if not top_logprobs_nums:
+        return
+
+    num_rows = raw_logprobs.shape[0]
+    if len(top_logprobs_nums) == num_rows:
+        expanded_top_logprobs_nums = top_logprobs_nums
+    elif num_rows % len(top_logprobs_nums) == 0:
+        repeat = num_rows // len(top_logprobs_nums)
+        expanded_top_logprobs_nums = [
+            k for k in top_logprobs_nums for _ in range(repeat)
+        ]
+    else:
+        raise ValueError(
+            f"Cannot align top_logprobs_nums={top_logprobs_nums} "
+            f"to {num_rows} output logprob rows."
+        )
+
+    max_k = max(expanded_top_logprobs_nums)
+    if max_k <= 0:
+        return
+
+    top = raw_logprobs.topk(max_k, dim=-1)
+    logits_output.next_token_top_logprobs_val = top.values
+    logits_output.next_token_top_logprobs_idx = top.indices
+    logits_output.next_token_top_logprobs_nums = expanded_top_logprobs_nums
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())

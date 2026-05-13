@@ -21,6 +21,7 @@ from tokenspeed.runtime.layers.attention.backends.deepseek_v4 import (
     DeepseekV4AttentionBackend,
 )
 from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
+    DEEPSEEK_V4_INDEXER_DIM,
     DeepseekV4AttentionOpUnavailable,
     deepseek_v4_compute_global_topk_indices_and_lens,
     deepseek_v4_indexer_topk_reference,
@@ -45,6 +46,10 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     DeepseekV4Indexer,
     DeepseekV4MLP,
     DeepseekV4MoEGate,
+    _deepseek_v4_deepgemm_fp4_indexer_available,
+    _deepseek_v4_deepgemm_fp4_indexer_enabled_for_platform,
+    _deepseek_v4_fast_mhc_enabled_for_platform,
+    _deepseek_v4_fast_topk_enabled_for_platform,
     _deepseek_v4_fused_select_experts,
     _deepseek_v4_gather_indexer_mxfp4_cache,
     _deepseek_v4_get_fp8_linear_deep_gemm,
@@ -59,9 +64,12 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     _deepseek_v4_indexer_topk_from_logits,
     _deepseek_v4_prefill_topk_op_available,
     _deepseek_v4_reorder_c4_ape_2604,
+    _deepseek_v4_trtllm_fp8_quant_enabled_for_platform,
     _DeepseekV4TopKBuffer,
     _fp8_act_quant_dequant,
     _fp8_linear,
+    _mhc_post_reference,
+    _mhc_pre_reference,
     deepseek_v4_attention_layout,
     deepseek_v4_rope_config,
     deepseek_v4_select_experts,
@@ -1911,6 +1919,113 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         self.assertTrue(torch.equal(actual, expected))
 
+    def test_deepseek_v4_indexer_decode_all_candidate_shortcut_skips_cache_read(self):
+        def cache_reader(cache_2d, slot_mapping, block_size):
+            del cache_2d, slot_mapping, block_size
+            raise AssertionError("all-candidate shortcut should not read cache")
+
+        topk = _deepseek_v4_indexer_topk_from_cache_batched(
+            cache_reader=cache_reader,
+            cache_2d=torch.empty(0),
+            positions=torch.tensor([0, 3, 7, 11], dtype=torch.int64),
+            token_to_req_indices=torch.zeros(4, dtype=torch.int32),
+            block_table=torch.arange(4, dtype=torch.int32).view(1, 4),
+            cache_block_size=1,
+            index_q=torch.empty(4, 1, 4),
+            weights=torch.empty(4, 1),
+            compress_ratio=4,
+            topk_tokens=512,
+        )
+
+        expected = torch.full((4, 512), -1, dtype=torch.int32)
+        expected[1, 0] = 0
+        expected[2, :2] = torch.tensor([0, 1], dtype=torch.int32)
+        expected[3, :3] = torch.tensor([0, 1, 2], dtype=torch.int32)
+        self.assertTrue(torch.equal(topk, expected))
+
+    def test_deepseek_v4_indexer_decode_all_candidate_shortcut_skips_q_prepare(self):
+        indexer = object.__new__(DeepseekV4Indexer)
+        torch.nn.Module.__init__(indexer)
+        indexer.use_fp4_cache = True
+        indexer.compress_ratio = 4
+        indexer.n_head = 2
+        indexer.head_dim = DEEPSEEK_V4_INDEXER_DIM
+        indexer.topk_tokens = 512
+        indexer.topk_buffer = None
+        indexer.softmax_scale = DEEPSEEK_V4_INDEXER_DIM**-0.5
+
+        calls: dict[str, int] = {"compressor": 0}
+
+        class FakeCompressor:
+            norm = SimpleNamespace(
+                weight=torch.ones(DEEPSEEK_V4_INDEXER_DIM),
+                variance_epsilon=1.0e-6,
+            )
+
+            def __call__(_self, **kwargs):
+                self.assertFalse(kwargs["write_compressed_cache"])
+                calls["compressor"] += 1
+
+        def unexpected_q_prepare(*_args, **_kwargs):
+            raise AssertionError("all-candidate decode should skip Q preparation")
+
+        indexer.compressor = FakeCompressor()
+        indexer.wq_b = unexpected_q_prepare
+        indexer.weights_proj = unexpected_q_prepare
+
+        positions = torch.tensor([0, 3, 7, 11], dtype=torch.int64)
+        metadata = SimpleNamespace(
+            token_to_req_indices=torch.zeros(4, dtype=torch.int32),
+            block_table=torch.arange(4, dtype=torch.int32).view(1, 4),
+        )
+        metadata.compressed_slot_mapping = lambda *args, **kwargs: torch.full(
+            (4,), -1, dtype=torch.int64
+        )
+        metadata.compressed_block_table = lambda *args, **kwargs: metadata.block_table
+        pool = SimpleNamespace(
+            state_block_size=4,
+            get_indexer_state_buffer=lambda layer_index: torch.empty(1),
+            get_indexer_block_size=lambda layer_index: 1,
+            get_indexer_kv_buffer_2d=lambda layer_index: torch.empty(0),
+        )
+        ctx = SimpleNamespace(
+            token_to_kv_pool=pool,
+            attn_backend=SimpleNamespace(forward_metadata=metadata),
+            forward_mode=ForwardMode.DECODE,
+        )
+
+        with (
+            patch(
+                "tokenspeed.runtime.models.deepseek_v4.deepseek_v4_csa_indexer_cache_insert"
+            ) as cache_insert,
+            patch(
+                "tokenspeed.runtime.models.deepseek_v4.deepseek_v4_prepare_indexer_q_mxfp4",
+                side_effect=unexpected_q_prepare,
+            ),
+            patch(
+                "tokenspeed.runtime.models.deepseek_v4.deepseek_v4_prepare_indexer_q_reference",
+                side_effect=unexpected_q_prepare,
+            ),
+        ):
+            topk = DeepseekV4Indexer.forward(
+                indexer,
+                hidden_states=torch.empty(4, 8),
+                qr=torch.empty(4, 8),
+                positions=positions,
+                ctx=ctx,
+                out_cache_loc=torch.zeros(4, dtype=torch.int64),
+                layer_index=0,
+                cos_sin_cache=torch.empty(16, 64),
+            )
+
+        self.assertEqual(calls["compressor"], 1)
+        cache_insert.assert_called_once()
+        expected = torch.full((4, 512), -1, dtype=torch.int32)
+        expected[1, 0] = 0
+        expected[2, :2] = torch.tensor([0, 1], dtype=torch.int32)
+        expected[3, :3] = torch.tensor([0, 1, 2], dtype=torch.int32)
+        self.assertTrue(torch.equal(topk, expected))
+
     def test_deepseek_v4_indexer_decode_max_len_uses_context_or_cache_window(self):
         block_table = torch.zeros((2, 257), dtype=torch.int32)
 
@@ -2529,6 +2644,496 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(tuple(comb.shape), (tokens, hc_mult, hc_mult))
         self.assertEqual(tuple(updated.shape), tuple(residual.shape))
 
+    def test_fast_mhc_is_disabled_by_default_on_sm12x(self):
+        with patch(
+            "tokenspeed.runtime.models.deepseek_v4._platform",
+            SimpleNamespace(is_sm12x=True),
+        ):
+            self.assertFalse(_deepseek_v4_fast_mhc_enabled_for_platform())
+
+    def test_fast_mhc_remains_enabled_on_non_sm12x(self):
+        with patch(
+            "tokenspeed.runtime.models.deepseek_v4._platform",
+            SimpleNamespace(is_sm12x=False),
+        ):
+            self.assertTrue(_deepseek_v4_fast_mhc_enabled_for_platform())
+
+    def test_mhc_pre_uses_sm12x_native_path_when_available(self):
+        residual = SimpleNamespace(is_cuda=True)
+        fn = torch.randn(24, 32, dtype=torch.float32)
+        scale = torch.ones(3, dtype=torch.float32)
+        base = torch.zeros(24, dtype=torch.float32)
+        expected = (
+            torch.empty(2, 8, dtype=torch.bfloat16),
+            torch.empty(2, 4, 1, dtype=torch.float32),
+            torch.empty(2, 4, 4, dtype=torch.float32),
+        )
+
+        with (
+            patch(
+                "tokenspeed.runtime.models.deepseek_v4._platform",
+                SimpleNamespace(is_sm12x=True),
+            ),
+            patch(
+                "tokenspeed.runtime.models.deepseek_v4._DEEPSEEK_V4_SM12X_MHC_UNAVAILABLE",
+                False,
+            ),
+            patch(
+                "tokenspeed.runtime.models.deepseek_v4._deepseek_v4_sm12x_mhc_input_supported",
+                return_value=True,
+            ),
+            patch(
+                "tokenspeed.runtime.layers.deepseek_v4_mhc.sm12x_mhc_pre",
+                return_value=expected,
+                create=True,
+            ) as sm12x_mhc_pre,
+            patch(
+                "tokenspeed.runtime.models.deepseek_v4._mhc_pre_reference",
+                side_effect=AssertionError("SM12x native mHC pre should be used"),
+            ),
+        ):
+            actual = mhc_pre(
+                residual,
+                fn,
+                scale,
+                base,
+                rms_eps=1e-6,
+                hc_eps=1e-6,
+                sinkhorn_iters=2,
+            )
+
+        self.assertIs(actual, expected)
+        sm12x_mhc_pre.assert_called_once_with(
+            residual,
+            fn,
+            scale,
+            base,
+            1e-6,
+            1e-6,
+            2,
+        )
+
+    def test_mhc_pre_cpu_reference_path_does_not_poison_sm12x_native(self):
+        from tokenspeed.runtime.models import deepseek_v4 as deepseek_v4_model
+
+        residual = torch.randn(2, 4, 8, dtype=torch.float32)
+        fn = torch.randn(24, 32, dtype=torch.float32)
+        scale = torch.ones(3, dtype=torch.float32)
+        base = torch.zeros(24, dtype=torch.float32)
+
+        with (
+            patch(
+                "tokenspeed.runtime.models.deepseek_v4._platform",
+                SimpleNamespace(is_sm12x=True),
+            ),
+            patch(
+                "tokenspeed.runtime.models.deepseek_v4._DEEPSEEK_V4_SM12X_MHC_UNAVAILABLE",
+                False,
+            ),
+            patch(
+                "tokenspeed.runtime.layers.deepseek_v4_mhc.sm12x_mhc_pre",
+                side_effect=AssertionError("CPU tensors must use the reference path"),
+                create=True,
+            ) as sm12x_mhc_pre,
+        ):
+            mhc_pre(
+                residual,
+                fn,
+                scale,
+                base,
+                rms_eps=1e-6,
+                hc_eps=1e-6,
+                sinkhorn_iters=2,
+            )
+
+            sm12x_mhc_pre.assert_not_called()
+            self.assertFalse(deepseek_v4_model._DEEPSEEK_V4_SM12X_MHC_UNAVAILABLE)
+
+    def test_mhc_post_uses_sm12x_native_path_when_available(self):
+        hidden_states = SimpleNamespace(is_cuda=True)
+        residual = SimpleNamespace(is_cuda=True)
+        post = torch.empty(2, 4, 1, dtype=torch.float32)
+        comb = torch.empty(2, 4, 4, dtype=torch.float32)
+        expected = torch.empty(2, 4, 8, dtype=torch.bfloat16)
+
+        with (
+            patch(
+                "tokenspeed.runtime.models.deepseek_v4._platform",
+                SimpleNamespace(is_sm12x=True),
+            ),
+            patch(
+                "tokenspeed.runtime.models.deepseek_v4._DEEPSEEK_V4_SM12X_MHC_UNAVAILABLE",
+                False,
+            ),
+            patch(
+                "tokenspeed.runtime.models.deepseek_v4._deepseek_v4_sm12x_mhc_input_supported",
+                return_value=True,
+            ),
+            patch(
+                "tokenspeed.runtime.layers.deepseek_v4_mhc.sm12x_mhc_post",
+                return_value=expected,
+                create=True,
+            ) as sm12x_mhc_post,
+            patch(
+                "tokenspeed.runtime.models.deepseek_v4._mhc_post_reference",
+                side_effect=AssertionError("SM12x native mHC post should be used"),
+            ),
+        ):
+            actual = mhc_post(hidden_states, residual, post, comb)
+
+        self.assertIs(actual, expected)
+        sm12x_mhc_post.assert_called_once_with(hidden_states, residual, post, comb)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_sm12x_native_mhc_pre_matches_reference(self):
+        major, _minor = torch.cuda.get_device_capability()
+        if major != 12:
+            self.skipTest("SM12x native mHC pre contract only applies to CUDA major 12")
+
+        from tokenspeed.runtime.layers import deepseek_v4_mhc
+
+        torch.manual_seed(20260509)
+        tokens, hc_mult, hidden = 2, 4, 128
+        mix_hc = (2 + hc_mult) * hc_mult
+        residual = torch.randn(
+            tokens, hc_mult, hidden, device="cuda", dtype=torch.bfloat16
+        )
+        fn = (
+            torch.randn(mix_hc, hc_mult * hidden, device="cuda", dtype=torch.float32)
+            * 0.01
+        )
+        scale = torch.tensor([0.7, 1.1, 0.5], device="cuda", dtype=torch.float32)
+        base = torch.randn(mix_hc, device="cuda", dtype=torch.float32) * 0.01
+
+        actual = deepseek_v4_mhc.sm12x_mhc_pre(
+            residual,
+            fn,
+            scale,
+            base,
+            1.0e-6,
+            1.0e-6,
+            2,
+        )
+        expected = _mhc_pre_reference(
+            residual,
+            fn,
+            scale,
+            base,
+            1.0e-6,
+            1.0e-6,
+            2,
+        )
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(
+            actual[0].float(), expected[0].float(), atol=2.0e-2, rtol=2.0e-2
+        )
+        torch.testing.assert_close(actual[1], expected[1], atol=2.0e-4, rtol=2.0e-4)
+        torch.testing.assert_close(actual[2], expected[2], atol=2.0e-4, rtol=2.0e-4)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_sm12x_native_mhc_pre_split_matches_reference(self):
+        major, _minor = torch.cuda.get_device_capability()
+        if major != 12:
+            self.skipTest("SM12x native mHC pre contract only applies to CUDA major 12")
+
+        from tokenspeed.runtime.layers import deepseek_v4_mhc
+
+        torch.manual_seed(20260511)
+        tokens, hc_mult, hidden = 1, 4, 1024
+        mix_hc = (2 + hc_mult) * hc_mult
+        residual = torch.randn(
+            tokens, hc_mult, hidden, device="cuda", dtype=torch.bfloat16
+        )
+        fn = (
+            torch.randn(mix_hc, hc_mult * hidden, device="cuda", dtype=torch.float32)
+            * 0.01
+        )
+        scale = torch.tensor([0.7, 1.1, 0.5], device="cuda", dtype=torch.float32)
+        base = torch.randn(mix_hc, device="cuda", dtype=torch.float32) * 0.01
+
+        actual = deepseek_v4_mhc.sm12x_mhc_pre(
+            residual,
+            fn,
+            scale,
+            base,
+            1.0e-6,
+            1.0e-6,
+            2,
+        )
+        expected = _mhc_pre_reference(
+            residual,
+            fn,
+            scale,
+            base,
+            1.0e-6,
+            1.0e-6,
+            2,
+        )
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(
+            actual[0].float(), expected[0].float(), atol=2.0e-2, rtol=2.0e-2
+        )
+        torch.testing.assert_close(actual[1], expected[1], atol=3.0e-4, rtol=3.0e-4)
+        torch.testing.assert_close(actual[2], expected[2], atol=3.0e-4, rtol=3.0e-4)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_sm12x_native_mhc_pre_deepseek_v4_shape_matches_reference(self):
+        major, _minor = torch.cuda.get_device_capability()
+        if major != 12:
+            self.skipTest("SM12x native mHC pre contract only applies to CUDA major 12")
+
+        from tokenspeed.runtime.layers import deepseek_v4_mhc
+
+        torch.manual_seed(20260512)
+        tokens, hc_mult, hidden = 1, 4, 4096
+        mix_hc = (2 + hc_mult) * hc_mult
+        residual = torch.randn(
+            tokens, hc_mult, hidden, device="cuda", dtype=torch.bfloat16
+        )
+        fn = (
+            torch.randn(mix_hc, hc_mult * hidden, device="cuda", dtype=torch.float32)
+            * 0.01
+        )
+        scale = torch.tensor([0.7, 1.1, 0.5], device="cuda", dtype=torch.float32)
+        base = torch.randn(mix_hc, device="cuda", dtype=torch.float32) * 0.01
+
+        actual = deepseek_v4_mhc.sm12x_mhc_pre(
+            residual,
+            fn,
+            scale,
+            base,
+            1.0e-6,
+            1.0e-6,
+            2,
+        )
+        expected = _mhc_pre_reference(
+            residual,
+            fn,
+            scale,
+            base,
+            1.0e-6,
+            1.0e-6,
+            2,
+        )
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(
+            actual[0].float(), expected[0].float(), atol=2.0e-2, rtol=2.0e-2
+        )
+        torch.testing.assert_close(actual[1], expected[1], atol=3.0e-4, rtol=3.0e-4)
+        torch.testing.assert_close(actual[2], expected[2], atol=3.0e-4, rtol=3.0e-4)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_sm12x_native_mhc_post_matches_reference(self):
+        major, _minor = torch.cuda.get_device_capability()
+        if major != 12:
+            self.skipTest(
+                "SM12x native mHC post contract only applies to CUDA major 12"
+            )
+
+        from tokenspeed.runtime.layers import deepseek_v4_mhc
+
+        torch.manual_seed(20260510)
+        tokens, hc_mult, hidden = 2, 4, 128
+        hidden_states = torch.randn(
+            tokens,
+            hidden,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        residual = torch.randn(
+            tokens,
+            hc_mult,
+            hidden,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        post = torch.randn(tokens, hc_mult, 1, device="cuda", dtype=torch.float32)
+        comb = torch.randn(tokens, hc_mult, hc_mult, device="cuda", dtype=torch.float32)
+
+        expected = _mhc_post_reference(hidden_states, residual, post, comb)
+        actual = deepseek_v4_mhc.sm12x_mhc_post(hidden_states, residual, post, comb)
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(
+            actual.float(),
+            expected.float(),
+            atol=2.0e-2,
+            rtol=2.0e-2,
+        )
+
+    def test_trtllm_fp8_activation_quant_is_disabled_by_default_on_sm12x(self):
+        with patch(
+            "tokenspeed.runtime.models.deepseek_v4._platform",
+            SimpleNamespace(is_sm12x=True),
+        ):
+            self.assertFalse(_deepseek_v4_trtllm_fp8_quant_enabled_for_platform())
+
+    def test_trtllm_fp8_activation_quant_remains_enabled_on_non_sm12x(self):
+        with patch(
+            "tokenspeed.runtime.models.deepseek_v4._platform",
+            SimpleNamespace(is_sm12x=False),
+        ):
+            self.assertTrue(_deepseek_v4_trtllm_fp8_quant_enabled_for_platform())
+
+    def test_deepgemm_fp4_indexer_is_disabled_by_default_on_sm12x(self):
+        with patch(
+            "tokenspeed.runtime.models.deepseek_v4._platform",
+            SimpleNamespace(is_sm12x=True),
+        ):
+            self.assertFalse(_deepseek_v4_deepgemm_fp4_indexer_enabled_for_platform())
+
+    def test_deepgemm_fp4_indexer_remains_enabled_on_non_sm12x(self):
+        with patch(
+            "tokenspeed.runtime.models.deepseek_v4._platform",
+            SimpleNamespace(is_sm12x=False),
+        ):
+            self.assertTrue(_deepseek_v4_deepgemm_fp4_indexer_enabled_for_platform())
+
+    def test_fast_topk_is_disabled_by_default_on_sm12x(self):
+        with patch(
+            "tokenspeed.runtime.models.deepseek_v4._platform",
+            SimpleNamespace(is_sm12x=True),
+        ):
+            self.assertFalse(_deepseek_v4_fast_topk_enabled_for_platform())
+
+    def test_fast_topk_remains_enabled_on_non_sm12x(self):
+        with patch(
+            "tokenspeed.runtime.models.deepseek_v4._platform",
+            SimpleNamespace(is_sm12x=False),
+        ):
+            self.assertTrue(_deepseek_v4_fast_topk_enabled_for_platform())
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
+    def test_indexer_topk_batched_uses_torch_topk_when_fast_topk_is_disabled(self):
+        cache = torch.eye(4, device="cuda", dtype=torch.bfloat16)
+
+        def cache_reader(cache_2d, slot_mapping, block_size):
+            del block_size
+            return cache_2d[slot_mapping.long()]
+
+        with (
+            patch(
+                "tokenspeed.runtime.models.deepseek_v4._deepseek_v4_fast_topk_enabled_for_platform",
+                return_value=False,
+            ),
+            patch(
+                "tokenspeed_kernel.thirdparty.trtllm.fast_topk_v2",
+                side_effect=AssertionError("SM12x must not call fast_topk_v2"),
+            ),
+        ):
+            topk = _deepseek_v4_indexer_topk_from_cache_batched(
+                cache_reader=cache_reader,
+                cache_2d=cache,
+                positions=torch.tensor([3], device="cuda", dtype=torch.int64),
+                token_to_req_indices=torch.tensor(
+                    [0], device="cuda", dtype=torch.int32
+                ),
+                block_table=torch.arange(4, device="cuda", dtype=torch.int32).view(
+                    1, 4
+                ),
+                cache_block_size=1,
+                index_q=torch.ones(1, 1, 4, device="cuda", dtype=torch.bfloat16),
+                weights=torch.ones(1, 1, device="cuda", dtype=torch.float32),
+                compress_ratio=1,
+                topk_tokens=512,
+            )
+
+        self.assertEqual(tuple(topk.shape), (1, 512))
+        self.assertTrue(torch.all(topk[0, :4] >= 0))
+        self.assertTrue(torch.all(topk[0, 4:] == -1))
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
+    def test_indexer_topk_batched_is_cuda_graph_capturable(self):
+        torch.manual_seed(1234)
+        device = torch.device("cuda")
+        positions = torch.tensor([15, 7], device=device, dtype=torch.int64)
+        token_to_req_indices = torch.tensor([0, 1], device=device, dtype=torch.int32)
+        block_table = torch.tensor(
+            [[0, 1, 2, 3], [4, 5, 6, 7]],
+            device=device,
+            dtype=torch.int32,
+        )
+        cache = torch.randn(8, 4, device=device, dtype=torch.bfloat16)
+        index_q = torch.randn(2, 2, 4, device=device, dtype=torch.bfloat16)
+        weights = torch.randn(2, 2, device=device, dtype=torch.float32)
+        out = torch.empty(2, 4, device=device, dtype=torch.int32)
+
+        def cache_reader(cache_2d, slot_mapping, block_size):
+            del block_size
+            return cache_2d[slot_mapping.long()]
+
+        with patch.dict(global_server_args_dict, {"max_model_len": 16}, clear=False):
+            stream = torch.cuda.Stream()
+            with torch.cuda.stream(stream):
+                for _ in range(2):
+                    _deepseek_v4_indexer_topk_from_cache_batched(
+                        cache_reader=cache_reader,
+                        cache_2d=cache,
+                        positions=positions,
+                        token_to_req_indices=token_to_req_indices,
+                        block_table=block_table,
+                        cache_block_size=1,
+                        index_q=index_q,
+                        weights=weights,
+                        compress_ratio=4,
+                        topk_tokens=4,
+                        out=out,
+                    )
+            stream.synchronize()
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                _deepseek_v4_indexer_topk_from_cache_batched(
+                    cache_reader=cache_reader,
+                    cache_2d=cache,
+                    positions=positions,
+                    token_to_req_indices=token_to_req_indices,
+                    block_table=block_table,
+                    cache_block_size=1,
+                    index_q=index_q,
+                    weights=weights,
+                    compress_ratio=4,
+                    topk_tokens=4,
+                    out=out,
+                )
+            graph.replay()
+
+        self.assertEqual(tuple(out.shape), (2, 4))
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
+    def test_deepgemm_fp4_indexer_available_respects_sm12x_gate(self):
+        fake_deep_gemm = SimpleNamespace(
+            fp8_fp4_mqa_logits=object(),
+            fp8_fp4_paged_mqa_logits=object(),
+            get_paged_mqa_logits_metadata=object(),
+        )
+        index_q = torch.empty(
+            (1, 32, DEEPSEEK_V4_INDEXER_DIM // 2),
+            device="cuda",
+            dtype=torch.uint8,
+        )
+
+        with (
+            patch(
+                "tokenspeed.runtime.models.deepseek_v4._platform",
+                SimpleNamespace(is_sm12x=True),
+            ),
+            patch("tokenspeed.runtime.models.deepseek_v4.deep_gemm", fake_deep_gemm),
+        ):
+            self.assertFalse(_deepseek_v4_deepgemm_fp4_indexer_available(index_q))
+
+        with (
+            patch(
+                "tokenspeed.runtime.models.deepseek_v4._platform",
+                SimpleNamespace(is_sm12x=False),
+            ),
+            patch("tokenspeed.runtime.models.deepseek_v4.deep_gemm", fake_deep_gemm),
+        ):
+            self.assertTrue(_deepseek_v4_deepgemm_fp4_indexer_available(index_q))
+
     def test_hidden_compression_pre_matches_reference_math(self):
         import torch
         import torch.nn.functional as F
@@ -2865,6 +3470,145 @@ class TestDeepseekV4Config(unittest.TestCase):
         expected = (quantized.float() * scale.unsqueeze(-1)).flatten(-2).reshape_as(x)
 
         self.assertTrue(torch.equal(actual, expected))
+
+    def test_deepseek_v4_fp8_activation_quant_uses_sm12x_native_path(self):
+        sentinel = object()
+        x = SimpleNamespace(shape=(1, 128), is_cuda=True, dtype=torch.bfloat16)
+        with (
+            patch(
+                "tokenspeed.runtime.models.deepseek_v4._platform",
+                SimpleNamespace(is_sm12x=True),
+            ),
+            patch(
+                "tokenspeed_kernel.ops.gemm.sm12x_fp8."
+                "sm12x_mxfp8_block128_quant_dequant_ue8m0",
+                return_value=sentinel,
+            ) as native_quant_dequant,
+        ):
+            actual = _fp8_act_quant_dequant(x, 128)
+
+        self.assertIs(actual, sentinel)
+        native_quant_dequant.assert_called_once_with(x)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_deepseek_v4_fp8_linear_uses_sm12x_weight_gemv(self):
+        major, _minor = torch.cuda.get_device_capability()
+        if major != 12:
+            self.skipTest("SM12x FP8 weight GEMV only applies to CUDA major 12")
+
+        torch.manual_seed(20260513)
+        rows, hidden, out_dim = 1, 256, 384
+        x = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16) * 2.0
+        weight = (
+            torch.randn(out_dim, hidden, device="cuda", dtype=torch.bfloat16) * 0.25
+        ).to(torch.float8_e4m3fn)
+        raw_scales = torch.randn(
+            (out_dim + 127) // 128,
+            hidden // 128,
+            device="cuda",
+            dtype=torch.float32,
+        ).abs()
+        scales = torch.pow(
+            2.0,
+            torch.ceil(torch.log2(raw_scales.clamp_min(1.0e-4))),
+        ).to(torch.float8_e8m0fnu)
+        layer = SimpleNamespace(
+            weight=weight,
+            weight_scale_inv=scales,
+            quant_config=SimpleNamespace(weight_block_size=(128, 128)),
+        )
+
+        from tokenspeed_kernel.ops.gemm import sm12x_fp8
+
+        calls = []
+        real_gemv = sm12x_fp8.sm12x_fp8_weight_gemv_ue8m0
+
+        def wrapped_gemv(*args, **kwargs):
+            calls.append(args)
+            return real_gemv(*args, **kwargs)
+
+        with (
+            patch(
+                "tokenspeed.runtime.models.deepseek_v4._platform",
+                SimpleNamespace(is_sm12x=True),
+            ),
+            patch(
+                "tokenspeed_kernel.ops.gemm.sm12x_fp8." "sm12x_fp8_weight_gemv_ue8m0",
+                side_effect=wrapped_gemv,
+            ),
+        ):
+            actual = _fp8_linear(layer, x, (out_dim, hidden))
+
+        x_eff = _fp8_act_quant_dequant(x, 128)
+        expanded_scales = scales.float().repeat_interleave(128, dim=0)
+        expanded_scales = expanded_scales.repeat_interleave(128, dim=1)[
+            :out_dim, :hidden
+        ]
+        expected = (x_eff @ (weight.float() * expanded_scales).T).to(torch.bfloat16)
+
+        torch.cuda.synchronize()
+        self.assertEqual(len(calls), 1)
+        torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_deepseek_v4_fp8_linear_keeps_prefill_on_fp32_weight_matmul(self):
+        major, _minor = torch.cuda.get_device_capability()
+        if major != 12:
+            self.skipTest("SM12x FP8 weight GEMV only applies to CUDA major 12")
+
+        torch.manual_seed(20260513)
+        rows, hidden, out_dim = 17, 256, 384
+        x = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16) * 2.0
+        weight = (
+            torch.randn(out_dim, hidden, device="cuda", dtype=torch.bfloat16) * 0.25
+        ).to(torch.float8_e4m3fn)
+        raw_scales = torch.randn(
+            (out_dim + 127) // 128,
+            hidden // 128,
+            device="cuda",
+            dtype=torch.float32,
+        ).abs()
+        scales = torch.pow(
+            2.0,
+            torch.ceil(torch.log2(raw_scales.clamp_min(1.0e-4))),
+        ).to(torch.float8_e8m0fnu)
+        layer = SimpleNamespace(
+            weight=weight,
+            weight_scale_inv=scales,
+            quant_config=SimpleNamespace(weight_block_size=(128, 128)),
+        )
+
+        from tokenspeed_kernel.ops.gemm import sm12x_fp8
+
+        calls = []
+        real_gemv = sm12x_fp8.sm12x_fp8_weight_gemv_ue8m0
+
+        def wrapped_gemv(*args, **kwargs):
+            calls.append(args)
+            return real_gemv(*args, **kwargs)
+
+        with (
+            patch(
+                "tokenspeed.runtime.models.deepseek_v4._platform",
+                SimpleNamespace(is_sm12x=True),
+            ),
+            patch(
+                "tokenspeed_kernel.ops.gemm.sm12x_fp8." "sm12x_fp8_weight_gemv_ue8m0",
+                side_effect=wrapped_gemv,
+            ),
+        ):
+            actual = _fp8_linear(layer, x, (out_dim, hidden))
+
+        x_eff = _fp8_act_quant_dequant(x, 128)
+        expanded_scales = scales.float().repeat_interleave(128, dim=0)
+        expanded_scales = expanded_scales.repeat_interleave(128, dim=1)[
+            :out_dim, :hidden
+        ]
+        expected = (x_eff @ (weight.float() * expanded_scales).T).to(torch.bfloat16)
+
+        torch.cuda.synchronize()
+        self.assertEqual(len(calls), 0)
+        torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0)
 
     def test_packed_topk_router_logits_recover_weights_after_softmax(self):
         import torch

@@ -1,0 +1,485 @@
+# DeepSeek V4 SM12x Rejected Experiments
+
+This note records SM12x DeepSeek V4 experiments that were correct enough to
+evaluate but should not remain as deployable runtime switches. Keep these as
+historical evidence and avoid reintroducing them without a new hypothesis and a
+fresh benchmark.
+
+## Rebase Cleanup
+
+- Date: 2026-05-09.
+- Context: after rebasing onto latest `upstream/main`, upstream's official
+  DeepSeek V4 model/cache/op helpers became the base implementation.
+- Code retained: SM12x platform helpers, SM12x MoE backend/kernel modules, the
+  SM12x-only sparse MLA fallback in the DeepSeek V4 attention backend, and the
+  SM12x-only PyTorch Hadamard fallback for CSA indexer prep.
+- Code removed/dropped during conflict resolution: old standalone
+  `deepseek_v4_profile.py` profiling helper and its tests, plus pre-rebase
+  DeepSeek V4 model/op rewrites that were superseded by upstream's official
+  implementation.
+- Decision: future work should add SM12x behavior through narrow SM12x gates or
+  `tokenspeed-kernel` SM12x op modules, not by replacing upstream's generic
+  DeepSeek V4 path.
+- Verification note: the Hadamard fallback stays because
+  `fast_hadamard_transform` currently has no SM120 kernel image on the test
+  workstation.
+
+## CuTile Python Route
+
+- Date: 2026-05-10.
+- Attempt considered: use NVIDIA CuTile / `cuda.tile` as the primary SM12x
+  kernel authoring path.
+- Evidence: the SM120 workstation has `cuda.tile`, but the API and ecosystem
+  are less mature than CUTLASS/CuTe DSL for this codebase. TokenSpeed already
+  depends on `nvidia-cutlass-dsl`, and `tokenspeed-mla` has a working CuTe DSL
+  packaging and launch pattern.
+- Decision: do not build the SM12x DeepSeek V4 route on CuTile. Prefer
+  CUTLASS/CuTe DSL for NVIDIA-owned long-term maintainability, and keep CuTile
+  out of the implementation plan unless NVIDIA's stack converges later.
+
+## FlashMLA SM12x Sparse Decode
+
+- Switches removed:
+  `TOKENSPEED_DEEPSEEK_V4_FLASHMLA_SM12X` and
+  `TOKENSPEED_DEEPSEEK_V4_FLASHMLA_DECODE_SM12X`.
+- Evidence: the packaged `flash_mla_cuda.sparse_decode_fwd` rejected SM120 with
+  `Unsupported architecture for sparse decode fwd`.
+- Decision: keep disabled until the FlashMLA package ships an SM12x sparse
+  decode build.
+
+## Upstream Fast mHC On SM12x
+
+- Date: 2026-05-09.
+- Attempt: use upstream's TileLang + DeepGEMM `tf32_hc_prenorm_gemm` fast mHC
+  path on the SM120 workstation.
+- Evidence: the remote environment has `tilelang` and a `deep_gemm` package
+  exposing both `tf32_hc_prenorm_gemm` and `fp8_fp4_mega_moe`, but the first
+  SM120 fast-mHC call fails with `Unsupported architecture` from DeepGEMM's
+  hyperconnection API and then falls back to the PyTorch reference.
+- Decision: gate fast mHC off by default on SM12x so production requests do not
+  pay a known exception path. Revisit only after the SM12x DeepGEMM path is
+  installed and benchmarked as faster than the PyTorch fallback.
+
+## Upstream TRT-LLM FP8 Activation Quant On SM12x
+
+- Date: 2026-05-09.
+- Attempt: use upstream's TRT-LLM `per_token_group_quant_8bit` helper inside the
+  DeepSeek V4 reference FP8 activation quantization path.
+- Evidence: full DeepSeek V4 config tests on SM120 reached a `no kernel image`
+  / bad-scale-shape failure in the helper before the PyTorch reference fallback.
+- Decision: gate this third-party helper off by default on SM12x. The local
+  PyTorch reference remains the correctness path until a native SM12x FP8
+  quantizer is wired through `tokenspeed-kernel`.
+
+## Upstream DeepGEMM FP4 Indexer On SM12x
+
+- Date: 2026-05-09.
+- Attempt: use upstream's DeepGEMM FP8xFP4 MQA logits helpers for DeepSeek V4
+  CSA indexer top-k with the FP4 indexer cache enabled.
+- Evidence: a real eager DeepSeek V4 Flash SM120 serve smoke loaded all 46
+  checkpoint shards and initialized the KV pool, but the first decode request
+  failed in `deep_gemm.get_paged_mqa_logits_metadata()` with
+  `Unsupported architecture`.
+- Decision: gate DeepGEMM FP4 indexer logits off by default on SM12x. The
+  existing reference indexer path remains the correctness route until a native
+  SM12x indexer logits kernel is available.
+
+## Upstream TRT-LLM Fast Top-K On SM12x
+
+- Date: 2026-05-09.
+- Attempt: keep upstream's `tokenspeed_kernel.thirdparty.trtllm.fast_topk_v2`
+  on the DeepSeek V4 indexer decode fallback when `topk_tokens=512`.
+- Evidence: after gating fast mHC, TRT-LLM FP8 activation quant, DeepGEMM FP4
+  indexer logits, and the fused QNorm/RoPE/SWA insert op, a real SM120 eager
+  serve could generate one token but crashed on the next decode step with
+  `CUDA error: no kernel image is available for execution on the device`.
+  Synchronization probes narrowed the failure to the CSA indexer path after
+  reference top-k. Gating `fast_topk_v2` off and using `torch.topk` produced a
+  clean 8-token completion in
+  `<remote-workspace>/tokenspeed_smoke_model_level_sm12x_clean_decode_20260509173619`.
+- Decision: gate `fast_topk_v2` off by default on SM12x. Replace it later with
+  a TokenSpeed-owned SM12x top-k kernel; do not keep a runtime switch for the
+  unsupported TRT-LLM path.
+
+## Sparse MLA Fast Exp
+
+- Rejected path: replacing precise `expf` with `__expf` in the online softmax
+  sparse MLA FP8 cache kernel.
+- Evidence: focused tests and B300 no-MTP oracle passed, but
+  `<remote-workspace>/tokenspeed_sparse_online_fast_exp_20260509034359`
+  regressed `1024x1024 c2` to `21.18` output tok/s from the online-softmax
+  baseline's `22.30` output tok/s.
+- Decision: precise `expf` remains the active implementation.
+
+## Old MXFP4 MoE Deploy Switches
+
+- Switches removed:
+  `TOKENSPEED_SM12X_MXFP4_MOE_IMPL=tensorcore` and
+  `TOKENSPEED_SM12X_MXFP4_MOE_IMPL=tile4`.
+- Evidence:
+  `<remote-workspace>/tokenspeed_tensorcore_moe_online_20260509034939`
+  passed the oracle threshold but measured only `19.05` output tok/s with mean
+  TPOT `103.33 ms`; `<remote-workspace>/tokenspeed_tile4_moe_online_20260509035308`
+  measured `21.35` output tok/s and had a weaker long-prefill oracle trajectory.
+- Decision: keep the default warp MoE route. Do not revive these switch names.
+
+## Grouped Tensorcore MoE Wrapper
+
+- Switch removed: `TOKENSPEED_SM12X_MXFP4_MOE_IMPL=grouped_tc`.
+- Code removed: the public/deployable
+  `sm12x_mxfp4_moe_forward_grouped_tc` wrapper and exports.
+- Follow-up cleanup on 2026-05-10 removed the lower-level grouped
+  MXFP8xMXFP4 primitives, route expansion helpers, grouped SwiGLU/requant, and
+  grouped W2/reduce public surfaces and tests as well. They encoded the same
+  padding-heavy route assumption and should not remain as a supported API.
+- Evidence:
+  `<remote-workspace>/tokenspeed_grouped_tc_online_20260509045145` passed the
+  B300 no-MTP oracle but regressed `1024x1024 c2` to `19.17` output tok/s with
+  mean TPOT `103.32 ms`. The N64 reducer run
+  `<remote-workspace>/tokenspeed_grouped_tc_n64_online_20260509050530`
+  improved that to `20.02` output tok/s with mean TPOT `99.01 ms`, still below
+  the warp route with online sparse MLA.
+- Root cause: a focused DeepSeek V4 Flash microbench showed full warp MoE around
+  `0.27 ms` and full grouped tensorcore MoE around `0.94 ms` for `tokens=1`,
+  `topk=6`, `hidden=4096`, and `moe_intermediate=2048`. The grouped route
+  spends about `0.79 ms` in W13/SwiGLU/requant because six real decode routes
+  are padded to 96 rows.
+- Decision: do not expose this wrapper as a runtime option. Future MoE work
+  should first eliminate decode padding waste or use a persistent schedule that
+  amortizes route padding across enough work.
+
+## Direct Warp MXFP4 Scale Broadcast
+
+- Date: 2026-05-09.
+- Attempt: reduce direct-warp MXFP4 MoE scalar overhead by loading each UE8M0
+  block scale once per warp/k-block and broadcasting it with `__shfl_sync`,
+  instead of letting every lane call the generic `load_mxfp4_value` helper.
+- Evidence: focused DeepSeek V4 Flash microbench on `the primary SM120 workstation` for
+  `tokens=1`, `topk=6`, `hidden=4096`, and `moe_intermediate=2048` measured
+  about `0.307 ms` after the change, worse than the previously measured direct
+  warp route around `0.27 ms`.
+- Decision: revert the kernel change and keep only the stronger varied-scale
+  correctness coverage. The extra shuffle/branch structure is not a useful
+  MoE path; revisit scale handling only inside a larger schedule rewrite.
+
+## Decode Route-Parallel Down Projection
+
+- Date: 2026-05-09.
+- Attempt: for decode-sized direct-warp MoE, replace the down projection's
+  one-warp-per-output-element kernel with a one-block-per-output-element kernel
+  where up to eight warps compute top-k routes in parallel and reduce in shared
+  memory.
+- Evidence: the isolated `tokens=1`, `topk=6`, `hidden=4096`,
+  `moe_intermediate=2048` microbench improved from restored direct warp
+  `0.256 ms` to `0.219 ms`, and MoE correctness stayed green (`28 passed`).
+  However the full DeepSeek V4 Flash `1024x128 c1` benchmark regressed from the
+  split-mHC baseline `18.36` output tok/s to `18.02` and `18.04` output tok/s in
+  `<remote-workspace>/tokenspeed_bench_sm12x_route_parallel_down_20260509205211`
+  and
+  `<remote-workspace>/tokenspeed_bench_sm12x_route_parallel_down_repeat_20260509205243`.
+- Decision: revert the deployable kernel path. The extra block scheduling
+  overhead does not pay off in the full model. Revisit route-level parallelism
+  only if it is fused with a larger persistent MoE schedule.
+
+## Compact Route-Table Gate Activation
+
+- Date: 2026-05-09.
+- Attempt: build a compact local-route table for decode MoE and run gate
+  activation only over local routes, while keeping the validated direct-warp
+  down projection. The goal was to remove non-local top-k empty gate warps
+  without reintroducing grouped tensorcore route padding.
+- Evidence: focused SM120 microbench on `the primary SM120 workstation` for `tokens=1`,
+  `topk=6`, `hidden=4096`, `moe_intermediate=2048`, `ep_size=2`, and three
+  local routes had exact output agreement (`max_diff=0.0`) but measured
+  `direct_warp mean_ms=0.1512` versus `routed_gate mean_ms=0.1528`.
+- Decision: remove the deployable routed-gate entrypoint and route-buffer
+  runtime wiring. The extra route-table build kernel costs more than the empty
+  non-local gate warps save. Revisit compact route tables only inside a larger
+  persistent/fused MoE schedule where route metadata is reused across more work.
+
+## Direct Warp UE8M0 Bit Decode
+
+- Date: 2026-05-09.
+- Attempt: replace the direct-warp MXFP4 dequant scale factor
+  `exp2f(encoded_scale - 127)` with a bit-level UE8M0 power-of-two decode inside
+  `load_mxfp4_value`.
+- Evidence: focused SM120 microbench on `the primary SM120 workstation` for `tokens=1`, `topk=6`,
+  `hidden=4096`, `moe_intermediate=2048`, `ep_size=2`, and three local routes
+  regressed from `0.1411 ms` to `0.1481 ms`, with identical checksum.
+- Decision: revert the kernel change. Keep the UE8M0 minimum subnormal
+  correctness test as guard coverage, but do not replace `exp2f` in the current
+  direct-warp schedule.
+
+## Direct Block-FP8 GEMM For DeepSeek V4 FP8 Linear
+
+- Date: 2026-05-09.
+- Attempt: replace selected DeepSeek V4 decode FP8 linear paths that currently
+  dequantize FP8 weights and use FP32 cublas GEMV with the existing
+  `tokenspeed_kernel.mm(..., quant="mxfp8")` block-FP8 Triton path, using the
+  native SM12x block-128 activation quantizer.
+- Evidence: focused SM120 microbench for decode-sized `M=1` shapes showed the
+  existing FP32 reference path is still faster for the compressor/indexer-sized
+  matrices: `K=4096,N=1024` was `0.0150 ms` reference versus `0.0272 ms`
+  block-FP8; `K=4096,N=2048` was `0.0149 ms` reference versus `0.0268 ms`
+  block-FP8. The larger `K=4096,N=8192` shape was slightly faster with
+  block-FP8 (`0.0482 ms` versus `0.0582 ms`) but had larger numerical drift and
+  is not the dominant compressor/indexer shape in the decode profile.
+- Decision: do not replace the current FP8 linear path with the generic
+  block-FP8 Triton kernel. Revisit only with an SM12x-tuned `M=1` FP8 GEMV/GEMM
+  kernel or a fused compressor/cache-insert design that removes the standalone
+  GEMV family altogether.
+
+## SM12x TRT-LLM One-Shot All-Reduce Auto-Configuration
+
+- Date: 2026-05-09.
+- Attempt: automatically configure TokenSpeed's existing TRT-LLM Lamport
+  one-shot all-reduce backend for SM12x process groups during distributed
+  initialization, so decode-sized MoE/attention all-reduces avoid NCCL latency.
+- Evidence: a two-rank SM120 microbench for `1x4096` BF16 all-reduce showed
+  the backend was correct (`max_diff=0.0`) and faster than NCCL
+  (`nccl mean_ms=0.0205`, `trt mean_ms=0.0119`). However full DeepSeek V4
+  Flash `1024x128 c1` regressed from the split-mHC baseline `18.36` output
+  tok/s to `18.24` and `18.23` output tok/s in
+  `<remote-workspace>/tokenspeed_bench_sm12x_trtllm_ar_20260509212424` and
+  `<remote-workspace>/tokenspeed_bench_sm12x_trtllm_ar_repeat_20260509212456`.
+- Decision: remove the automatic configuration. The one-shot backend may still
+  be useful inside a larger fused all-reduce+norm or graph-safe communication
+  plan, but standalone replacement does not improve the current eager full
+  model path.
+
+## Attention Aux-Stream Input GEMM Overlap
+
+- Switch removed: `TOKENSPEED_DEEPSEEK_V4_AUX_INPUT_GEMMS`.
+- Attempt: mirror the vLLM DeepSeek V4 branch by precomputing attention
+  compressor and indexer-compressor input GEMMs on auxiliary CUDA streams while
+  the main stream runs QKV projection, Q projection, and SWA cache insert.
+- Evidence:
+  `<remote-workspace>/tokenspeed_aux_input_gemms_oracle_20260509060859`
+  passed all five B300 no-MTP oracle cases, but
+  `<remote-workspace>/tokenspeed_aux_input_gemms_online_20260509061127`
+  regressed `1024x1024 c2` to `22.57` output tok/s with mean TPOT
+  `82.92 ms`. A corrected variant that stopped precomputing
+  `indexer.weights_proj` on the common full-candidate decode path improved only
+  to `22.78` output tok/s with mean TPOT `82.09 ms` in
+  `<remote-workspace>/tokenspeed_aux_input_gemms_nowproj_online_20260509061615`.
+  The stable warp-slot QNorm path remains faster at `23.56` output tok/s with
+  mean TPOT `79.23 ms`.
+- Root cause: in TokenSpeed's current eager decode path, the full-candidate
+  indexer shortcut already avoids one of vLLM's auxiliary GEMMs, and the
+  remaining two GEMMs do not hide enough work to pay for Python-level
+  stream/event scheduling and later synchronization.
+- Decision: do not keep a runtime switch for layer-local aux streams. Revisit
+  overlap only as part of a coarser persistent/layer executor where launch and
+  synchronization overhead can be amortized globally.
+
+## Verification Gotcha: Empty Oracle Logprobs
+
+- Symptom: oracle comparison can report `actual_token_count=0` for every case
+  while the server logs show successful HTTP 200 completion requests.
+- Root cause: TokenSpeed intentionally returns empty sampled-token logprobs
+  unless the server was started with `--enable-output-logprobs`.
+- Evidence: the first warp-slot SWA insert oracle run without the flag produced
+  empty actual token traces. Re-running with the flag in
+  `<remote-workspace>/tokenspeed_warpslot_qnorm_logprobs_20260509054446`
+  accepted all five B300 no-MTP top-20 oracle cases.
+- Decision: treat empty actual token traces as an invalid oracle setup unless
+  `--enable-output-logprobs` is present. Do not attribute that failure to kernel
+  correctness.
+
+## Directly Enabling Existing Fast mHC On SM120
+
+- Switch kept disabled: `_deepseek_v4_fast_mhc_enabled_for_platform()` still
+  returns false on SM12x.
+- Attempt: call `tokenspeed.runtime.layers.deepseek_v4_mhc.mhc_pre` and
+  `mhc_post` directly on RTX Pro 6000 for small CUDA tensors, bypassing the
+  model-level platform gate.
+- Evidence: direct smoke on `the primary SM120 workstation` for hidden sizes `128`, `512`, and
+  `2048` failed before correctness comparison. The TileLang module imported, but
+  DeepGEMM's `tf32_hc_prenorm_gemm` raised
+  `RuntimeError: Assertion error (csrc/apis/hyperconnection.hpp:56): Unsupported architecture`.
+- Decision: do not merely remove the SM12x gate for fast mHC. The next useful
+  path is an SM12x-native mHC pre implementation or a rewrite that avoids the
+  unsupported DeepGEMM hyperconnection primitive.
+
+## mHC Pre Fast Math Exp
+
+- Date: 2026-05-09.
+- Attempt: replace the SM12x native mHC pre `sigmoid` and Sinkhorn softmax
+  exponentials with CUDA `__expf` while leaving the sparse MLA online softmax
+  unchanged.
+- Evidence: the focused DeepSeek V4 shape correctness test passed, but the
+  isolated `tokens=1,hc_mult=4,hidden=4096` microbench on `the primary SM120 workstation` moved
+  from the retained split-apply baseline `0.024192 ms/call` to
+  `0.024384 ms/call` (`min_ms=0.024362`, `max_ms=0.024391`).
+- Decision: keep precise `expf` in mHC pre. This was not a measurable win and
+  consumes numerical-risk budget without throughput upside.
+
+## MoE SwiGLU Fast Exp
+
+- Date: 2026-05-09.
+- Attempt: replace the native SM12x MXFP4 MoE `apply_swiglu` sigmoid
+  exponentials with CUDA `__expf`.
+- Evidence: focused MoE correctness on `the primary SM120 workstation` still passed
+  (`tokenspeed-kernel/test/ops/test_sm12x_mxfp4.py`: `30 passed`), but the
+  isolated DeepSeek V4 decode-shape MoE microbench regressed from the retained
+  DS4 direct-warp baseline `0.125853 ms/call` to `0.133723 ms/call`
+  (`median_ms=0.133568`, checksum `0.004159`).
+- Decision: revert to precise `expf` in `apply_swiglu`. The sigmoid exp is not
+  the limiting cost in the current direct-warp schedule; weight loads and dot
+  products dominate.
+
+## Sparse MLA Online Softmax Fast Exp
+
+- Date: 2026-05-09.
+- Attempt: replace the SM12x sparse MLA FP8-cache online-softmax `expf` calls
+  for score rescaling and candidate weights with CUDA `__expf`.
+- Evidence: focused sparse MLA correctness passed on `the primary SM120 workstation`, but two
+  full-model `1024x128 c1` runs were indistinguishable from the retained FP8
+  weight GEMV baseline: `20.20` output tok/s, TPOT `39.67 ms` in
+  `<remote-workspace>/tokenspeed_bench_sparse_fast_exp_20260509233349`, then
+  `20.17` output tok/s, TPOT `39.74 ms` in
+  `<remote-workspace>/tokenspeed_bench_sparse_fast_exp_repeat_20260509233420`.
+  The retained precise-exp baseline was `20.18` output tok/s, TPOT `39.73 ms`.
+- Decision: keep precise `expf` in sparse MLA. This change only trades
+  numerical-risk budget for measurement noise.
+
+## DSv4 Output Projection FP8 GEMV: one-cell-per-block CUDA design
+
+- Date: 2026-05-13.
+- Attempt: native CUDA per-group batched FP8 GEMV for the DSv4 attention
+  output projection (`bhr,hdr->bhd`), structured as one CUDA block per
+  `(token, group, out_col)` output cell with `blockDim.x = 128` threads
+  reducing over `hidden_dim` (commit `7eb2845`, file
+  `tokenspeed-kernel/.../csrc/sm12x_deepseek_v4_output_proj.cu`,
+  `deepseek_v4_grouped_fp8_gemv_kernel`).
+- Evidence: focused projection tests passed (9/9), platform guard tests
+  passed (31/31), and the decode-shape microbench
+  (`tokens={1,2,8}`, `groups=8`, `hidden=2048`, `out_rank=1024`) measured:
+
+  | tokens | CUDA mean | Triton mean | CUDA / Triton |
+  |--------|-----------|-------------|---------------|
+  | 1      | 0.016 ms  | 0.020 ms    | 1.25x ✓       |
+  | 2      | 0.028 ms  | 0.021 ms    | 0.73x ✗       |
+  | 8      | 0.096 ms  | 0.020 ms    | 0.21x ✗       |
+
+  Workstation log:
+  `<remote-workspace>/tokenspeed_t1_gamma_cuda_microbench_20260513_*.log`.
+- Root cause: the grid is `(out_dim, num_tokens, num_groups)`, so each
+  block reads the same weight column independently. Total weight bandwidth
+  scales linearly with `num_tokens`. At `num_tokens=8` the kernel reads the
+  16 MB wo_a weight 8x, hitting ~128 MB of duplicated reads versus
+  Triton's 16 MB (whose `BLOCK_TOKENS=16` tile shares one weight load
+  across all tokens in the tile).
+- Decision: this design ships **only** as a single-stream (tokens==1)
+  specialization (hotfix `aff5c53`). The intended successor was a tile
+  variant with per-thread `B_TOKEN=16` accumulators -- recorded as a
+  separate rejected experiment below. Anti-pattern guard for future CUDA
+  GEMV kernels with batched M dimension on SM12x: a kernel whose grid
+  contains the batched-M dimension as a parallel axis (one block per row)
+  cannot win against any tile design that shares weights across the
+  batch -- never treat per-row launches as an acceptable starting design
+  when `M` can exceed 1 in production.
+
+## DSv4 Output Projection FP8 GEMV: per-thread B_TOKEN=16 accumulator tile
+
+- Date: 2026-05-13.
+- Attempt: replace the rejected one-cell-per-block design with a tile
+  variant `deepseek_v4_grouped_fp8_gemv_tile_kernel` that holds a
+  `B_TOKEN=16`-wide fp32 accumulator array per thread and amortizes the
+  wo_a weight read across the entire token tile. Inner loop unrolled with
+  `if (t < num_tokens)` masks for partial tiles / single-stream decodes.
+  Grid `(out_dim, ceil(num_tokens / 16), num_groups)`. Final reduction
+  uses a `partials[16][4]` shared scratch + per-token shuffles. Working
+  tree (uncommitted) on `codex/ds4-sm12x-poc` rebuilt on top of
+  `aff5c53`.
+- Evidence: focused projection tests passed (9/9). The decode-shape
+  microbench regressed at every token count:
+
+  | tokens | tile B=16 mean | Triton mean | tile B=16 / Triton |
+  |--------|----------------|-------------|--------------------|
+  | 1      | 0.096 ms       | 0.020 ms    | 0.21x ✗            |
+  | 2      | 0.098 ms       | 0.021 ms    | 0.21x ✗            |
+  | 8      | 0.169 ms       | 0.020 ms    | 0.12x ✗            |
+
+  This is 6x slower at tokens=1 than the previous one-cell-per-block
+  variant (0.016 ms), even where the tile shape has no compute waste --
+  pure overhead. Workstation log:
+  `<remote-workspace>/tokenspeed_t1_gamma_phase2_microbench_20260513_*.log`.
+- Root cause: `cuobjdump --dump-resource-usage` reports the tile kernel
+  uses **80 registers per thread**. With 128 threads per block that is
+  10240 registers per block; on RTX PRO 6000 Blackwell (65 536 registers
+  per SM), only 6 blocks fit per SM, capping resident threads at 768 of
+  the 2048 max -- ~37.5% theoretical occupancy. The 16-fp32 per-thread
+  accumulator array dominates the register pressure; the compiler keeps
+  all sixteen slots live across the entire k-block loop even when only
+  one slot ever receives a write (the `if (t < num_tokens)` mask cannot
+  prove the others dead at compile time).
+- Decision: revert. The per-thread accumulator tile model is not viable
+  on Blackwell at `B_TOKEN=16`. The viable replacement designs are
+  either (a) per-`B_TOKEN` kernel template specializations
+  (`__device__` kernel templated on `B`, instantiate for 1 / 2 / 4 / 8
+  / 16, wrapper dispatches based on `num_tokens`) so each instance has
+  exactly as many live accumulators as it actually needs; or (b) a true
+  cooperative tile (Triton-style) using shared-memory weight + activation
+  staging with cross-thread accumulation, which keeps each thread's
+  register footprint small but adds shared-memory traffic and reduction
+  complexity. Both options are deferred R&D items, not session-scoped
+  fixes.
+- Anti-pattern guard: any per-thread accumulator array of size >= 8 with
+  unrolled-with-mask population on a kernel that already pressures
+  registers (>= 32 regs/thread baseline) needs an explicit
+  `cuobjdump --dump-resource-usage` check before microbench, or
+  splitting into template-specialized smaller `B`. Do not try the same
+  naive per-thread accumulator design again -- the failure mode is
+  occupancy collapse on Blackwell, not algorithmic.
+
+## DSv4 Output Projection FP8 einsum: per-thread multi-token tile (template-specialized B=1..16)
+
+- Date: 2026-05-13.
+- Attempt: extend the ported DeepGEMM SM120 FP8 einsum (commit `0831acd`)
+  with a multi-token grid axis. Templated kernel on `kBTokenTile ∈ {1, 2,
+  4, 8, 16}`; the host wrapper picks the smallest specialization that
+  covers `num_tokens`. Each thread holds `kBTokenTile` fp32 accumulators
+  and `kBTokenTile` activation-scale slots; the outer K loop loads one
+  shared weight cell per thread and the unrolled inner token-loop reuses
+  that weight across all valid tokens. Hypothesis: weight reads scale
+  with `ceil(T / kBTokenTile)` blocks rather than `T` blocks, so total
+  weight LDGs drop by `kBTokenTile` and the t≥4 cliff disappears.
+- Evidence: cuobjdump usage came out clean for B≤8 (REG: 1→40, 2→39,
+  4→47, 8→63, 16→114). Correctness tests passed (9/9). Decode-shape
+  microbench (groups=8, hidden=2048, out=1024, GPU idle, 2 runs each):
+
+  | tokens | multi-token mean | naive port mean | Triton |
+  |--------|------------------|-----------------|--------|
+  | 1      | 0.030 ms         | 0.028 ms        | 0.020 ms |
+  | 2      | 0.031 ms         | 0.028 ms        | 0.021 ms |
+  | 8      | 0.100 ms         | 0.077 ms        | 0.020 ms |
+
+  Multi-token is strictly slower at every tokens it was expected to help.
+- Root cause: the hypothesis was wrong. The naive port's per-thread total
+  LDG count and the multi-token kernel's per-thread total LDG count are
+  basically identical -- the new design just shifts the cost from
+  per-block weight reads to per-thread activation reads (each thread now
+  loops over `kBTokenTile` activation lanes). What does change is
+  parallelism: the multi-token grid is `kBTokenTile`x smaller, so at
+  tokens=8 with B=8 we get 64 blocks × 128 threads = 8 192 threads
+  scattered over 140 Blackwell SMs (~58 threads/SM), down from the naive
+  port's 65 536 threads (~468 threads/SM). Latency hiding evaporates. The
+  per-thread register footprint also grows (40 → 63 regs at B=8), so even
+  if the thread count were comparable, occupancy halves.
+- Decision: revert to the naive single-token-per-block DeepGEMM port
+  (commit `0831acd`). The multi-token kernel was not committed; the
+  working tree returns to that state. The t=8 regression versus Triton
+  (0.27x) is real but tolerable until T1-α actually exposes graph bs ≥ 8
+  to production; the correct optimization at that point is
+  cooperative-thread MMA tile (Triton's actual underlying strategy) or
+  shared-memory weight staging on top of the naive design, not
+  per-thread multi-token accumulation.
+- Anti-pattern guard: at decode shape (small `M`, small total blocks,
+  Blackwell with 140 SMs), do not reduce block count via per-thread
+  multi-output tiling -- the GPU is parallelism-starved, not bandwidth-
+  starved. A kernel that produces fewer blocks-with-more-work-each at
+  this shape will lose to one with more blocks-with-less-work-each, even
+  if their total LDG counts match. Verify the parallelism cost via
+  `nthreads_per_SM = grid * threads_per_block / num_SMs` before assuming
+  a tile-size optimization will pay off.

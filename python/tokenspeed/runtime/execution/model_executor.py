@@ -333,6 +333,22 @@ class ModelExecutor:
 
     @nvtx_range("target_forward", color="red")
     def _run_target_forward(self, bs: int, ctx: ForwardContext, req_pool_indices):
+        # ``decode_step`` is the marker the nsys profile workflow targets:
+        # ``nsys profile --capture-range=nvtx
+        # --nvtx-capture=decode_step@tokenspeed --capture-range-end=stop``
+        # (or ``repeat-shutdown:N``) anchors collection on decode steps
+        # only, skipping the long prefill / capture / warmup phases. The
+        # inner range stays nested inside the existing
+        # ``target_forward`` range so eyeballed trace navigation still
+        # works.
+        if ctx.forward_mode.is_decode():
+            with nvtx_range("decode_step", color="blue"):
+                return self._call_model_runner_forward(bs, ctx, req_pool_indices)
+        return self._call_model_runner_forward(bs, ctx, req_pool_indices)
+
+    def _call_model_runner_forward(
+        self, bs: int, ctx: ForwardContext, req_pool_indices
+    ):
         return self.model_runner.forward(
             ctx,
             self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
@@ -417,7 +433,17 @@ class ModelExecutor:
             ] = next_round_input_ids.to(torch.int32)
 
         output_logprobs = logits_output.next_token_logprobs
-        return output_tokens, accept_lengths, output_logprobs
+        output_top_logprobs_val = logits_output.next_token_top_logprobs_val
+        output_top_logprobs_idx = logits_output.next_token_top_logprobs_idx
+        output_top_logprobs_nums = logits_output.next_token_top_logprobs_nums
+        return (
+            output_tokens,
+            accept_lengths,
+            output_logprobs,
+            output_top_logprobs_val,
+            output_top_logprobs_idx,
+            output_top_logprobs_nums,
+        )
 
     @nvtx_range("update_runtime_state", color="orange")
     def _update_runtime_state(
@@ -458,12 +484,14 @@ class ModelExecutor:
         self,
         bs: int,
         sampling_params_list: list[SamplingParams],
+        top_logprobs_nums: list[int] | None = None,
     ) -> SamplingBatchInfo:
         return SamplingBatchInfo(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
             valid_cache_lengths=self.runtime_states.valid_cache_lengths,
             is_all_greedy=all(p.top_k <= 1 for p in sampling_params_list),
             vocab_size=self.runtime_states.vocab_size,
+            top_logprobs_nums=top_logprobs_nums,
             device=self.device,
         )
 
@@ -519,6 +547,7 @@ class ModelExecutor:
         self,
         forward_op,
         sampling_params_list: list[SamplingParams],
+        top_logprobs_nums: list[int] | None = None,
         num_active_pages: int = 0,
         num_cached_pages: int = 0,
         num_queue_reqs: int = 0,
@@ -559,6 +588,7 @@ class ModelExecutor:
         result = self.execute_forward_op(
             forward_op,
             sampling_params_list,
+            top_logprobs_nums,
             dp_global_num_tokens,
             dp_global_bs,
             dp_all_decode_or_idle,
@@ -803,6 +833,7 @@ class ModelExecutor:
         self,
         forward_op,
         sampling_params_list: list[SamplingParams],
+        top_logprobs_nums: list[int] | None = None,
         dp_global_num_tokens=None,
         dp_global_bs=None,
         dp_all_decode_or_idle: bool = False,
@@ -859,6 +890,9 @@ class ModelExecutor:
                 output_tokens = torch.zeros(0, dtype=torch.int32, device=self.device)
                 output_lengths = torch.zeros(bs, dtype=torch.int32, device=self.device)
                 output_logprobs = None
+                output_top_logprobs_val = None
+                output_top_logprobs_idx = None
+                output_top_logprobs_nums = None
             else:
                 ctx = ForwardContext(
                     attn_backend=self.attn_backend,
@@ -888,7 +922,9 @@ class ModelExecutor:
                     ctx.all_decode_or_idle = dp_all_decode_or_idle
 
                 with nvtx_range("sampling_prep", color="yellow"):
-                    sampling_info = self._build_sampling_info(bs, sampling_params_list)
+                    sampling_info = self._build_sampling_info(
+                        bs, sampling_params_list, top_logprobs_nums
+                    )
                     grammar_completion = setup_grammar_step(
                         sampling_info=sampling_info,
                         bs=bs,
@@ -949,7 +985,14 @@ class ModelExecutor:
                         device=self.device,
                         num_reqs=bs,
                     )
-                    output_tokens, output_lengths, output_logprobs = self.forward_step(
+                    (
+                        output_tokens,
+                        output_lengths,
+                        output_logprobs,
+                        output_top_logprobs_val,
+                        output_top_logprobs_idx,
+                        output_top_logprobs_nums,
+                    ) = self.forward_step(
                         bs=bs,
                         ctx=ctx,
                         sampling_info=sampling_info,
@@ -989,6 +1032,14 @@ class ModelExecutor:
 
                 if output_logprobs is not None:
                     output_logprobs = output_logprobs.to("cpu", non_blocking=True)
+                if output_top_logprobs_val is not None:
+                    output_top_logprobs_val = output_top_logprobs_val.to(
+                        "cpu", non_blocking=True
+                    )
+                if output_top_logprobs_idx is not None:
+                    output_top_logprobs_idx = output_top_logprobs_idx.to(
+                        "cpu", non_blocking=True
+                    )
 
                 copy_event = torch.cuda.Event()
                 copy_event.record()
@@ -997,6 +1048,9 @@ class ModelExecutor:
             output_tokens=output_tokens,
             output_lengths=output_lengths,
             output_logprobs=output_logprobs,
+            output_top_logprobs_val=output_top_logprobs_val,
+            output_top_logprobs_idx=output_top_logprobs_idx,
+            output_top_logprobs_nums=output_top_logprobs_nums,
             copy_event=copy_event,
             grammar_completion=grammar_completion,
         )

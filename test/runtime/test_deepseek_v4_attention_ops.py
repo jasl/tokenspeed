@@ -13,10 +13,12 @@
 
 import math
 import unittest
+from unittest.mock import patch
 
 import torch
 
 from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
+    DEEPSEEK_V4_INDEXER_DIM,
     DEEPSEEK_V4_SWA_SCALE_DIM,
     DEEPSEEK_V4_SWA_TOKEN_STRIDE,
     DeepseekV4AttentionOpUnavailable,
@@ -166,6 +168,9 @@ def _mxfp4_bytes_and_scales(
 
 
 def _hadamard_rotate(row: torch.Tensor) -> torch.Tensor:
+    if _cuda_device_is_sm12x(row):
+        return _torch_hadamard_rotate(row)
+
     from tokenspeed_kernel.thirdparty.fast_hadamard_transform import hadamard_transform
 
     shape = row.shape
@@ -173,6 +178,32 @@ def _hadamard_rotate(row: torch.Tensor) -> torch.Tensor:
         row.to(torch.bfloat16).reshape(-1, shape[-1]).contiguous(),
         scale=shape[-1] ** -0.5,
     ).reshape(shape)
+
+
+def _cuda_device_is_sm12x(tensor: torch.Tensor) -> bool:
+    if not tensor.is_cuda:
+        return False
+    major, _minor = torch.cuda.get_device_capability(tensor.device)
+    return major == 12
+
+
+def _torch_hadamard_rotate(row: torch.Tensor) -> torch.Tensor:
+    shape = row.shape
+    width = shape[-1]
+    if width <= 0 or width & (width - 1) != 0:
+        raise ValueError(f"Hadamard rotate requires power-of-two dim, got {width}")
+
+    out = row.to(torch.bfloat16).reshape(-1, width).float()
+    h = 1
+    while h < width:
+        out = out.reshape(-1, width // (h * 2), h * 2)
+        lo = out[..., :h].clone()
+        hi = out[..., h:].clone()
+        out[..., :h] = lo + hi
+        out[..., h:] = lo - hi
+        out = out.reshape(-1, width)
+        h *= 2
+    return (out * (width**-0.5)).to(torch.bfloat16).reshape(shape)
 
 
 def _expected_overlap_normed(
@@ -287,6 +318,158 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         # The fourth token was DP-style padding for KV insert: Q is still updated,
         # but no cache row is written for it.
         self.assertEqual(int(cache.view(-1)[3 * 576 : 4 * 576].sum()), 0)
+
+    def test_sm12x_fused_qnorm_rope_kv_insert_uses_native_op_when_available(self):
+        major, _minor = torch.cuda.get_device_capability()
+        if major != 12:
+            self.skipTest(
+                "SM12x native fused insert contract only applies to CUDA major 12"
+            )
+
+        torch.manual_seed(1234)
+        dtype = torch.bfloat16
+        device = torch.device("cuda")
+        num_tokens = 1
+        num_heads = 2
+        block_size = 4
+        eps = 1.0e-6
+
+        q = torch.randn(num_tokens, num_heads, HEAD_DIM, device=device, dtype=dtype)
+        kv = torch.randn(num_tokens, HEAD_DIM, device=device, dtype=dtype)
+        positions = torch.tensor([3], dtype=torch.int32, device=device)
+        slot_mapping = torch.tensor([2], dtype=torch.int32, device=device)
+        cos_sin = torch.randn(16, ROPE_DIM, device=device, dtype=torch.float32) * 0.1
+        cache = torch.zeros(2, block_size * 584, device=device, dtype=torch.uint8)
+        seen: dict[str, torch.Tensor | bool] = {}
+
+        def fake_op(
+            q_arg,
+            kv_arg,
+            cache_arg,
+            slot_mapping_arg,
+            positions_arg,
+            cos_sin_arg,
+            eps_arg,
+            block_size_arg,
+        ):
+            seen["called"] = True
+            seen["slot_mapping"] = slot_mapping_arg
+            seen["positions"] = positions_arg
+            self.assertIs(q_arg, q)
+            self.assertIs(kv_arg, kv)
+            self.assertIs(cache_arg, cache)
+            self.assertIs(cos_sin_arg, cos_sin)
+            self.assertEqual(eps_arg, eps)
+            self.assertEqual(block_size_arg, block_size)
+
+        with (
+            patch(
+                "tokenspeed.runtime.layers.attention.deepseek_v4_ops._get_tokenspeed_op",
+                return_value=fake_op,
+            ),
+            patch(
+                "tokenspeed.runtime.layers.attention.deepseek_v4_ops._has_tokenspeed_op",
+                return_value=True,
+            ),
+        ):
+            fused_qnorm_rope_kv_insert(
+                q=q,
+                kv=kv,
+                swa_kv_cache_2d=cache,
+                slot_mapping=slot_mapping,
+                positions=positions,
+                cos_sin_cache=cos_sin,
+                rms_norm_eps=eps,
+                block_size=block_size,
+            )
+
+        self.assertTrue(seen.get("called"))
+        self.assertEqual(seen["slot_mapping"].dtype, torch.int64)
+        self.assertEqual(seen["positions"].dtype, torch.int64)
+
+    def test_sm12x_fused_qnorm_rope_kv_insert_falls_back_when_native_op_missing(self):
+        major, _minor = torch.cuda.get_device_capability()
+        if major != 12:
+            self.skipTest("SM12x fallback contract only applies to CUDA major 12")
+
+        torch.manual_seed(1234)
+        dtype = torch.bfloat16
+        device = torch.device("cuda")
+        num_tokens = 4
+        num_insert = 3
+        num_heads = 2
+        block_size = 4
+        eps = 1.0e-6
+
+        q = torch.randn(num_tokens, num_heads, HEAD_DIM, device=device, dtype=dtype)
+        kv = torch.randn(num_tokens, HEAD_DIM, device=device, dtype=dtype)
+        q_before = q.clone()
+        kv_before = kv.clone()
+        positions = torch.tensor([0, 3, 5, 7], dtype=torch.int32, device=device)
+        slot_mapping = torch.tensor([0, 2, -1], dtype=torch.int32, device=device)
+        cos_sin = torch.randn(16, ROPE_DIM, device=device, dtype=torch.float32) * 0.1
+        cache = torch.zeros(2, block_size * 584, device=device, dtype=torch.uint8)
+
+        with (
+            patch(
+                "tokenspeed.runtime.layers.attention.deepseek_v4_ops._get_tokenspeed_op",
+                return_value=None,
+            ),
+            patch(
+                "tokenspeed.runtime.layers.attention.deepseek_v4_ops._has_tokenspeed_op",
+                return_value=False,
+            ),
+        ):
+            fused_qnorm_rope_kv_insert(
+                q=q,
+                kv=kv,
+                swa_kv_cache_2d=cache,
+                slot_mapping=slot_mapping,
+                positions=positions,
+                cos_sin_cache=cos_sin,
+                rms_norm_eps=eps,
+                block_size=block_size,
+            )
+        torch.cuda.synchronize()
+
+        expected_q = _q_reference(q_before, positions.long(), cos_sin, eps)
+        torch.testing.assert_close(
+            q.float(), expected_q.float(), atol=3.0e-2, rtol=3.0e-2
+        )
+
+        expected_k = _k_reference(
+            kv_before[:num_insert], positions[:num_insert].long(), cos_sin
+        )
+        for token_idx, slot in enumerate(slot_mapping.tolist()):
+            if slot < 0:
+                continue
+            block = slot // block_size
+            pos = slot % block_size
+            base = block * cache.stride(0) + pos * 576
+            scale_base = block * cache.stride(0) + block_size * 576 + pos * 8
+            flat_cache = cache.view(-1)
+            token_bytes = flat_cache[base : base + 576]
+            scale_bytes = flat_cache[scale_base : scale_base + 8]
+            for qblock in range(7):
+                start = qblock * 64
+                expected_bytes, expected_scale = _fp8_bytes_and_scale(
+                    expected_k[token_idx, start : start + 64].float()
+                )
+                torch.testing.assert_close(
+                    token_bytes[start : start + 64].cpu(),
+                    expected_bytes.cpu(),
+                    atol=0,
+                    rtol=0,
+                )
+                self.assertEqual(int(scale_bytes[qblock]), expected_scale)
+            self.assertEqual(int(scale_bytes[7]), 0)
+            expected_rope = expected_k[token_idx, NOPE_DIM:].view(torch.uint8)
+            torch.testing.assert_close(
+                token_bytes[NOPE_DIM:].cpu(),
+                expected_rope.cpu(),
+                atol=0,
+                rtol=0,
+            )
 
     def test_hca_compressor_state_insert_matches_reference(self):
         torch.manual_seed(4321)
@@ -971,6 +1154,50 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                 expected_scales.contiguous().view(torch.int32).squeeze(-1).cpu(),
             )
         )
+
+    def test_indexer_q_reference_fp4_is_cuda_graph_capturable(self):
+        torch.manual_seed(1234)
+        device = torch.device("cuda")
+        dtype = torch.bfloat16
+        tokens = 2
+        heads = 2
+        index_q = torch.randn(
+            tokens,
+            heads,
+            DEEPSEEK_V4_INDEXER_DIM,
+            device=device,
+            dtype=dtype,
+        )
+        positions = torch.arange(tokens, device=device, dtype=torch.int64)
+        cos_sin = torch.randn(16, ROPE_DIM, device=device, dtype=torch.float32) * 0.1
+        weights = torch.rand(tokens, heads, device=device, dtype=torch.float32)
+
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                deepseek_v4_prepare_indexer_q_reference(
+                    index_q,
+                    positions,
+                    cos_sin,
+                    weights,
+                    softmax_scale=0.125,
+                    head_scale=0.5,
+                    use_fp4=True,
+                )
+        stream.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            deepseek_v4_prepare_indexer_q_reference(
+                index_q,
+                positions,
+                cos_sin,
+                weights,
+                softmax_scale=0.125,
+                head_scale=0.5,
+                use_fp4=True,
+            )
+        graph.replay()
 
     def test_sparse_prefill_combine_topk_swa_indices_matches_reference(self):
         device = torch.device("cuda")

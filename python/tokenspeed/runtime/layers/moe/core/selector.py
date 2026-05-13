@@ -46,6 +46,7 @@ _AUTO_IMPL_PREFERENCE = {
         "flashinfer_cutlass",
     ),
     "mxfp4": (
+        "sm12x_mxfp4",
         "flashinfer_mxfp4",
         "triton_kernel",
     ),
@@ -93,6 +94,8 @@ def _detect_arch() -> str:
     platform = current_platform()
 
     major, minor = platform.arch_version.major, platform.arch_version.minor
+    if major >= 12:
+        return f"sm{major}{minor}"
     if major >= 9:
         return f"sm{major}0"
     return f"sm{major}{minor}"
