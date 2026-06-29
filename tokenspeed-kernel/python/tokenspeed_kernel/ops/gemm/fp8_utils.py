@@ -413,10 +413,15 @@ def per_token_group_quant_fp8(
 
     if (
         _is_nvidia
+        and not platform.is_consumer_blackwell
         and not column_major_scales
         and not scale_tma_aligned
         and not scale_ue8m0
     ):
+        # TRTLLM per_token_group_quant_8bit returns a malformed (TMA-padded)
+        # scale on consumer Blackwell (sm_120/sm_121); fall through to the
+        # portable triton quant below, which yields a clean [tokens, groups]
+        # scale. The caller pairs this with group_major_scales=False.
         return _trtllm_per_token_group_quant_fp8(x, group_size)
 
     return _per_token_group_quant_8bit_raw(

@@ -49,10 +49,17 @@ platform = current_platform()
 
 
 if platform.is_blackwell_plus:
-    from flash_attn.cute import (
-        flash_attn_func,
-        flash_attn_varlen_func,
-    )
+    try:
+        from flash_attn.cute import (
+            flash_attn_func,
+            flash_attn_varlen_func,
+        )
+    except ImportError:
+        # FA4 (flash_attn.cute) is an optional backend. On consumer Blackwell
+        # the fa4 kernels below don't register anyway (the registration block is
+        # gated on arch == sm_100), and DeepSeek-V4 uses FlashMLA, not FA4.
+        # Degrade to error_fn instead of making the package unimportable.
+        pass
 
 if (
     platform.is_nvidia

@@ -212,14 +212,16 @@ def _online_quantize_mxfp8(
                 block_k,
                 column_major_scales=False,
             ),
-            group_major_scales=_platform.is_nvidia,
+            group_major_scales=_platform.is_nvidia
+            and not _platform.is_consumer_blackwell,
         )
     elif kernel_name == "triton_mm_fp8_blockscale":
         from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
 
         return ensure_row_major_scales(
             *per_token_group_quant_fp8(A, block_k, column_major_scales=False),
-            group_major_scales=_platform.is_nvidia,
+            group_major_scales=_platform.is_nvidia
+            and not _platform.is_consumer_blackwell,
         )
     else:
         raise ValueError(f"No online quantization defined for kernel {kernel_name!r}")
