@@ -61,6 +61,10 @@ if platform.is_nvidia:
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(9, 0),
+            # CUTLASS fused-MoE FP8 is datacenter-Blackwell tuned; cap at sm_103
+            # to match the sibling TRT-LLM MoE kernels and keep it off consumer
+            # Blackwell (sm_120/sm_121) / Thor where there is no AOT binary.
+            max_arch_version=ArchVersion(10, 3),
         ),
         signatures=format_signatures(
             "x",

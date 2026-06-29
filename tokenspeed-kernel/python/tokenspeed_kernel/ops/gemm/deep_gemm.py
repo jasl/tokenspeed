@@ -61,6 +61,12 @@ if fp8_gemm_nt is not None:
         solution="deep_gemm",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
+            # deep_gemm's FP8 block-scale GEMM is TMA/TMEM-aligned (Hopper +
+            # datacenter Blackwell + Thor). Cap below consumer Blackwell
+            # (sm_120/sm_121, major 12), which lacks TMEM: deep_gemm would
+            # otherwise register at SPECIALIZED+2 and outrank the portable
+            # Triton FP8 block-scale fallback there.
+            max_arch_version=ArchVersion(11, 0),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=_MXFP8_FORMAT_SIGNATURES,
