@@ -30,8 +30,17 @@ import sys
 
 import tokenspeed_triton as triton
 import tokenspeed_triton.experimental.gluon.language as gl
-import tokenspeed_triton.profiler as proton
 from tokenspeed_triton import language as tl
+
+try:
+    import tokenspeed_triton.profiler as proton
+except ImportError:
+    # Proton (the Triton profiler) is optional — some tokenspeed-triton wheels
+    # ship without it. profiling.py treats ``proton is None`` as "profiling
+    # disabled" (see ``_HAS_PROTON``), so degrade gracefully instead of making
+    # the whole kernel package unimportable.
+    proton = None
+
 from tokenspeed_triton.experimental import gluon
 from tokenspeed_triton.language.core import _aggregate as aggregate
 from tokenspeed_triton.language.extra import libdevice
