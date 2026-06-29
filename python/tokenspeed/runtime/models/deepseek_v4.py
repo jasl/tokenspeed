@@ -527,9 +527,13 @@ def pack_topk_as_router_logits(
 from tokenspeed_kernel.ops.attention.indexer_mqa_logits_sm12x import (
     indexer_mqa_logits_sm12x,
 )
+from tokenspeed_kernel.ops.attention.triton.indexer_mqa_logits_sm12x import (
+    indexer_mqa_logits_sm12x_triton,
+)
 
 _DEEPGEMM_INDEXER_ARCH_OK: bool | None = None
 _INDEXER_SM12X_SCORING: bool | None = None
+_INDEXER_SM12X_SCORING_BACKEND: str | None = None
 
 
 def _deepseek_v4_indexer_use_sm12x_scoring() -> bool:
@@ -546,6 +550,22 @@ def _deepseek_v4_indexer_use_sm12x_scoring() -> bool:
         except Exception:
             _INDEXER_SM12X_SCORING = False
     return _INDEXER_SM12X_SCORING
+
+
+def _deepseek_v4_indexer_sm12x_scoring_backend() -> str:
+    """Portable scoring backend for the consumer-Blackwell indexer MQA-logits.
+
+    ``TOKENSPEED_INDEXER_SCORING`` selects it: ``triton`` (default; tiled, the
+    production kernel) or ``torch`` (the reference fallback, which materializes
+    [num_q, num_heads, num_kv] and OOMs on long context). Cached on first use.
+    """
+    global _INDEXER_SM12X_SCORING_BACKEND
+    if _INDEXER_SM12X_SCORING_BACKEND is None:
+        choice = os.environ.get("TOKENSPEED_INDEXER_SCORING", "triton").strip().lower()
+        _INDEXER_SM12X_SCORING_BACKEND = (
+            choice if choice in ("triton", "torch") else "triton"
+        )
+    return _INDEXER_SM12X_SCORING_BACKEND
 
 
 def _deepgemm_indexer_arch_supported() -> bool:
@@ -1470,8 +1490,15 @@ def _deepseek_v4_indexer_topk_prefill_deepgemm(
     k_values, k_scales = gathered_k
 
     if _deepseek_v4_indexer_use_sm12x_scoring():
+        # Portable consumer-Blackwell scoring: Triton (default) or the torch
+        # reference; both share the call signature and feed the same top-k.
+        scorer = (
+            indexer_mqa_logits_sm12x_triton
+            if _deepseek_v4_indexer_sm12x_scoring_backend() == "triton"
+            else indexer_mqa_logits_sm12x
+        )
         with nvtx_range("indexer_topk_prefill_sm12x_logits"):
-            logits = indexer_mqa_logits_sm12x(
+            logits = scorer(
                 q_values.contiguous().view(torch.int8),
                 q_scales.contiguous(),
                 k_values.contiguous(),
