@@ -219,6 +219,12 @@ def _warmup_tf32_hc_prenorm_gemm(
     max_tokens: int,
     device: torch.device,
 ) -> None:
+    if torch.cuda.get_device_capability()[0] != 10:
+        # tf32_hc_prenorm_gemm is datacenter-Blackwell-only (major 10); on
+        # consumer Blackwell (sm_120/121), Thor and Hopper the mHC prenorm GEMM
+        # runs via the torch fallback in deepseek_v4_mhc.mhc_pre, which needs no
+        # JIT warmup. Calling the kernel here asserts "Unsupported architecture".
+        return
     try:
         from tokenspeed_kernel.thirdparty.deep_gemm import tf32_hc_prenorm_gemm
     except ImportError:
