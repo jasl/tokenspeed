@@ -531,6 +531,16 @@ from tokenspeed_kernel.ops.attention.triton.indexer_mqa_logits_sm12x import (
 _DEEPGEMM_INDEXER_ARCH_OK: bool | None = None
 _INDEXER_SM12X_SCORING: bool | None = None
 _INDEXER_SM12X_SCORING_BACKEND: str | None = None
+# tl.dot precision for the Triton indexer scoring. "tf32" (default) matches the
+# deep_gemm decode throughput (the indexer is a top-k selector, so tf32 is
+# accuracy-safe -- GSM8K 0.945 vs 0.955 ieee, within one stderr; same choice as
+# the vLLM kernel). Set TOKENSPEED_INDEXER_PRECISION=ieee for the exact fp32 path
+# (~18% slower decode) if maximum reproducibility is needed.
+_INDEXER_TRITON_PRECISION: str = (
+    "ieee"
+    if os.environ.get("TOKENSPEED_INDEXER_PRECISION", "tf32").strip().lower() == "ieee"
+    else "tf32"
+)
 
 
 def _deepseek_v4_indexer_use_sm12x_scoring() -> bool:
@@ -1492,24 +1502,34 @@ def _deepseek_v4_indexer_topk_prefill_deepgemm(
     if _deepseek_v4_indexer_use_sm12x_scoring():
         # Portable consumer-Blackwell prefill scoring: Triton (default; also for
         # the deepgemm A/B arm, which has no sm12x prefill kernel) or the torch
-        # reference; both share the call signature and feed the same top-k.
-        scorer = (
-            indexer_mqa_logits_sm12x
-            if _deepseek_v4_indexer_sm12x_scoring_backend() == "torch"
-            else indexer_mqa_logits_sm12x_triton
-        )
+        # reference. Serving uses tf32 dots (the indexer is a top-k selector, so
+        # tf32 is accuracy-safe and ~2-3x faster than ieee; matches the vLLM kernel).
         with nvtx_range("indexer_topk_prefill_sm12x_logits"):
-            logits = scorer(
-                q_values.contiguous().view(torch.int8),
-                q_scales.contiguous(),
-                k_values.contiguous(),
-                k_scales.contiguous(),
-                weights.contiguous(),
-                cu_start,
-                cu_end,
-                max_len,
-                head_dim=q_values.shape[-1] * 2,
-            )
+            if _deepseek_v4_indexer_sm12x_scoring_backend() == "torch":
+                logits = indexer_mqa_logits_sm12x(
+                    q_values.contiguous().view(torch.int8),
+                    q_scales.contiguous(),
+                    k_values.contiguous(),
+                    k_scales.contiguous(),
+                    weights.contiguous(),
+                    cu_start,
+                    cu_end,
+                    max_len,
+                    head_dim=q_values.shape[-1] * 2,
+                )
+            else:
+                logits = indexer_mqa_logits_sm12x_triton(
+                    q_values.contiguous().view(torch.int8),
+                    q_scales.contiguous(),
+                    k_values.contiguous(),
+                    k_scales.contiguous(),
+                    weights.contiguous(),
+                    cu_start,
+                    cu_end,
+                    max_len,
+                    head_dim=q_values.shape[-1] * 2,
+                    input_precision=_INDEXER_TRITON_PRECISION,
+                )
     else:
         with nvtx_range("indexer_topk_prefill_deepgemm_logits"):
             logits = deep_gemm.fp8_fp4_mqa_logits(
@@ -1626,6 +1646,7 @@ def _deepseek_v4_indexer_topk_from_cache_deepgemm_decode(
                 cache_block_size,
                 max_len,
                 head_dim=q_values.shape[-1] * 2,
+                input_precision=_INDEXER_TRITON_PRECISION,
             )
     else:
         kv_cache = _deepseek_v4_indexer_mxfp4_cache_view(cache_2d, cache_block_size)
