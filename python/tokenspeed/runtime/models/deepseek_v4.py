@@ -528,6 +528,7 @@ from tokenspeed_kernel.ops.attention.indexer_mqa_logits_sm12x import (
     indexer_mqa_logits_sm12x,
 )
 from tokenspeed_kernel.ops.attention.triton.indexer_mqa_logits_sm12x import (
+    indexer_mqa_logits_paged_sm12x_triton,
     indexer_mqa_logits_sm12x_triton,
 )
 
@@ -555,15 +556,18 @@ def _deepseek_v4_indexer_use_sm12x_scoring() -> bool:
 def _deepseek_v4_indexer_sm12x_scoring_backend() -> str:
     """Portable scoring backend for the consumer-Blackwell indexer MQA-logits.
 
-    ``TOKENSPEED_INDEXER_SCORING`` selects it: ``triton`` (default; tiled, the
-    production kernel) or ``torch`` (the reference fallback, which materializes
-    [num_q, num_heads, num_kv] and OOMs on long context). Cached on first use.
+    ``TOKENSPEED_INDEXER_SCORING`` selects it (cached on first use):
+    - ``triton`` (default): Triton prefill + Triton paged decode scoring.
+    - ``torch``: torch-reference prefill (OOMs on long context) + Triton decode.
+    - ``deepgemm``: Triton prefill (no sm12x deep_gemm prefill kernel exists) +
+      nv_dev deep_gemm paged decode -- the A/B arm vs the Triton decode kernel
+      (requires the TOKENSPEED_INDEXER_DEEPGEMM_SM120 lever for decode).
     """
     global _INDEXER_SM12X_SCORING_BACKEND
     if _INDEXER_SM12X_SCORING_BACKEND is None:
         choice = os.environ.get("TOKENSPEED_INDEXER_SCORING", "triton").strip().lower()
         _INDEXER_SM12X_SCORING_BACKEND = (
-            choice if choice in ("triton", "torch") else "triton"
+            choice if choice in ("triton", "torch", "deepgemm") else "triton"
         )
     return _INDEXER_SM12X_SCORING_BACKEND
 
@@ -1490,12 +1494,13 @@ def _deepseek_v4_indexer_topk_prefill_deepgemm(
     k_values, k_scales = gathered_k
 
     if _deepseek_v4_indexer_use_sm12x_scoring():
-        # Portable consumer-Blackwell scoring: Triton (default) or the torch
+        # Portable consumer-Blackwell prefill scoring: Triton (default; also for
+        # the deepgemm A/B arm, which has no sm12x prefill kernel) or the torch
         # reference; both share the call signature and feed the same top-k.
         scorer = (
-            indexer_mqa_logits_sm12x_triton
-            if _deepseek_v4_indexer_sm12x_scoring_backend() == "triton"
-            else indexer_mqa_logits_sm12x
+            indexer_mqa_logits_sm12x
+            if _deepseek_v4_indexer_sm12x_scoring_backend() == "torch"
+            else indexer_mqa_logits_sm12x_triton
         )
         with nvtx_range("indexer_topk_prefill_sm12x_logits"):
             logits = scorer(
@@ -1565,7 +1570,9 @@ def _deepseek_v4_indexer_topk_from_cache_deepgemm_decode(
     persistent_topk_workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     q_values, q_scales = index_q
-    if not _deepseek_v4_deepgemm_fp4_indexer_available(q_values):
+    if not _deepseek_v4_deepgemm_fp4_indexer_available(q_values) and (
+        not _deepseek_v4_indexer_use_sm12x_scoring()
+    ):
         raise RuntimeError("DeepSeek V4 sparse indexer requires DeepGEMM FP4 support")
 
     num_tokens = positions.numel()
@@ -1606,43 +1613,62 @@ def _deepseek_v4_indexer_topk_from_cache_deepgemm_decode(
     if max_len <= 0:
         topk.fill_(-1)
         return topk
-    kv_cache = _deepseek_v4_indexer_mxfp4_cache_view(cache_2d, cache_block_size)
-    schedule_key = (compress_ratio, cache_block_size, num_tokens)
-    indexer_metadata = metadata.indexer if metadata is not None else None
-    schedule_cache = (
-        None
-        if indexer_metadata is None
-        else indexer_metadata.decode_schedule_metadata_cache
-    )
-    if schedule_metadata is None:
-        schedule_metadata = (
-            schedule_cache.get(schedule_key) if schedule_cache is not None else None
-        )
-    if schedule_metadata is None:
-        with nvtx_range("indexer_decode_schedule_metadata"):
-            schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+    if (
+        _deepseek_v4_indexer_use_sm12x_scoring()
+        and _deepseek_v4_indexer_sm12x_scoring_backend() != "deepgemm"
+    ):
+        # Paged Triton decode scoring: reads the MXFP4 cache via block_table, no
+        # deep_gemm / schedule metadata. Default on consumer Blackwell.
+        with nvtx_range("indexer_decode_sm12x_triton_logits"):
+            logits = indexer_mqa_logits_paged_sm12x_triton(
+                q_values.contiguous().view(torch.int8),
+                q_scales.contiguous(),
+                cache_2d,
+                block_tables,
                 context_lens,
+                weights.contiguous(),
                 cache_block_size,
-                deep_gemm.get_num_sms(),
+                max_len,
+                head_dim=q_values.shape[-1] * 2,
             )
-        if schedule_cache is not None:
-            schedule_cache[schedule_key] = schedule_metadata
-
-    with nvtx_range("indexer_decode_deepgemm_logits"):
-        logits = deep_gemm.fp8_fp4_paged_mqa_logits(
-            q=(
-                q_values.contiguous().view(torch.int8).unsqueeze(1),
-                q_scales.contiguous().unsqueeze(1),
-            ),
-            kv_cache=kv_cache,
-            weights=weights.contiguous(),
-            context_lens=context_lens,
-            block_table=block_tables,
-            schedule_meta=schedule_metadata,
-            max_context_len=max_len,
-            clean_logits=False,
-            logits_dtype=torch.float32,
+    else:
+        kv_cache = _deepseek_v4_indexer_mxfp4_cache_view(cache_2d, cache_block_size)
+        schedule_key = (compress_ratio, cache_block_size, num_tokens)
+        indexer_metadata = metadata.indexer if metadata is not None else None
+        schedule_cache = (
+            None
+            if indexer_metadata is None
+            else indexer_metadata.decode_schedule_metadata_cache
         )
+        if schedule_metadata is None:
+            schedule_metadata = (
+                schedule_cache.get(schedule_key) if schedule_cache is not None else None
+            )
+        if schedule_metadata is None:
+            with nvtx_range("indexer_decode_schedule_metadata"):
+                schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    context_lens,
+                    cache_block_size,
+                    deep_gemm.get_num_sms(),
+                )
+            if schedule_cache is not None:
+                schedule_cache[schedule_key] = schedule_metadata
+
+        with nvtx_range("indexer_decode_deepgemm_logits"):
+            logits = deep_gemm.fp8_fp4_paged_mqa_logits(
+                q=(
+                    q_values.contiguous().view(torch.int8).unsqueeze(1),
+                    q_scales.contiguous().unsqueeze(1),
+                ),
+                kv_cache=kv_cache,
+                weights=weights.contiguous(),
+                context_lens=context_lens,
+                block_table=block_tables,
+                schedule_meta=schedule_metadata,
+                max_context_len=max_len,
+                clean_logits=False,
+                logits_dtype=torch.float32,
+            )
 
     with nvtx_range("indexer_decode_topk"):
         return _deepseek_v4_indexer_topk_from_logits(
