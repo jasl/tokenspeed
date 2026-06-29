@@ -524,7 +524,28 @@ def pack_topk_as_router_logits(
     return router_logits
 
 
+from tokenspeed_kernel.ops.attention.indexer_mqa_logits_sm12x import (
+    indexer_mqa_logits_sm12x,
+)
+
 _DEEPGEMM_INDEXER_ARCH_OK: bool | None = None
+_INDEXER_SM12X_SCORING: bool | None = None
+
+
+def _deepseek_v4_indexer_use_sm12x_scoring() -> bool:
+    """Whether to use the portable indexer MQA-logits scoring on consumer Blackwell.
+
+    deep_gemm's non-paged ``fp8_fp4_mqa_logits`` (the prefill indexer scoring) has
+    no sm_120/sm_121 binary (cudaErrorNoKernelImageForDevice). Route that scoring
+    to the portable fallback on consumer Blackwell. Returns True iff major==12.
+    """
+    global _INDEXER_SM12X_SCORING
+    if _INDEXER_SM12X_SCORING is None:
+        try:
+            _INDEXER_SM12X_SCORING = torch.cuda.get_device_capability()[0] == 12
+        except Exception:
+            _INDEXER_SM12X_SCORING = False
+    return _INDEXER_SM12X_SCORING
 
 
 def _deepgemm_indexer_arch_supported() -> bool:
@@ -1408,9 +1429,12 @@ def _deepseek_v4_indexer_topk_prefill_deepgemm(
     use_prefill_topk_op: bool,
     gathered_k: tuple[torch.Tensor, torch.Tensor] | None = None,
     gather_workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
+    persistent_topk_workspace: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
     q_values, q_scales = index_q
-    if not _deepseek_v4_deepgemm_fp4_indexer_available(q_values):
+    if not _deepseek_v4_deepgemm_fp4_indexer_available(q_values) and (
+        not _deepseek_v4_indexer_use_sm12x_scoring()
+    ):
         raise RuntimeError("DeepSeek V4 sparse indexer requires DeepGEMM FP4 support")
 
     num_tokens = q_values.shape[0]
@@ -1445,25 +1469,49 @@ def _deepseek_v4_indexer_topk_prefill_deepgemm(
             )
     k_values, k_scales = gathered_k
 
-    with nvtx_range("indexer_topk_prefill_deepgemm_logits"):
-        logits = deep_gemm.fp8_fp4_mqa_logits(
-            q=(q_values.contiguous().view(torch.int8), q_scales.contiguous()),
-            kv=(k_values.contiguous(), k_scales.contiguous()),
-            weights=weights.contiguous(),
-            cu_seq_len_k_start=cu_start,
-            cu_seq_len_k_end=cu_end,
-            clean_logits=False,
-            max_seqlen_k=max_len,
-            logits_dtype=torch.float32,
-        )
+    if _deepseek_v4_indexer_use_sm12x_scoring():
+        with nvtx_range("indexer_topk_prefill_sm12x_logits"):
+            logits = indexer_mqa_logits_sm12x(
+                q_values.contiguous().view(torch.int8),
+                q_scales.contiguous(),
+                k_values.contiguous(),
+                k_scales.contiguous(),
+                weights.contiguous(),
+                cu_start,
+                cu_end,
+                max_len,
+                head_dim=q_values.shape[-1] * 2,
+            )
+    else:
+        with nvtx_range("indexer_topk_prefill_deepgemm_logits"):
+            logits = deep_gemm.fp8_fp4_mqa_logits(
+                q=(q_values.contiguous().view(torch.int8), q_scales.contiguous()),
+                kv=(k_values.contiguous(), k_scales.contiguous()),
+                weights=weights.contiguous(),
+                cu_seq_len_k_start=cu_start,
+                cu_seq_len_k_end=cu_end,
+                clean_logits=False,
+                max_seqlen_k=max_len,
+                logits_dtype=torch.float32,
+            )
 
     with nvtx_range("indexer_topk_prefill_select"):
+        # The prefill top-k op is torch.ops.trtllm.indexer_topk_prefill, which has
+        # no consumer-Blackwell binary (cudaErrorNoKernelImageForDevice). The logits
+        # are already compact (0-based per row with row_lens), so on sm12x disable the
+        # prefill op and reuse the decode path's persistent_topk (sm120a) by threading
+        # its workspace through (see persistent_topk_workspace below). The no-workspace
+        # fallback (fast_topk_v2) is unusable here: it returns all -1 for these shapes.
+        prefill_topk_op = use_prefill_topk_op and (
+            not _deepseek_v4_indexer_use_sm12x_scoring()
+        )
         return (
             _deepseek_v4_indexer_topk_from_logits(
                 logits,
                 row_lens,
                 topk_tokens,
-                use_prefill_topk_op=use_prefill_topk_op,
+                use_prefill_topk_op=prefill_topk_op,
+                persistent_topk_workspace=persistent_topk_workspace,
             ),
             gathered_k,
         )
@@ -1687,6 +1735,7 @@ def _deepseek_v4_sparse_attn_indexer_native(
                     use_prefill_topk_op=True,
                     gathered_k=reuse_k,
                     gather_workspace=gather_workspace,
+                    persistent_topk_workspace=persistent_topk_workspace,
                 )
                 if next_gathered_k is not None:
                     gather_cache_key = key
