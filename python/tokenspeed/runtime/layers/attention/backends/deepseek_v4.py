@@ -27,6 +27,9 @@ from tokenspeed_kernel.ops.attention.flashinfer.sparse_mla_sm120 import (
     sparse_mla_sm120_available,
     sparse_mla_sm120_decode,
 )
+from tokenspeed_kernel.ops.attention.sparse_mla_prefill_sm12x import (
+    sparse_mla_prefill_sm12x,
+)
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_indexer_decode_metadata_compute,
 )
@@ -65,6 +68,21 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 DEEPSEEK_V4_DEFAULT_PREFILL_CHUNK_SIZE = 4
+
+
+@functools.cache
+def _use_sparse_mla_prefill_sm12x() -> bool:
+    """Whether to use the portable MLA sparse-prefill fallback (consumer Blackwell).
+
+    FlashMLA's ``sparse_prefill_fwd`` is sm90a/sm100f-only and raises on
+    consumer Blackwell (sm_120/sm_121, major 12); use the torch fallback there.
+
+    Returns:
+        True iff running on consumer Blackwell.
+    """
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability()[0] == 12
 
 
 @functools.cache
@@ -1472,7 +1490,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         metadata = self.forward_metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 prefill requires forward metadata")
-        if flash_mla_sparse_fwd is error_fn:
+        if flash_mla_sparse_fwd is error_fn and not _use_sparse_mla_prefill_sm12x():
             raise RuntimeError(
                 "DeepSeek V4 prefill requires FlashMLA sparse attention. "
                 "Build/install `tokenspeed-kernel/python` with FlashMLA."
@@ -1498,15 +1516,31 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 head_dim=head_dim,
                 topk_indices=topk_indices,
             )
-        with nvtx_range(f"attn_{kind}_prefill_flashmla"):
-            out, _, _ = flash_mla_sparse_fwd(
-                q=q_padded,
-                kv=kv_workspace.view(-1, 1, head_dim),
-                indices=indices.unsqueeze(1),
-                sm_scale=softmax_scale,
-                attn_sink=attn_sink,
-                topk_length=lens,
-            )
+        kv_sparse = kv_workspace.view(-1, 1, head_dim)
+        indices_sparse = indices.unsqueeze(1)
+        if _use_sparse_mla_prefill_sm12x():
+            # Consumer Blackwell: FlashMLA sparse_prefill_fwd is sm90a/sm100f
+            # only; use the portable MLA sparse-prefill fallback (d_v defaults
+            # to 512 == the latent value subset, as in the FlashMLA path).
+            with nvtx_range(f"attn_{kind}_prefill_sm12x"):
+                out, _, _ = sparse_mla_prefill_sm12x(
+                    q_padded,
+                    kv_sparse,
+                    indices_sparse,
+                    softmax_scale,
+                    attn_sink=attn_sink,
+                    topk_length=lens,
+                )
+        else:
+            with nvtx_range(f"attn_{kind}_prefill_flashmla"):
+                out, _, _ = flash_mla_sparse_fwd(
+                    q=q_padded,
+                    kv=kv_sparse,
+                    indices=indices_sparse,
+                    sm_scale=softmax_scale,
+                    attn_sink=attn_sink,
+                    topk_length=lens,
+                )
         return out[:, :num_local_heads]
 
     def forward_deepseek_v4_prefill(
