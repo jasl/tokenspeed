@@ -112,6 +112,12 @@ def _indexer_mqa_logits_kernel(
     row_len = tl.maximum(ke - ks, 0)
 
     n_rel = nb * BLOCK_N + tl.arange(0, BLOCK_N)  # 0-based output columns
+    # Whole tile is past this row's window: write -inf and skip the dequant+dot.
+    # (Decode captures an over-sized grid, so most tiles are empty at short ctx.)
+    if nb * BLOCK_N >= row_len:
+        neg = tl.full((BLOCK_N,), float("-inf"), tl.float32)
+        tl.store(out_ptr + m_off * stride_o_m + n_rel, neg, mask=n_rel < max_seqlen_k)
+        return
     valid_n = (n_rel < row_len) & (n_rel < max_seqlen_k)
     k_idx = ks + n_rel  # actual kv row in [0, num_kv), valid only where valid_n
 
@@ -280,6 +286,13 @@ def _indexer_mqa_logits_paged_kernel(
 
     ctx_len = tl.load(context_lens_ptr + t)
     j = nb * BLOCK_N + tl.arange(0, BLOCK_N)  # KV positions for this token
+    # Whole tile is past this token's context: write -inf and skip dequant+dot.
+    # The decode cudagraph captures an over-sized grid; at short context most
+    # tiles are empty, so this early-out is the dominant decode speedup.
+    if nb * BLOCK_N >= ctx_len:
+        neg = tl.full((BLOCK_N,), float("-inf"), tl.float32)
+        tl.store(out_ptr + t_off * stride_o_m + j, neg, mask=j < max_context_len)
+        return
     valid = (j < ctx_len) & (j < max_context_len)
 
     # Paged location: page = block_table[t, j // CACHE_BLOCK_SIZE], slot = j % size.
