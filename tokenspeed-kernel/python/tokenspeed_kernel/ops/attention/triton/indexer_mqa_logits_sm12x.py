@@ -243,3 +243,190 @@ def indexer_mqa_logits_sm12x_triton(
         INPUT_PRECISION=input_precision,
     )
     return out
+
+
+@triton.jit
+def _indexer_mqa_logits_paged_kernel(
+    q_values_ptr,  # int8  [num_tokens, H, VALUE_BYTES]
+    q_scales_ptr,  # int32 [num_tokens, H]
+    cache_ptr,  # int8  [num_pages, CACHE_BLOCK_SIZE * ROW_BYTES]; per slot the
+    #             head_dim is block-interleaved: [16 value bytes | 1 scale byte]
+    #             per 32-dim block, ROW_BYTES = SCALE_BLOCKS * BLOCK_BYTES.
+    block_table_ptr,  # int32 [num_tokens, max_blocks]
+    context_lens_ptr,  # int32 [num_tokens]
+    weights_ptr,  # fp32  [num_tokens, H]
+    out_ptr,  # fp32  [num_tokens, max_context_len]
+    max_context_len,
+    stride_qv_m,
+    stride_qv_h,
+    stride_qs_m,
+    stride_cache_page,
+    stride_bt_m,
+    stride_w_m,
+    stride_o_m,
+    H: tl.constexpr,
+    VALUE_BYTES: tl.constexpr,  # head_dim // 2
+    SCALE_BLOCKS: tl.constexpr,  # head_dim // 32
+    BYTES_PER_BLOCK: tl.constexpr,  # value bytes per block = 32 // 2 = 16
+    ROW_BYTES: tl.constexpr,  # bytes per slot = SCALE_BLOCKS * (BYTES_PER_BLOCK + 1)
+    BLOCK_BYTES: tl.constexpr,  # BYTES_PER_BLOCK + 1 (value + 1 e8m0 scale byte)
+    CACHE_BLOCK_SIZE: tl.constexpr,  # slots per page
+    BLOCK_N: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr,
+):
+    t = tl.program_id(0)
+    nb = tl.program_id(1)
+    t_off = t.to(tl.int64)
+
+    ctx_len = tl.load(context_lens_ptr + t)
+    j = nb * BLOCK_N + tl.arange(0, BLOCK_N)  # KV positions for this token
+    valid = (j < ctx_len) & (j < max_context_len)
+
+    # Paged location: page = block_table[t, j // CACHE_BLOCK_SIZE], slot = j % size.
+    blk_idx = j // CACHE_BLOCK_SIZE
+    slot = j % CACHE_BLOCK_SIZE
+    page = tl.load(block_table_ptr + t * stride_bt_m + blk_idx, mask=valid, other=0)
+    slot_off = page.to(tl.int64) * stride_cache_page + slot.to(tl.int64) * ROW_BYTES
+
+    hd = tl.arange(0, H)
+    db = tl.arange(0, VALUE_BYTES)
+    blk = db // BYTES_PER_BLOCK  # value-byte -> 32-dim block index
+
+    # ---- dequant q[t]: [H, VALUE_BYTES] (identical to the contiguous kernel) ----
+    q_ptr = q_values_ptr + t_off * stride_qv_m + hd[:, None] * stride_qv_h + db[None, :]
+    q_b = tl.load(q_ptr).to(tl.int32) & 0xFF
+    q_lo = _e2m1_decode(q_b & 0xF)
+    q_hi = _e2m1_decode((q_b >> 4) & 0xF)
+    q_sc = tl.load(q_scales_ptr + t_off * stride_qs_m + hd)
+    q_scale = tl.zeros((H, VALUE_BYTES), dtype=tl.float32)
+    for b in tl.static_range(SCALE_BLOCKS):
+        sval = _block_scale(q_sc, b)
+        q_scale = tl.where(blk[None, :] == b, sval[:, None], q_scale)
+    q_lo = q_lo * q_scale
+    q_hi = q_hi * q_scale
+
+    # ---- dequant paged k: [VALUE_BYTES, BLOCK_N], block-interleaved slot ----
+    # value byte db lives at slot_off + (db // 16) * BLOCK_BYTES + (db % 16).
+    k_byte_off = (db // BYTES_PER_BLOCK) * BLOCK_BYTES + (db % BYTES_PER_BLOCK)
+    k_ptr = cache_ptr + slot_off[None, :] + k_byte_off[:, None]
+    k_b = tl.load(k_ptr, mask=valid[None, :], other=0).to(tl.int32) & 0xFF
+    k_lo = _e2m1_decode(k_b & 0xF)
+    k_hi = _e2m1_decode((k_b >> 4) & 0xF)
+    # scale byte for block b lives at slot_off + b * BLOCK_BYTES + BYTES_PER_BLOCK.
+    k_scale = tl.zeros((VALUE_BYTES, BLOCK_N), dtype=tl.float32)
+    for b in tl.static_range(SCALE_BLOCKS):
+        sb = tl.load(
+            cache_ptr + slot_off + (b * BLOCK_BYTES + BYTES_PER_BLOCK),
+            mask=valid,
+            other=0,
+        )
+        sval = tl.exp2((sb.to(tl.int32) & 0xFF).to(tl.float32) - 127.0)  # [BLOCK_N]
+        k_scale = tl.where(blk[:, None] == b, sval[None, :], k_scale)
+    k_lo = k_lo * k_scale
+    k_hi = k_hi * k_scale
+
+    scores = tl.dot(q_lo, k_lo, input_precision=INPUT_PRECISION)
+    scores += tl.dot(q_hi, k_hi, input_precision=INPUT_PRECISION)  # [H, BLOCK_N]
+
+    w = tl.load(weights_ptr + t_off * stride_w_m + hd).to(tl.float32)
+    logits = tl.sum(tl.maximum(scores, 0.0) * w[:, None], axis=0)  # [BLOCK_N]
+
+    out_val = tl.where(j < ctx_len, logits, float("-inf"))
+    tl.store(out_ptr + t_off * stride_o_m + j, out_val, mask=j < max_context_len)
+
+
+def indexer_mqa_logits_paged_sm12x_triton(
+    q_values: torch.Tensor,
+    q_scales: torch.Tensor,
+    cache_2d: torch.Tensor,
+    block_table: torch.Tensor,
+    context_lens: torch.Tensor,
+    weights: torch.Tensor,
+    cache_block_size: int,
+    max_context_len: int,
+    head_dim: int = 128,
+    block_n: int = 128,
+    input_precision: str = "ieee",
+) -> torch.Tensor:
+    """Paged DeepSeek-V4 indexer MQA-logits (Triton), drop-in for the decode
+    ``fp8_fp4_paged_mqa_logits``.
+
+    The KV is read straight from the paged MXFP4 indexer cache (no gather): each
+    query token ``t`` scores its ``context_lens[t]`` keys, gathered from
+    ``cache_2d`` via ``block_table[t]``. The per-slot head_dim is block-interleaved
+    (``[16 value bytes | 1 e8m0 scale byte]`` per 32-dim block).
+
+    Args:
+        q_values: Packed fp4 query, ``[num_tokens, num_heads, head_dim // 2]`` int8.
+        q_scales: int32-packed e8m0 q scales, ``[num_tokens, num_heads]``.
+        cache_2d: Paged MXFP4 indexer cache, ``[num_pages, cache_block_size * row_bytes]`` int8.
+        block_table: Per-token page table, ``[num_tokens, max_blocks]`` int32.
+        context_lens: Per-token KV length, ``[num_tokens]`` int32.
+        weights: Per-head indexer weights, ``[num_tokens, num_heads]`` (cast to fp32).
+        cache_block_size: Slots per page.
+        max_context_len: Width of the output logits.
+        head_dim: Indexer per-head dim (128 for DeepSeek-V4).
+        block_n: KV tile width.
+        input_precision: ``tl.dot`` precision (``"ieee"`` default).
+
+    Returns:
+        Logits ``[num_tokens, max_context_len]`` fp32: ``out[t, 0:context_lens[t]]``
+        are the scores; columns >= context_lens[t] are -inf.
+    """
+    num_tokens, num_heads, value_bytes = q_values.shape
+    device = q_values.device
+    out = torch.full(
+        (num_tokens, max_context_len), float("-inf"), dtype=torch.float32, device=device
+    )
+    if num_tokens == 0 or max_context_len <= 0:
+        return out
+    if value_bytes != head_dim // 2:
+        raise ValueError(
+            f"q_values last dim {value_bytes} != head_dim//2 {head_dim // 2}"
+        )
+
+    row_bytes = cache_2d.shape[1] // cache_block_size
+    scale_blocks = head_dim // _MXFP4_BLOCK
+    bytes_per_block = _MXFP4_BLOCK // 2  # 16
+    block_bytes = bytes_per_block + 1  # 16 value + 1 e8m0 scale
+    if row_bytes != scale_blocks * block_bytes:
+        raise ValueError(
+            f"cache row_bytes {row_bytes} != {scale_blocks * block_bytes} "
+            f"(expected block-interleaved [16 value | 1 scale] x {scale_blocks})"
+        )
+
+    q_values = q_values.contiguous()
+    q_scales = q_scales.contiguous()
+    cache_2d = cache_2d.contiguous()
+    block_table = block_table.contiguous()
+    context_lens = context_lens.contiguous()
+    weights = weights.contiguous()
+
+    grid = (num_tokens, triton.cdiv(max_context_len, block_n))
+    _indexer_mqa_logits_paged_kernel[grid](
+        q_values,
+        q_scales,
+        cache_2d,
+        block_table,
+        context_lens,
+        weights,
+        out,
+        max_context_len,
+        q_values.stride(0),
+        q_values.stride(1),
+        q_scales.stride(0),
+        cache_2d.stride(0),
+        block_table.stride(0),
+        weights.stride(0),
+        out.stride(0),
+        H=num_heads,
+        VALUE_BYTES=value_bytes,
+        SCALE_BLOCKS=scale_blocks,
+        BYTES_PER_BLOCK=bytes_per_block,
+        ROW_BYTES=row_bytes,
+        BLOCK_BYTES=block_bytes,
+        CACHE_BLOCK_SIZE=cache_block_size,
+        BLOCK_N=block_n,
+        INPUT_PRECISION=input_precision,
+    )
+    return out
