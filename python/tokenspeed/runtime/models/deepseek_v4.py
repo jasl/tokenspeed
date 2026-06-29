@@ -109,6 +109,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
 from tokenspeed.runtime.layers.deepseek_v4_mhc import mhc_fused_hc as fast_mhc_fused_hc
 from tokenspeed.runtime.layers.deepseek_v4_mhc import mhc_post as fast_mhc_post
 from tokenspeed.runtime.layers.deepseek_v4_mhc import mhc_pre as fast_mhc_pre
+from tokenspeed.runtime.layers.deepseek_v4_o_proj_sm12x import (
+    deepseek_v4_o_proj_einsum,
+)
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -517,9 +520,35 @@ def pack_topk_as_router_logits(
     return router_logits
 
 
+_DEEPGEMM_INDEXER_ARCH_OK: bool | None = None
+
+
+def _deepgemm_indexer_arch_supported() -> bool:
+    # deep_gemm's fp8_fp4_mqa_logits / fp8_fp4_paged_mqa_logits indexer kernels
+    # are datacenter-Blackwell-only (major 10); they assert "Unsupported
+    # architecture" on consumer Blackwell (sm_120/sm_121) and Thor. Those archs
+    # use the compiled-CUDA persistent_topk / indexer_topk_prefill fallback.
+    # Consumer Blackwell (sm_120/sm_121) gains a deep_gemm fp4 indexer ONLY via
+    # the deep_gemm nv_dev branch (not the shipped release). Opt in with
+    # TOKENSPEED_INDEXER_DEEPGEMM_SM120=1 for the A/B baseline against the Triton
+    # scorer; default off so the shipped sm120 path stays the Triton scorer.
+    global _DEEPGEMM_INDEXER_ARCH_OK
+    if _DEEPGEMM_INDEXER_ARCH_OK is None:
+        try:
+            cap0 = torch.cuda.get_device_capability()[0]
+            _DEEPGEMM_INDEXER_ARCH_OK = cap0 == 10 or (
+                cap0 == 12
+                and os.environ.get("TOKENSPEED_INDEXER_DEEPGEMM_SM120") == "1"
+            )
+        except Exception:
+            _DEEPGEMM_INDEXER_ARCH_OK = False
+    return _DEEPGEMM_INDEXER_ARCH_OK
+
+
 def _deepseek_v4_deepgemm_fp4_indexer_available(index_q: torch.Tensor) -> bool:
     return (
         deep_gemm is not None
+        and _deepgemm_indexer_arch_supported()
         and index_q.is_cuda
         and index_q.dim() >= 3
         and index_q.shape[-2] in (32, 64)
@@ -3429,9 +3458,11 @@ class DeepseekV4Attention(nn.Module):
         )
         self.wo_a.is_bmm = True
         self.wo_a.bmm_batch_size = self.num_local_groups
-        # SM100 packs the FP8 output-proj scales as INT32 UE8M0 (fp8_einsum
-        # recipe (1,1,128)); SM90 keeps FP32 block scales (recipe (1,128,128)).
-        self._o_tma_aligned = torch.cuda.get_device_capability()[0] >= 10
+        # Datacenter Blackwell (major 10) packs the FP8 output-proj scales as
+        # INT32 UE8M0 (deep_gemm recipe (1,1,128)); consumer Blackwell
+        # (sm_120/sm_121) and Thor keep FP32 block scales (recipe (1,128,128))
+        # for the triton o_proj einsum (deepseek_v4_o_proj_sm12x).
+        self._o_tma_aligned = torch.cuda.get_device_capability()[0] == 10
         self.wo_b = RowParallelLinear(
             self.o_groups * self.o_lora_rank,
             config.hidden_size,
@@ -3555,12 +3586,14 @@ class DeepseekV4Attention(nn.Module):
             device=attn_output.device,
             dtype=torch.bfloat16,
         )
-        deep_gemm.fp8_einsum(
-            "bhr,hdr->bhd",
-            (o_fp8, o_scale),
-            (weight, self.wo_a.weight_scale_inv),
+        deepseek_v4_o_proj_einsum(
+            o_fp8,
+            o_scale,
+            weight,
+            self.wo_a.weight_scale_inv,
             z,
-            recipe=recipe,
+            recipe,
+            deep_gemm,
         )
         out, _ = self.wo_b(z.flatten(1))
         return out
@@ -4206,7 +4239,12 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
     def _warmup_prefill_jit(self) -> None:
         if deep_gemm is None:
             return
-        if torch.cuda.get_device_capability()[0] < 10:
+        if torch.cuda.get_device_capability()[0] != 10:
+            # The DSv4 prefill deep_gemm kernels (tf32_hc_prenorm_gemm,
+            # fp8_fp4_mqa_logits, ...) are datacenter-Blackwell-only. Consumer
+            # Blackwell (sm_120/121), Thor and Hopper run the mHC torch fallback
+            # + the compiled-CUDA indexer (persistent_topk / indexer_topk_prefill),
+            # which JIT/load on first use -- no deep_gemm prefill warmup needed.
             return
         config = self.config
         tp_size = self.mapping.attn.tp_size if self.mapping else 1

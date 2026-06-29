@@ -15,11 +15,17 @@ from __future__ import annotations
 
 from typing import Optional
 
+import functools
+
 import torch
 from tokenspeed_kernel.ops.attention.flash_mla import (
     flash_mla_sparse_fwd,
     flash_mla_with_kvcache,
     get_mla_metadata,
+)
+from tokenspeed_kernel.ops.attention.flashinfer.sparse_mla_sm120 import (
+    sparse_mla_sm120_available,
+    sparse_mla_sm120_decode,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_indexer_decode_metadata_compute,
@@ -59,6 +65,26 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 DEEPSEEK_V4_DEFAULT_PREFILL_CHUNK_SIZE = 4
+
+
+@functools.cache
+def _use_flashinfer_sparse_mla_sm120() -> bool:
+    """Whether to route DeepSeek-V4 sparse-MLA through FlashInfer's SM120 kernel.
+
+    Consumer Blackwell (sm_120/sm_121, major 12) has no FlashMLA sparse-MLA
+    kernel -- ``sparse_decode_fwd``/``sparse_fwd`` raise "Unsupported
+    architecture". FlashInfer's official packed SM120 kernel is used instead when
+    importable. Cached: the capability + import probe runs once.
+
+    Returns:
+        True iff running on consumer Blackwell with the FlashInfer SM120 packed
+        sparse-MLA runner available.
+    """
+    if not torch.cuda.is_available():
+        return False
+    if torch.cuda.get_device_capability()[0] != 12:
+        return False
+    return sparse_mla_sm120_available()
 
 
 def _compressed_block_table_base_offsets(
@@ -997,7 +1023,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 f"metadata_tokens={metadata.token_to_req_indices.numel()}, "
                 f"q_tokens={q.shape[0]}"
             )
-        if flash_mla_with_kvcache is error_fn:
+        if flash_mla_with_kvcache is error_fn and not _use_flashinfer_sparse_mla_sm120():
             raise RuntimeError(
                 "DeepSeek V4 decode requires FlashMLA latent attention. "
                 "Build/install `tokenspeed-kernel/python` with FlashMLA."
@@ -1048,25 +1074,42 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 compressed_block_size,
             )
 
-        out, _ = flash_mla_with_kvcache(
-            q=q_padded.unsqueeze(1),
-            k_cache=swa_cache,
-            block_table=None,
-            cache_seqlens=None,
-            head_dim_v=head_dim,
-            tile_scheduler_metadata=self._get_decode_tile_metadata(
-                kind,
-                q_padded.shape[0],
-            ),
-            softmax_scale=softmax_scale,
-            is_fp8_kvcache=True,
-            indices=swa_indices.unsqueeze(1),
-            attn_sink=attn_sink,
-            extra_k_cache=compressed_cache,
-            extra_indices_in_kvcache=extra_indices,
-            topk_length=swa_lens,
-            extra_topk_length=extra_lens,
-        )
+        if _use_flashinfer_sparse_mla_sm120():
+            # Consumer Blackwell: the FlashMLA wheel has no sm120 sparse-decode
+            # kernel; drive FlashInfer's official SM120 packed sparse-MLA decode
+            # (same packed fp8_ds_mla cache + top-k indices).
+            out = sparse_mla_sm120_decode(
+                q_padded.unsqueeze(1),
+                swa_cache,
+                swa_indices,
+                softmax_scale,
+                head_dim_v=head_dim,
+                attn_sink=attn_sink,
+                extra_k_cache=compressed_cache,
+                extra_indices=extra_indices,
+                topk_length=swa_lens,
+                extra_topk_length=extra_lens,
+            )
+        else:
+            out, _ = flash_mla_with_kvcache(
+                q=q_padded.unsqueeze(1),
+                k_cache=swa_cache,
+                block_table=None,
+                cache_seqlens=None,
+                head_dim_v=head_dim,
+                tile_scheduler_metadata=self._get_decode_tile_metadata(
+                    kind,
+                    q_padded.shape[0],
+                ),
+                softmax_scale=softmax_scale,
+                is_fp8_kvcache=True,
+                indices=swa_indices.unsqueeze(1),
+                attn_sink=attn_sink,
+                extra_k_cache=compressed_cache,
+                extra_indices_in_kvcache=extra_indices,
+                topk_length=swa_lens,
+                extra_topk_length=extra_lens,
+            )
         if out.dim() == 4:
             out = out.squeeze(1)
         return out[:, :num_local_heads]

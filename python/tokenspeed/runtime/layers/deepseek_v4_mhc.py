@@ -19,6 +19,23 @@ except Exception:
 
 
 @cache
+def _hc_prenorm_needs_fallback() -> bool:
+    """Whether to use the portable torch fallback for the mHC prenorm GEMM.
+
+    ``deep_gemm.tf32_hc_prenorm_gemm`` is datacenter-Blackwell-only (major 10);
+    it asserts "Unsupported architecture" on consumer Blackwell (sm_120/sm_121),
+    Thor (sm_110) and Hopper. Those archs use the fp32 torch fallback in
+    :func:`mhc_pre` instead.
+    """
+    if deep_gemm is None:
+        return True
+    try:
+        return torch.cuda.get_device_capability(0)[0] != 10
+    except Exception:
+        return True
+
+
+@cache
 def _compute_num_split(block_k: int, k: int | None, grid_size: int) -> int:
     device_props = torch.cuda.get_device_properties(0)
     split_k = device_props.multi_processor_count // grid_size
@@ -348,8 +365,7 @@ def mhc_pre(
     if not residual.is_cuda:
         raise RuntimeError("fast mHC requires CUDA tensors")
 
-    if deep_gemm is None:
-        raise RuntimeError("deep_gemm.tf32_hc_prenorm_gemm is unavailable")
+    use_fallback = _hc_prenorm_needs_fallback()
 
     hc_mult = residual.shape[-2]
     hidden_size = residual.shape[-1]
@@ -380,8 +396,10 @@ def mhc_pre(
 
     block_k = 64
     block_m = 64
-    n_splits = _compute_num_split(
-        block_k, hc_hidden_size, ceil_div(num_tokens, block_m)
+    n_splits = (
+        1
+        if use_fallback
+        else _compute_num_split(block_k, hc_hidden_size, ceil_div(num_tokens, block_m))
     )
 
     post_mix = torch.empty(
@@ -403,13 +421,24 @@ def mhc_pre(
         n_splits, num_tokens, dtype=torch.float32, device=residual.device
     )
 
-    deep_gemm.tf32_hc_prenorm_gemm(
-        residual_flat.view(num_tokens, hc_hidden_size),
-        fn,
-        gemm_out_mul,
-        gemm_out_sqrsum,
-        n_splits,
-    )
+    if use_fallback:
+        # Portable fp32 equivalent of deep_gemm.tf32_hc_prenorm_gemm for archs
+        # without the datacenter kernel (consumer Blackwell sm_120/121, Thor,
+        # Hopper): the fused split-K (residual @ fn.T) + per-row sum-of-squares.
+        # n_splits == 1, so the single full reduction is exact (the mix kernel
+        # sums over splits). fn is the prenorm weight [hc_mult3, hc_hidden_size];
+        # gemm_out_sqrsum feeds the pre-RMSNorm.
+        r2d = residual_flat.reshape(num_tokens, hc_hidden_size).to(torch.float32)
+        torch.mm(r2d, fn.t(), out=gemm_out_mul[0])
+        torch.sum(r2d * r2d, dim=1, out=gemm_out_sqrsum[0])
+    else:
+        deep_gemm.tf32_hc_prenorm_gemm(
+            residual_flat.view(num_tokens, hc_hidden_size),
+            fn,
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            n_splits,
+        )
     block_h = 1024
     block_comb = triton.next_power_of_2(hc_mult2)
     _mhc_pre_mix_triton_kernel[(num_tokens,)](

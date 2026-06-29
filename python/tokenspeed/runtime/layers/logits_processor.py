@@ -284,6 +284,14 @@ class LogitsProcessor(nn.Module):
         if not current_platform().is_nvidia:
             return None
 
+        # The triton all-gather uses multimem.st / multimem.ld_reduce, which need
+        # NVLink multicast (NVLS). On boxes with symmetric-memory P2P but no full
+        # NVLink (e.g. PCIe-only multi-GPU), the multicast pointer is invalid and
+        # the kernel issues an illegal memory access; fall back to the standard
+        # (non-multimem) all-gather there.
+        if "comms:nvlink_full" not in current_platform().runtime_features:
+            return None
+
         if self.tp_size == 1 or self.skip_all_gather:
             return None
 
@@ -303,6 +311,11 @@ class LogitsProcessor(nn.Module):
 
     def _init_dist_argmax_state(self, lm_head: VocabParallelEmbedding):
         if not current_platform().is_nvidia:
+            return None
+
+        # Distributed argmax also relies on NVLink-multicast symmetric memory;
+        # require full NVLink or fall back to the gather-then-argmax path.
+        if "comms:nvlink_full" not in current_platform().runtime_features:
             return None
 
         if self.tp_size == 1 or self.skip_all_gather or self.dp_sampling_enabled:

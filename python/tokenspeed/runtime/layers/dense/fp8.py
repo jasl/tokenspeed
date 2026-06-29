@@ -61,6 +61,15 @@ from tokenspeed.runtime.layers.quantization.utils import convert_to_channelwise
 platform = Platform.get()
 
 
+def _deepgemm_fp8_dense_supported() -> bool:
+    # deep_gemm's fp8 block-scale GEMM and its UE8M0 scale-layout transform
+    # (transform_sf_into_required_layout) are datacenter-Blackwell-only; on
+    # consumer Blackwell (sm_120/sm_121) and Thor they assert ("Unknown SF
+    # transformation"). Those archs use the triton fp8 blockscale GEMM for dense
+    # layers and the triton o_proj einsum (deepseek_v4_o_proj_sm12x).
+    return platform.is_datacenter_blackwell
+
+
 class Fp8LinearMethod(LinearMethodBase):
     """Linear method for FP8.
     Supports loading FP8 checkpoints with static weight scale and
@@ -209,7 +218,12 @@ class Fp8LinearMethod(LinearMethodBase):
             layer._use_deep_gemm_fp8 = False
             is_bmm = getattr(layer, "is_bmm", False)
             is_ue8m0 = getattr(self.quant_config, "scale_fmt", None) == "ue8m0"
-            if _transform_sf is not None and _ceil_to_ue8m0 is not None and is_ue8m0:
+            if (
+                _transform_sf is not None
+                and _ceil_to_ue8m0 is not None
+                and is_ue8m0
+                and _deepgemm_fp8_dense_supported()
+            ):
                 N, K = layer.weight.shape
                 block_n, block_k = self.quant_config.weight_block_size
                 if is_bmm:
@@ -247,16 +261,23 @@ class Fp8LinearMethod(LinearMethodBase):
                     )
                     layer._use_deep_gemm_fp8 = True
             if is_bmm and not layer._use_deep_gemm_fp8:
-                # The is_bmm runtime path (DeepSeek-V4 o_proj) has no FP32
-                # fallback, so fail fast at load with a clear message instead of
-                # a cryptic AttributeError on the first forward.
-                raise RuntimeError(
-                    "is_bmm weight requires the deep_gemm FP8 block-scale path "
-                    "but it could not be prepared (deep_gemm_available="
-                    f"{_transform_sf is not None}, ue8m0={is_ue8m0}, "
-                    f"weight={tuple(layer.weight.shape)}); ensure FP8 block-quant "
-                    "ue8m0 weights with block-aligned dims and deep_gemm installed."
-                )
+                if _deepgemm_fp8_dense_supported():
+                    # The is_bmm runtime path (DeepSeek-V4 o_proj) has no FP32
+                    # fallback on datacenter Blackwell; fail fast at load.
+                    raise RuntimeError(
+                        "is_bmm weight requires the deep_gemm FP8 block-scale "
+                        "path but it could not be prepared (deep_gemm_available="
+                        f"{_transform_sf is not None}, ue8m0={is_ue8m0}, "
+                        f"weight={tuple(layer.weight.shape)}); ensure FP8 "
+                        "block-quant ue8m0 weights with block-aligned dims and "
+                        "deep_gemm installed."
+                    )
+                # Consumer Blackwell / Thor: keep the on-disk FP32 block-[bn,bk]
+                # scales (no deep_gemm SF transform) and run the o_proj einsum via
+                # the triton kernel (deepseek_v4_o_proj_sm12x). Record the block
+                # size so the runtime recipe resolves to (1, block_n, block_k).
+                block_n, block_k = self.quant_config.weight_block_size
+                layer._deep_gemm_block_size = [block_n, block_k]
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 

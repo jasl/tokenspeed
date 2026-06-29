@@ -69,6 +69,29 @@ from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
 
 platform = current_platform()
 
+# Consumer Blackwell (sm_120/sm_121) has FP4 tensor cores and basic TMA but NOT
+# the `.tile::gather4`/`.tile::scatter4` TMA tile gather/scatter — that is a
+# datacenter-Blackwell (sm_100/sm_103) feature and ptxas aborts on sm_120a.
+# triton_kernels' `has_tma_gather()` only tests `cuda_capability >= (10, 0)`, which
+# wrongly includes sm12x, so the mxfp4 MoE matmul emits an unsupported gather/
+# scatter epilogue. Report no TMA gather on consumer Blackwell so the (still
+# persistent, still native-FP4) matmul falls back to indexed gather/scatter.
+import triton_kernels.target_info as _tk_target_info  # noqa: E402
+
+_tk_orig_has_tma_gather = _tk_target_info.has_tma_gather
+
+
+def _has_tma_gather_consumer_safe() -> bool:
+    if current_platform().is_consumer_blackwell:
+        return False
+    return _tk_orig_has_tma_gather()
+
+
+if getattr(_tk_target_info.has_tma_gather, "__name__", "") != (
+    "_has_tma_gather_consumer_safe"
+):
+    _tk_target_info.has_tma_gather = _has_tma_gather_consumer_safe
+
 MXFP4_BLOCK = 32
 MXFP4_ACTIVATION_SCALE_LAYOUT = "linear"
 
@@ -159,14 +182,25 @@ def _routing(
         dtype = logits.dtype
 
     assert logits.ndim == 2, "router_logits must be (n_tokens, n_expts_tot)"
-    n_tokens, _ = logits.shape
+    n_tokens, n_expts_tot = logits.shape
 
     assert sm_first is False, "sm_first=True not supported for triton_kernels routing"
-    sparse = topk(logits, n_expts_act, apply_softmax=not sm_first)
+    # triton_kernels' fused topk AND its bitmatrix-metadata kernel hard-require a
+    # power-of-2 selection width (tl.arange/tl.topk/tl.sort over k, and tl.sort
+    # over 32*k inside make_bitmatrix_metadata). DeepSeek-V4 routes top-6, so pad
+    # the selection width up to the next power of two. This is exact for the
+    # DeepSeek-V4 path because the router logits are packed log-weights (-1e20 at
+    # every non-selected expert, log(w_i) at the selected experts whose weights
+    # already sum to 1): softmax over the padded top-k recovers each real expert's
+    # weight w_i and assigns every pad slot exp(-1e20) == 0, so the padded experts
+    # are inert and no renormalization is needed. No-op when k is already a power
+    # of two (e.g. gpt-oss top-4).
+    k_eff = min(1 << (n_expts_act - 1).bit_length(), n_expts_tot)
+    sparse = topk(logits, k_eff, apply_softmax=not sm_first)
     mask_metadata = sparse.mask_metadata
 
     col_sorted = mask_metadata.col_sorted_indx
-    gather_indx = col_sorted // n_expts_act
+    gather_indx = col_sorted // k_eff
     scatter_indx = col_sorted
 
     vals_flat = sparse.vals.reshape(-1)
@@ -174,7 +208,7 @@ def _routing(
         vals_flat = vals_flat.to(dtype)
     gate_scal = vals_flat[scatter_indx]
 
-    n_total_rows = n_tokens * n_expts_act
+    n_total_rows = n_tokens * k_eff
     ragged_metadata = make_ragged_tensor_metadata(mask_metadata.col_sum, n_total_rows)
 
     return ragged_metadata, gather_indx, scatter_indx, gate_scal
@@ -478,7 +512,15 @@ def triton_mxfp4_moe_apply(
     w2_pc = getattr(w, "w2_precision_config", None)
 
     act = None
-    if swiglu_arg is not None:
+    if swiglu_arg is not None and (
+        getattr(w, "w13_input_layout", "concatenated") == "interleaved"
+    ):
+        # The triton_kernels fused SwiGLU consumes interleaved [g,u,g,u,...]
+        # gate/up pairs and hardwires the gpt-oss form silu(alpha*gate)*(up+1)
+        # (and requires a numeric alpha). Only use it for that interleaved
+        # layout. Standard SwiGLU models (e.g. DeepSeek-V4: concatenated
+        # [gate|up], silu(gate)*up with no "(up+1)" and alpha=1.0) fall through
+        # to the unfused _silu_gate_up path below, which is byte-correct for them.
         act = FusedActivation(
             FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
             (swiglu_arg.alpha, swiglu_arg.limit),
@@ -534,5 +576,11 @@ def triton_mxfp4_moe_apply(
             gammas=gate_scal,
         )
     if top_k > 1:
-        return output.view(n_tokens, top_k, output.shape[-1]).sum(dim=1)
+        # _routing may pad the selection width to a power of two (e.g. top-6 -> 8)
+        # for the triton_kernels topk/bitmatrix kernels, so the scattered output
+        # carries that padded number of expert rows per token. Derive it from the
+        # output rather than top_k. Padded slots carry gate weight 0, so summing
+        # over the padded width is exact.
+        effective_top_k = output.shape[0] // n_tokens
+        return output.view(n_tokens, effective_top_k, output.shape[-1]).sum(dim=1)
     return output
