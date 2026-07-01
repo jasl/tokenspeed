@@ -171,7 +171,19 @@ def get_available_gpu_memory(
 
         if empty_cache:
             torch.cuda.empty_cache()
-        free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
+        if getattr(torch.cuda.get_device_properties(gpu_id), "is_integrated", 0):
+            # Unified memory (e.g. GB10/Grace): the CUDA allocator shares the
+            # host RAM pool, so torch.cuda.mem_get_info() free EXCLUDES the
+            # reclaimable host page cache (model checkpoint) -- it badly
+            # under-reports the real free memory and is per-node noisy, which
+            # zeros the KV cache budget and false-trips the TP balance check.
+            # Use host MemAvailable (free + reclaimable, which evicts under
+            # allocation pressure) instead.
+            import psutil
+
+            free_gpu_memory = psutil.virtual_memory().available
+        else:
+            free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
