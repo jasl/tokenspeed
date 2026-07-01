@@ -27,7 +27,11 @@ import tokenspeed_kernel
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
-from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -463,6 +467,39 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
         "supports_bias": frozenset({True}),
     },
     priority=Priority.PORTABLE,
+)
+@register_kernel(
+    "moe",
+    "apply",
+    name="triton_mxfp4_ep_swiglu_sm12x_moe_apply",
+    solution="triton",
+    weight_preprocessor=triton_mxfp4_moe_weights,
+    # Consumer-Blackwell (sm_120/sm_121) expert-parallel mxfp4 MoE. The shared
+    # impl below already handles the precomputed-topk EP path (_local_topk_for_ep)
+    # and swiglu; the existing EP registration was gated to AMD + silu-only, so
+    # NVIDIA EP found no kernel. Enables --enable-expert-parallel on sm12x (shards
+    # the 256 experts across nodes, matching vLLM) without deepep all-to-all.
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}),
+        min_arch_version=ArchVersion(12, 0),
+    ),
+    signatures=format_signatures(
+        "x",
+        "dense",
+        {torch.float16, torch.bfloat16},
+    ),
+    traits={
+        "weight_dtype": frozenset({"mxfp4"}),
+        "activation": frozenset({"silu", "swiglu"}),
+        "routing_mode": frozenset({"precomputed_topk"}),
+        "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({True}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "ispp_alignment": frozenset({1}),
+        "internal_activation_dtype": frozenset({"fp8", "input"}),
+        "supports_bias": frozenset({True}),
+    },
+    priority=Priority.SPECIALIZED + 1,
 )
 def triton_mxfp4_moe_apply(
     plan: dict,
