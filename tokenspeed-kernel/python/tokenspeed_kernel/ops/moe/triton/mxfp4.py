@@ -385,12 +385,13 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
 
     w.w13_weight_triton_tensor = w13_weight
     w.w2_weight_triton_tensor = w2_weight
-    # Free original weights (replaced by shuffled versions)
+    # Free original weights and scales (replaced by the swizzled versions;
+    # the matmul reads only PrecisionConfig.b_mx_scale). Keeping the raw
+    # scales alive costs ~100 MB/layer/rank -- ~4.4 GB/rank on DSv4-Flash.
     _release_parameter(w, "w13_weight")
     _release_parameter(w, "w2_weight")
-    if current_platform().is_amd:
-        _release_parameter(w, "w13_weight_scale")
-        _release_parameter(w, "w2_weight_scale")
+    _release_parameter(w, "w13_weight_scale")
+    _release_parameter(w, "w2_weight_scale")
     torch.cuda.empty_cache()
 
 
