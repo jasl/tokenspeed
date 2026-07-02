@@ -49,8 +49,18 @@ from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
     indexer_mxfp4_paged_gather,
     persistent_topk,
 )
+from tokenspeed_kernel.ops.attention.torch.indexer_mqa_logits_sm12x import (
+    indexer_mqa_logits_sm12x,
+)
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_indexer_decode_metadata_compute,
+)
+from tokenspeed_kernel.ops.attention.triton.indexer_mqa_logits_sm12x import (
+    indexer_mqa_logits_paged_sm12x_triton,
+    indexer_mqa_logits_sm12x_triton,
+)
+from tokenspeed_kernel.ops.gemm.triton.deepseek_v4_o_proj_sm12x import (
+    deepseek_v4_o_proj_einsum,
 )
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda import (
@@ -109,9 +119,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
 from tokenspeed.runtime.layers.deepseek_v4_mhc import mhc_fused_hc as fast_mhc_fused_hc
 from tokenspeed.runtime.layers.deepseek_v4_mhc import mhc_post as fast_mhc_post
 from tokenspeed.runtime.layers.deepseek_v4_mhc import mhc_pre as fast_mhc_pre
-from tokenspeed.runtime.layers.deepseek_v4_o_proj_sm12x import (
-    deepseek_v4_o_proj_einsum,
-)
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -144,7 +151,7 @@ from tokenspeed.runtime.utils import (
 )
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.custom_ops import direct_register_custom_op
-from tokenspeed.runtime.utils.env import global_server_args_dict, pdl_enabled
+from tokenspeed.runtime.utils.env import envs, global_server_args_dict, pdl_enabled
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 _platform = current_platform()
@@ -520,14 +527,6 @@ def pack_topk_as_router_logits(
     return router_logits
 
 
-from tokenspeed_kernel.ops.attention.indexer_mqa_logits_sm12x import (
-    indexer_mqa_logits_sm12x,
-)
-from tokenspeed_kernel.ops.attention.triton.indexer_mqa_logits_sm12x import (
-    indexer_mqa_logits_paged_sm12x_triton,
-    indexer_mqa_logits_sm12x_triton,
-)
-
 _DEEPGEMM_INDEXER_ARCH_OK: bool | None = None
 _INDEXER_SM12X_SCORING: bool | None = None
 _INDEXER_SM12X_SCORING_BACKEND: str | None = None
@@ -538,7 +537,7 @@ _INDEXER_SM12X_SCORING_BACKEND: str | None = None
 # (~18% slower decode) if maximum reproducibility is needed.
 _INDEXER_TRITON_PRECISION: str = (
     "ieee"
-    if os.environ.get("TOKENSPEED_INDEXER_PRECISION", "tf32").strip().lower() == "ieee"
+    if envs.TOKENSPEED_INDEXER_PRECISION.get().strip().lower() == "ieee"
     else "tf32"
 )
 
@@ -571,7 +570,7 @@ def _deepseek_v4_indexer_sm12x_scoring_backend() -> str:
     """
     global _INDEXER_SM12X_SCORING_BACKEND
     if _INDEXER_SM12X_SCORING_BACKEND is None:
-        choice = os.environ.get("TOKENSPEED_INDEXER_SCORING", "triton").strip().lower()
+        choice = envs.TOKENSPEED_INDEXER_SCORING.get().strip().lower()
         _INDEXER_SM12X_SCORING_BACKEND = (
             choice if choice in ("triton", "torch", "deepgemm") else "triton"
         )
@@ -592,8 +591,7 @@ def _deepgemm_indexer_arch_supported() -> bool:
         try:
             cap0 = torch.cuda.get_device_capability()[0]
             _DEEPGEMM_INDEXER_ARCH_OK = cap0 == 10 or (
-                cap0 == 12
-                and os.environ.get("TOKENSPEED_INDEXER_DEEPGEMM_SM120") == "1"
+                cap0 == 12 and envs.TOKENSPEED_INDEXER_DEEPGEMM_SM120.get()
             )
         except Exception:
             _DEEPGEMM_INDEXER_ARCH_OK = False

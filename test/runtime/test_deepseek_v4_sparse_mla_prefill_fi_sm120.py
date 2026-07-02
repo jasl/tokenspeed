@@ -42,7 +42,7 @@ from tokenspeed_kernel.ops.attention.flashinfer.sparse_mla_sm120 import (
     sparse_mla_sm120_available,
     sparse_mla_sm120_paged_attention,
 )
-from tokenspeed_kernel.ops.attention.sparse_mla_prefill_sm12x import (
+from tokenspeed_kernel.ops.attention.torch.sparse_mla_prefill_sm12x import (
     sparse_mla_prefill_sm12x,
 )
 

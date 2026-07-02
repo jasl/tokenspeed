@@ -237,6 +237,17 @@ class Envs:
     TOKENSPEED_PROFILER_DIR = EnvStr("/tmp")
     TOKENSPEED_CI_SMALL_KV_SIZE = EnvInt(-1)
     TOKENSPEED_NVTX = EnvBool(False)
+
+    # DeepSeek-V4 on consumer Blackwell (sm_120/sm_121)
+    # Sparse-MLA prefill backend: "fi" (FlashInfer SM120 orchestrator) or
+    # "torch" (gather+einsum correctness baseline / A-B arm).
+    TOKENSPEED_SPARSE_MLA_PREFILL = EnvStr("fi")
+    # Indexer MQA-logits scoring backend: "triton", "torch", or "deepgemm".
+    TOKENSPEED_INDEXER_SCORING = EnvStr("triton")
+    # tl.dot input precision for the Triton indexer scoring: "tf32" or "ieee".
+    TOKENSPEED_INDEXER_PRECISION = EnvStr("tf32")
+    # Opt-in: nv_dev deep_gemm fp4 indexer kernels on consumer Blackwell.
+    TOKENSPEED_INDEXER_DEEPGEMM_SM120 = EnvBool(False)
     TOKENSPEED_DP_SAMPLING_BACKEND = EnvStr(None)
 
     # Scheduler
