@@ -46,7 +46,6 @@ no nibble interleave.
 from __future__ import annotations
 
 import torch
-
 from tokenspeed_kernel._triton import tl, triton
 
 # e2m1 magnitude lookup (sign is bit 3). value = LUT[code & 7] * (1 - 2*(code>>3)).
@@ -103,7 +102,9 @@ def _indexer_mqa_logits_kernel(
 ):
     m = tl.program_id(0)
     nb = tl.program_id(1)
-    m_off = m.to(tl.int64)  # 64-bit row base: guards int32 offset overflow at long context
+    m_off = m.to(
+        tl.int64
+    )  # 64-bit row base: guards int32 offset overflow at long context
 
     # Clamp the window to [0, num_kv] to match the torch reference contract
     # (defensive: the prefill planner already keeps ks>=0 and ke<=num_kv).
