@@ -273,6 +273,23 @@ PagedCacheGroupTable::CommitResult PagedCacheGroupTable::CheckpointStateToSnapsh
     // prevent the pool from reclaiming pages that no future boundary window needs.
     const std::int32_t target_page = target_raw_tokens / raw_per_page;
     const std::int32_t owned_base = base_logical_page_ + static_cast<std::int32_t>(borrowed_page_ids_.size());
+
+    // Full-coverage guard: a published segment must start exactly where this
+    // boundary's coverage begins — the window lower bound, or the previous
+    // checkpoint's end when the window spans multiple boundary segments.
+    // When this checkpoint runs LATE (the live sliding base advanced past the
+    // boundary window via ReleaseSkipped at the current decode position), the
+    // leading window pages are already released, so any segment taken here
+    // would be ragged (short or empty) and would poison future matches and
+    // adoptions. Advance the commit cursor (keeping all groups in lockstep)
+    // but publish nothing; callers leave this group out of the snapshot.
+    const std::int32_t coverage_start_page = std::max(live_lower_page, committed_prefix_len_tokens_ / raw_per_page);
+    if (owned_base > coverage_start_page) {
+        committed_prefix_len_tokens_ = target_raw_tokens;
+        RefreshPageIdsView();
+        return {};
+    }
+
     const std::int32_t segment_count =
         std::min(static_cast<std::int32_t>(owned_pages_.Size()), std::max(0, target_page - owned_base));
     OwnedPages segment = owned_pages_.TakeFirst(segment_count);
@@ -322,7 +339,13 @@ void PagedCacheGroupTable::AdoptStateSnapshotSegment(const std::vector<std::int3
         throw std::invalid_argument("PagedCacheGroupTable::AdoptStateSnapshotSegment: segment does not end at target");
     }
     if (base_logical_page < base_logical_page_) {
-        throw std::invalid_argument("PagedCacheGroupTable::AdoptStateSnapshotSegment: segment precedes table base");
+        // The live sliding window (ReleaseSkipped at the current position) has
+        // already advanced past this boundary's window, so there are no local
+        // duplicate pages left to swap for the canonical snapshot ids. Adopt
+        // by advancing the commit cursor only: the node keeps sole ownership
+        // of its segment and this table keeps serving its own live pages.
+        committed_prefix_len_tokens_ = target_raw_tokens;
+        return;
     }
 
     const std::int32_t pages_before_segment = base_logical_page - base_logical_page_;

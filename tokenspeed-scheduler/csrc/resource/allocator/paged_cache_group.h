@@ -141,12 +141,18 @@ public:
 
     // State checkpoint: snapshot the live trailing window [max(0,target-W),
     // target); drop stale prefix from both owned (back to pool) and borrowed
-    // (index drop only; physical pages live on earlier snapshots). Throws for
-    // non-State family groups or when sliding_window_tokens is missing/non-positive.
+    // (index drop only; physical pages live on earlier snapshots). When the
+    // live sliding base has already advanced past the boundary window (late
+    // catch-up checkpoint), advances the commit cursor but publishes nothing:
+    // returns an empty CommitResult so no ragged segment ever reaches a
+    // snapshot. Throws for non-State family groups or when
+    // sliding_window_tokens is missing/non-positive.
     CommitResult CheckpointStateToSnapshot(std::int32_t target_raw_tokens);
 
     // State adoption: replace local duplicate pages for the snapshot segment
-    // with canonical borrowed ids.
+    // with canonical borrowed ids. When the segment precedes the table's live
+    // base (the window already slid past this boundary) only the commit
+    // cursor advances; no pages are swapped.
     void AdoptStateSnapshotSegment(const std::vector<std::int32_t>& ids, std::int32_t base_logical_page,
                                    std::int32_t target_raw_tokens);
 
