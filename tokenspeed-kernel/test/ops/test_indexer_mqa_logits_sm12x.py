@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-
 from tokenspeed_kernel.ops.attention.indexer_mqa_logits_sm12x import (
     indexer_mqa_logits_sm12x,
 )
@@ -58,7 +57,9 @@ _ROW_BYTES = _SCALE_BLOCKS * _BLOCK_BYTES  # 68
 
 def _scales(shape: tuple[int, ...], gen: torch.Generator, device: str) -> torch.Tensor:
     """int32-packed e8m0 scales near exponent 0 (finite, scale ~1)."""
-    b = torch.randint(120, 135, shape + (4,), dtype=torch.int64, device=device, generator=gen)
+    b = torch.randint(
+        120, 135, shape + (4,), dtype=torch.int64, device=device, generator=gen
+    )
     packed = b[..., 0] | (b[..., 1] << 8) | (b[..., 2] << 16) | (b[..., 3] << 24)
     return packed.to(torch.int32)
 
@@ -101,22 +102,41 @@ def _topk_sets_match(
 )
 def test_indexer_prefill_matches_reference(device, num_q, num_kv, max_len, mode):
     gen = torch.Generator(device=device).manual_seed(num_q * 131 + num_kv)
-    qv = torch.randint(0, 256, (num_q, H, VB), dtype=torch.uint8, device=device, generator=gen).view(torch.int8)
+    qv = torch.randint(
+        0, 256, (num_q, H, VB), dtype=torch.uint8, device=device, generator=gen
+    ).view(torch.int8)
     qs = _scales((num_q, H), gen, device)
-    kv = torch.randint(0, 256, (num_kv, VB), dtype=torch.uint8, device=device, generator=gen).view(torch.int8)
+    kv = torch.randint(
+        0, 256, (num_kv, VB), dtype=torch.uint8, device=device, generator=gen
+    ).view(torch.int8)
     ksc = _scales((num_kv,), gen, device)
     w = torch.randn(num_q, H, dtype=torch.float32, device=device, generator=gen)
 
     if mode == "ragged":
-        ks = torch.randint(0, max(1, num_kv // 2), (num_q,), dtype=torch.int32, device=device, generator=gen)
-        win = torch.randint(1, max_len + 1, (num_q,), dtype=torch.int32, device=device, generator=gen)
+        ks = torch.randint(
+            0,
+            max(1, num_kv // 2),
+            (num_q,),
+            dtype=torch.int32,
+            device=device,
+            generator=gen,
+        )
+        win = torch.randint(
+            1, max_len + 1, (num_q,), dtype=torch.int32, device=device, generator=gen
+        )
         ke = torch.minimum(ks + win, torch.full_like(ks, num_kv))
     elif mode == "overflow":  # ke may exceed num_kv -> exercises the clamp
-        ks = torch.randint(0, num_kv, (num_q,), dtype=torch.int32, device=device, generator=gen)
-        ke = ks + torch.randint(1, max_len + 8, (num_q,), dtype=torch.int32, device=device, generator=gen)
+        ks = torch.randint(
+            0, num_kv, (num_q,), dtype=torch.int32, device=device, generator=gen
+        )
+        ke = ks + torch.randint(
+            1, max_len + 8, (num_q,), dtype=torch.int32, device=device, generator=gen
+        )
     else:
         ks = torch.zeros(num_q, dtype=torch.int32, device=device)
-        ke = torch.randint(1, num_kv + 1, (num_q,), dtype=torch.int32, device=device, generator=gen)
+        ke = torch.randint(
+            1, num_kv + 1, (num_q,), dtype=torch.int32, device=device, generator=gen
+        )
 
     ref = indexer_mqa_logits_sm12x(qv, qs, kv, ksc, w, ks, ke, max_len, head_dim=D)
     tri = indexer_mqa_logits_sm12x_triton(
@@ -130,20 +150,28 @@ def test_indexer_prefill_matches_reference(device, num_q, num_kv, max_len, mode)
     ]
     assert bool((torch.isinf(ref) == torch.isinf(tri)).all()), "-inf padding mismatch"
     assert _cos(ref, tri) > 0.9999
-    assert _topk_sets_match(ref, tri, eff), "prefill top-k selection differs from reference"
+    assert _topk_sets_match(
+        ref, tri, eff
+    ), "prefill top-k selection differs from reference"
 
 
 def test_indexer_prefill_tf32_topk_close(device):
     """The tf32 serving precision keeps the selection essentially identical."""
     num_q, num_kv, max_len = 96, 512, 512
     gen = torch.Generator(device=device).manual_seed(7)
-    qv = torch.randint(0, 256, (num_q, H, VB), dtype=torch.uint8, device=device, generator=gen).view(torch.int8)
+    qv = torch.randint(
+        0, 256, (num_q, H, VB), dtype=torch.uint8, device=device, generator=gen
+    ).view(torch.int8)
     qs = _scales((num_q, H), gen, device)
-    kv = torch.randint(0, 256, (num_kv, VB), dtype=torch.uint8, device=device, generator=gen).view(torch.int8)
+    kv = torch.randint(
+        0, 256, (num_kv, VB), dtype=torch.uint8, device=device, generator=gen
+    ).view(torch.int8)
     ksc = _scales((num_kv,), gen, device)
     w = torch.randn(num_q, H, dtype=torch.float32, device=device, generator=gen)
     ks = torch.zeros(num_q, dtype=torch.int32, device=device)
-    ke = torch.randint(1, num_kv + 1, (num_q,), dtype=torch.int32, device=device, generator=gen)
+    ke = torch.randint(
+        1, num_kv + 1, (num_q,), dtype=torch.int32, device=device, generator=gen
+    )
 
     ref = indexer_mqa_logits_sm12x(qv, qs, kv, ksc, w, ks, ke, max_len, head_dim=D)
     tf32 = indexer_mqa_logits_sm12x_triton(
@@ -157,7 +185,11 @@ def test_indexer_prefill_tf32_topk_close(device):
 # Paged decode (block-interleaved MXFP4 cache + block_table)
 # --------------------------------------------------------------------------- #
 def _pack_paged_cache(
-    kv_values_i8: torch.Tensor, kv_scales_i32: torch.Tensor, num_pages: int, bs: int, device: str
+    kv_values_i8: torch.Tensor,
+    kv_scales_i32: torch.Tensor,
+    num_pages: int,
+    bs: int,
+    device: str,
 ) -> torch.Tensor:
     """Pack logical [N, VB] values + [N] int32 scales into the block-interleaved
     paged cache layout: per 32-dim block ``[16 value bytes | 1 e8m0 scale byte]``."""
@@ -169,8 +201,12 @@ def _pack_paged_cache(
     ii = torch.arange(_BYTES_PER_BLOCK, device=device)
     for b in range(_SCALE_BLOCKS):
         dst = slot * _ROW_BYTES + b * _BLOCK_BYTES
-        cache[page[:, None], dst[:, None] + ii[None, :]] = kvv[:, b * _BYTES_PER_BLOCK : (b + 1) * _BYTES_PER_BLOCK]
-        cache[page, dst + _BYTES_PER_BLOCK] = ((kv_scales_i32 >> (8 * b)) & 0xFF).to(torch.uint8)
+        cache[page[:, None], dst[:, None] + ii[None, :]] = kvv[
+            :, b * _BYTES_PER_BLOCK : (b + 1) * _BYTES_PER_BLOCK
+        ]
+        cache[page, dst + _BYTES_PER_BLOCK] = ((kv_scales_i32 >> (8 * b)) & 0xFF).to(
+            torch.uint8
+        )
     return cache.view(torch.int8)
 
 
@@ -185,28 +221,54 @@ def _pack_paged_cache(
 )
 def test_indexer_paged_decode_matches_reference(device, num_tokens, num_kv, block_size):
     gen = torch.Generator(device=device).manual_seed(num_tokens * 977 + num_kv)
-    qv = torch.randint(0, 256, (num_tokens, H, VB), dtype=torch.uint8, device=device, generator=gen).view(torch.int8)
+    qv = torch.randint(
+        0, 256, (num_tokens, H, VB), dtype=torch.uint8, device=device, generator=gen
+    ).view(torch.int8)
     qs = _scales((num_tokens, H), gen, device)
-    kvv = torch.randint(0, 256, (num_kv, VB), dtype=torch.uint8, device=device, generator=gen).view(torch.int8)
+    kvv = torch.randint(
+        0, 256, (num_kv, VB), dtype=torch.uint8, device=device, generator=gen
+    ).view(torch.int8)
     kvs = _scales((num_kv,), gen, device)
     w = torch.randn(num_tokens, H, dtype=torch.float32, device=device, generator=gen)
-    ctx = torch.randint(1, num_kv + 1, (num_tokens,), dtype=torch.int32, device=device, generator=gen)
+    ctx = torch.randint(
+        1, num_kv + 1, (num_tokens,), dtype=torch.int32, device=device, generator=gen
+    )
     max_ctx = int(ctx.max())
 
     num_pages = (num_kv + block_size - 1) // block_size
     cache = _pack_paged_cache(kvv, kvs, num_pages, block_size, device)
-    block_table = torch.arange(num_pages, dtype=torch.int32, device=device)[None, :].repeat(num_tokens, 1)
+    block_table = torch.arange(num_pages, dtype=torch.int32, device=device)[
+        None, :
+    ].repeat(num_tokens, 1)
 
     # Each token scores [0, ctx[t]) of the shared pool: reference window = [0, ctx).
     ref = indexer_mqa_logits_sm12x(
-        qv, qs, kvv, kvs, w,
-        torch.zeros(num_tokens, dtype=torch.int32, device=device), ctx, max_ctx, head_dim=D,
+        qv,
+        qs,
+        kvv,
+        kvs,
+        w,
+        torch.zeros(num_tokens, dtype=torch.int32, device=device),
+        ctx,
+        max_ctx,
+        head_dim=D,
     )
     tri = indexer_mqa_logits_paged_sm12x_triton(
-        qv, qs, cache, block_table, ctx, w, block_size, max_ctx, head_dim=D, input_precision="ieee"
+        qv,
+        qs,
+        cache,
+        block_table,
+        ctx,
+        w,
+        block_size,
+        max_ctx,
+        head_dim=D,
+        input_precision="ieee",
     )
 
     eff = [min(int(ctx[m]), max_ctx) for m in range(num_tokens)]
     assert bool((torch.isinf(ref) == torch.isinf(tri)).all()), "-inf padding mismatch"
     assert _cos(ref, tri) > 0.9999
-    assert _topk_sets_match(ref, tri, eff), "paged decode top-k selection differs from reference"
+    assert _topk_sets_match(
+        ref, tri, eff
+    ), "paged decode top-k selection differs from reference"
