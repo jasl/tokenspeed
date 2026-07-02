@@ -15,8 +15,7 @@ portable Triton kernel instead.
 from __future__ import annotations
 
 import torch
-import triton
-import triton.language as tl
+from tokenspeed_kernel._triton import tl, triton
 
 
 # num_tokens and the token-count-dependent strides are RUNTIME args marked

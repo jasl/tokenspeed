@@ -28,7 +28,7 @@ from tokenspeed_kernel.ops.attention.flashinfer.sparse_mla_sm120 import (
     sparse_mla_sm120_decode,
     sparse_mla_sm120_paged_attention,
 )
-from tokenspeed_kernel.ops.attention.sparse_mla_prefill_sm12x import (
+from tokenspeed_kernel.ops.attention.torch.sparse_mla_prefill_sm12x import (
     sparse_mla_prefill_sm12x,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
@@ -68,7 +68,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
     _split_paged_cache_block_tables_into_v4_metadata,
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
-from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 DEEPSEEK_V4_DEFAULT_PREFILL_CHUNK_SIZE = 4
@@ -122,7 +122,7 @@ def _sparse_mla_prefill_sm12x_backend() -> str:
     - ``torch``: the gather + einsum reference fallback (correctness
       baseline / A-B arm).
     """
-    choice = os.environ.get("TOKENSPEED_SPARSE_MLA_PREFILL", "fi").strip().lower()
+    choice = envs.TOKENSPEED_SPARSE_MLA_PREFILL.get().strip().lower()
     return choice if choice in ("fi", "torch") else "fi"
 
 
