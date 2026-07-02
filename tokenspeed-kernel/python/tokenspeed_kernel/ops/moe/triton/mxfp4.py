@@ -176,6 +176,43 @@ def _maybe_lds_guard(x, w, precision_config):
         yield
 
 
+# Consumer Blackwell (sm_120/121): the datacenter-Blackwell opt_flags
+# heuristics size the software pipeline for ~227KB smem (B200) while sm12x
+# has ~101KB (and the model double-counts the fp4 pad on the bf16-upcast
+# path), so num_stages collapses to 1 -- zero pipelining -- at every
+# DeepSeek-V4 shape, and large-M tiles invert efficiency (T=2048 slower per
+# FLOP than T=512). Measured on GB10 (DSv4-Flash TP=2 shapes): these
+# constraints give 12518us vs 82489us baseline at T=2048 (6.6x, 24.7 TFLOP/s)
+# and 4.2x at T=1024; below ~4096 gathered rows the stock small-M defaults
+# (block_m 16-32, stages 1) remain faster, so decode/small-prefill keep them.
+_SM12X_MOE_LARGE_M_CONSTRAINTS = {
+    "block_m": 64,
+    "block_n": 128,
+    "num_stages": 2,
+    "num_warps": 8,
+}
+_SM12X_MOE_LARGE_M_MIN_ROWS = 4096
+
+
+def _sm12x_moe_tuning_should_apply(x, w, precision_config, num_rows):
+    if scoped_opt_flags_constraints is None:
+        return False
+    if num_rows < _SM12X_MOE_LARGE_M_MIN_ROWS:
+        return False
+    if not current_platform().is_consumer_blackwell:
+        return False
+    return _is_bf16_mxfp4(x, w, precision_config)
+
+
+@contextmanager
+def _maybe_sm12x_moe_tuning(x, w, precision_config, num_rows):
+    if not _sm12x_moe_tuning_should_apply(x, w, precision_config, num_rows):
+        yield
+        return
+    with scoped_opt_flags_constraints(_SM12X_MOE_LARGE_M_CONSTRAINTS):
+        yield
+
+
 def _routing(
     logits: torch.Tensor,
     n_expts_act: int,
@@ -576,7 +613,10 @@ def triton_mxfp4_moe_apply(
     else:
         gemm1_input = x
 
-    with _maybe_lds_guard(gemm1_input, w13_weight, w13_pc):
+    num_ragged_rows = n_tokens * top_k
+    with _maybe_lds_guard(gemm1_input, w13_weight, w13_pc), _maybe_sm12x_moe_tuning(
+        gemm1_input, w13_weight, w13_pc, num_ragged_rows
+    ):
         intermediate_cache = matmul(
             gemm1_input,
             w13_weight,
@@ -603,7 +643,9 @@ def triton_mxfp4_moe_apply(
     else:
         gemm2_input = intermediate_cache
 
-    with _maybe_lds_guard(gemm2_input, w2_weight, w2_pc):
+    with _maybe_lds_guard(gemm2_input, w2_weight, w2_pc), _maybe_sm12x_moe_tuning(
+        gemm2_input, w2_weight, w2_pc, num_ragged_rows
+    ):
         output = matmul(
             gemm2_input,
             w2_weight,
