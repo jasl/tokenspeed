@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from typing import Optional
 
 import torch
@@ -25,6 +26,7 @@ from tokenspeed_kernel.ops.attention.flash_mla import (
 from tokenspeed_kernel.ops.attention.flashinfer.sparse_mla_sm120 import (
     sparse_mla_sm120_available,
     sparse_mla_sm120_decode,
+    sparse_mla_sm120_paged_attention,
 )
 from tokenspeed_kernel.ops.attention.sparse_mla_prefill_sm12x import (
     sparse_mla_prefill_sm12x,
@@ -105,6 +107,36 @@ def _use_flashinfer_sparse_mla_sm120() -> bool:
     if torch.cuda.get_device_capability()[0] != 12:
         return False
     return sparse_mla_sm120_available()
+
+
+@functools.cache
+def _sparse_mla_prefill_sm12x_backend() -> str:
+    """Sparse-MLA prefill backend on consumer Blackwell (sm_120/sm_121).
+
+    ``TOKENSPEED_SPARSE_MLA_PREFILL`` selects it (cached on first use):
+    - ``fi`` (default): FlashInfer's native SM120 sparse-MLA prefill
+      orchestrator, reading the packed paged caches directly (no dequant
+      workspace). Falls back to ``torch`` per call when a shape is outside
+      the FlashInfer dispatch envelope (see
+      ``_prefill_fi_sm120_eligible``).
+    - ``torch``: the gather + einsum reference fallback (correctness
+      baseline / A-B arm).
+    """
+    choice = os.environ.get("TOKENSPEED_SPARSE_MLA_PREFILL", "fi").strip().lower()
+    return choice if choice in ("fi", "torch") else "fi"
+
+
+def _use_flashinfer_sparse_mla_prefill_sm12x() -> bool:
+    """Whether to route sm12x sparse-MLA prefill through FlashInfer SM120.
+
+    Requires consumer Blackwell, an importable FlashInfer SM120 runner (the
+    build must carry the prefill orchestrator, flashinfer main /
+    v0.6.14rc1+), and the ``fi`` backend selection.
+    """
+    return (
+        _use_flashinfer_sparse_mla_sm120()
+        and _sparse_mla_prefill_sm12x_backend() == "fi"
+    )
 
 
 def _compressed_block_table_base_offsets(
@@ -1065,7 +1097,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 f"metadata_tokens={metadata.token_to_req_indices.numel()}, "
                 f"q_tokens={q.shape[0]}"
             )
-        if flash_mla_with_kvcache is error_fn and not _use_flashinfer_sparse_mla_sm120():
+        if (
+            flash_mla_with_kvcache is error_fn
+            and not _use_flashinfer_sparse_mla_sm120()
+        ):
             raise RuntimeError(
                 "DeepSeek V4 decode requires FlashMLA latent attention. "
                 "Build/install `tokenspeed-kernel/python` with FlashMLA."
@@ -1504,6 +1539,155 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             forward_mode=forward_mode,
         )
 
+    def _prefill_fi_sm120_eligible(
+        self,
+        *,
+        token_to_kv_pool,
+        layer_id: int,
+        compress_ratio: int,
+        window_size: int,
+        padded_heads: int,
+        head_dim: int,
+        topk_indices: torch.Tensor | None,
+    ) -> bool:
+        """Whether this prefill call fits FlashInfer's SM120 dispatch envelope.
+
+        The SM120 prefill orchestrator instantiates: main-cache page size 64;
+        dual-cache main ``topk == 128`` (the sliding window) with extra-cache
+        page size in {64, 2}; single-cache ``topk`` in {128, 512, 1024, 2048};
+        ``num_heads`` in {16, 32, 64, 128}; ``d_qk == d_v == 512`` (the DSv4
+        footer-scale cache). Anything else returns False and the caller stays
+        on the gather + einsum fallback.
+        """
+        if not _use_flashinfer_sparse_mla_prefill_sm12x():
+            return False
+        if head_dim != 512 or padded_heads not in (16, 32, 64, 128):
+            return False
+        if token_to_kv_pool.swa_block_size != 64:
+            return False
+        if compress_ratio > 1:
+            if window_size != 128:
+                return False
+            if compress_ratio == 4 and topk_indices is None:
+                return False
+            compressed_block_size = token_to_kv_pool.get_compressed_block_size(layer_id)
+            if compressed_block_size not in (64, 2):
+                return False
+        elif window_size not in (128, 512, 1024, 2048):
+            return False
+        return True
+
+    def _forward_prefill_fi_sm120(
+        self,
+        *,
+        q_padded: torch.Tensor,
+        positions: torch.Tensor,
+        token_to_kv_pool,
+        layer_id: int,
+        compress_ratio: int,
+        head_dim: int,
+        window_size: int,
+        softmax_scale: float,
+        attn_sink: torch.Tensor,
+        topk_indices: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Sparse-MLA prefill via FlashInfer's native SM120 orchestrator.
+
+        Reads the packed fp8_ds_mla paged caches directly -- no dequantized
+        gather workspace. Per-token global slot indices are built with the
+        same position-aware Triton helpers the decode path uses:
+
+        - SWA segment: the last ``min(pos+1, window)`` raw slots per token
+          (``deepseek_v4_decode_swa_indices_and_lens`` derives each token's
+          absolute position from the prefill metadata).
+        - Compressed segment (CSA, ratio 4): the indexer's request-local
+          compressed positions map through the compressed block table from
+          column 0 (``deepseek_v4_compute_global_topk_indices_and_lens``) --
+          exactly the mapping the workspace gather applies today. Unlike
+          decode, prefill indexer rows carry no base-slot shift, so no
+          rebase is needed.
+        - Compressed segment (HCA, dense ratios): dense causal local indices
+          mapped through the same kernel.
+
+        One FlashInfer call serves the whole chunk: ``num_tokens <= 64``
+        dispatches to the split-K decode kernels, larger chunks to the SM120
+        prefill orchestrator.
+        """
+        metadata = self.forward_metadata
+        cache_metadata = metadata.cache
+        if cache_metadata.swa_block_table is None:
+            raise RuntimeError("DeepSeek V4 missing paged-cache block table for SWA KV")
+        num_tokens = positions.numel()
+        swa_block_size = token_to_kv_pool.swa_block_size
+
+        # SWA slot indices depend only on (window, block, positions) -- reuse
+        # the metadata-cached build across the model's layers, exactly like
+        # the decode path does.
+        attention_metadata = metadata.attention
+        if (
+            attention_metadata.decode_swa_indices is not None
+            and attention_metadata.decode_swa_lens is not None
+            and attention_metadata.decode_swa_window_size == window_size
+            and attention_metadata.decode_swa_block_size == swa_block_size
+            and attention_metadata.decode_swa_indices.shape[0] == num_tokens
+        ):
+            swa_indices = attention_metadata.decode_swa_indices
+            swa_lens = attention_metadata.decode_swa_lens
+        else:
+            swa_indices, swa_lens = self._update_decode_swa_metadata(
+                metadata,
+                window_size=window_size,
+                block_size=swa_block_size,
+            )
+
+        extra_indices = None
+        extra_lens = None
+        compressed_cache = None
+        if compress_ratio > 1:
+            compressed_block_size = token_to_kv_pool.get_compressed_block_size(layer_id)
+            compressed_block_table = cache_metadata.compressed_block_table(
+                compress_ratio,
+                compressed_block_size,
+            )
+            if compress_ratio == 4:
+                local_indices = topk_indices
+            else:
+                local_indices = self._dense_prefill_local_compressed_indices(
+                    positions,
+                    compress_ratio=compress_ratio,
+                    width=self._dense_compressed_indices_width(compress_ratio),
+                )
+            extra_indices, extra_lens = (
+                deepseek_v4_compute_global_topk_indices_and_lens(
+                    topk_indices=local_indices,
+                    token_to_req_indices=metadata.token_to_req_indices[:num_tokens],
+                    block_table=compressed_block_table,
+                    block_size=compressed_block_size,
+                    is_valid_token=metadata.is_valid_token,
+                )
+            )
+            compressed_cache = self._fp8_ds_mla_cache_view(
+                token_to_kv_pool.get_compressed_kv_buffer_2d(layer_id),
+                compressed_block_size,
+            )
+
+        swa_cache = self._fp8_ds_mla_cache_view(
+            token_to_kv_pool.get_swa_kv_buffer(layer_id),
+            swa_block_size,
+        )
+        return sparse_mla_sm120_paged_attention(
+            q_padded,
+            swa_cache,
+            swa_indices,
+            softmax_scale,
+            head_dim_v=head_dim,
+            attn_sink=attn_sink,
+            extra_k_cache=compressed_cache,
+            extra_indices=extra_indices,
+            topk_length=swa_lens,
+            extra_topk_length=extra_lens,
+        )
+
     def _forward_deepseek_v4_prefill_chunk(
         self,
         *,
@@ -1540,6 +1724,32 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     device=q.device,
                 )
                 q_padded[:, : q.shape[1]].copy_(q)
+        if self._prefill_fi_sm120_eligible(
+            token_to_kv_pool=token_to_kv_pool,
+            layer_id=layer_id,
+            compress_ratio=compress_ratio,
+            window_size=window_size,
+            padded_heads=padded_heads,
+            head_dim=head_dim,
+            topk_indices=topk_indices,
+        ):
+            # Consumer Blackwell: FlashInfer's native SM120 sparse-MLA prefill
+            # orchestrator reads the packed paged caches directly -- skip the
+            # dequant-gather workspace and the einsum fallback entirely.
+            with nvtx_range(f"attn_{kind}_prefill_fi_sm120"):
+                out = self._forward_prefill_fi_sm120(
+                    q_padded=q_padded,
+                    positions=positions,
+                    token_to_kv_pool=token_to_kv_pool,
+                    layer_id=layer_id,
+                    compress_ratio=compress_ratio,
+                    head_dim=head_dim,
+                    window_size=window_size,
+                    softmax_scale=softmax_scale,
+                    attn_sink=attn_sink,
+                    topk_indices=topk_indices,
+                )
+            return out[:, :num_local_heads]
         with nvtx_range(f"attn_{kind}_prefill_workspace"):
             kv_workspace, indices, lens = self._prefill_workspace(
                 positions=positions,
