@@ -684,6 +684,7 @@ def triton_mxfp4_moe_apply(
         # carries that padded number of expert rows per token. Derive it from the
         # output rather than top_k. Padded slots carry gate weight 0, so summing
         # over the padded width is exact.
-        effective_top_k = output.shape[0] // n_tokens
+        # 0-token forwards (attention-DP idle ranks) must not divide by zero.
+        effective_top_k = output.shape[0] // n_tokens if n_tokens else top_k
         return output.view(n_tokens, effective_top_k, output.shape[-1]).sum(dim=1)
     return output
