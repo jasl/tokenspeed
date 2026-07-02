@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.indexer_mqa_logits_sm12x import (
+from tokenspeed_kernel.ops.attention.torch.indexer_mqa_logits_sm12x import (
     indexer_mqa_logits_sm12x,
 )
 from tokenspeed_kernel.ops.attention.triton.indexer_mqa_logits_sm12x import (

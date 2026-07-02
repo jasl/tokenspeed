@@ -150,6 +150,20 @@ def maybe_set_numa_aware_cpu_affinity(device_id: int) -> None:
     )
 
 
+def device_has_unified_memory(device_id: int = 0) -> bool:
+    """Whether the CUDA device shares one physical memory pool with the host.
+
+    Reads ``cudaDeviceProp.integrated`` (exposed by torch as
+    ``is_integrated``): true on integrated-GPU platforms such as DGX Spark
+    (GB10), Thor, and Jetson, where "device" and "host" memory are the same
+    LPDDR DRAM. Distinct from CUDA managed memory (``cudaMallocManaged``),
+    which also exists on discrete GPUs.
+    """
+    return bool(
+        getattr(torch.cuda.get_device_properties(device_id), "is_integrated", 0)
+    )
+
+
 def get_available_gpu_memory(
     device, gpu_id, distributed=False, empty_cache=True, cpu_group=None
 ):
@@ -172,7 +186,7 @@ def get_available_gpu_memory(
 
         if empty_cache:
             torch.cuda.empty_cache()
-        if getattr(torch.cuda.get_device_properties(gpu_id), "is_integrated", 0):
+        if device_has_unified_memory(gpu_id):
             # Unified memory (e.g. GB10/Grace): the CUDA allocator shares the
             # host RAM pool, so torch.cuda.mem_get_info() free EXCLUDES the
             # reclaimable host page cache (model checkpoint) -- it badly
@@ -180,8 +194,6 @@ def get_available_gpu_memory(
             # zeros the KV cache budget and false-trips the TP balance check.
             # Use host MemAvailable (free + reclaimable, which evicts under
             # allocation pressure) instead.
-            import psutil
-
             free_gpu_memory = psutil.virtual_memory().available
         else:
             free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
