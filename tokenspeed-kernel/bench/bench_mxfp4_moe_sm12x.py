@@ -40,6 +40,10 @@ import types
 
 import torch
 
+# Import the production op FIRST: it performs the tokenspeed-triton redirect
+# and leaves triton_kernels.* cached in sys.modules against the right triton.
+import tokenspeed_kernel.ops.moe.triton.mxfp4  # noqa: E402,F401
+
 # Safe now: triton_kernels.* are cached in sys.modules by the import above.
 import triton_kernels.matmul as tk_matmul  # noqa: E402
 import triton_kernels.matmul_details.opt_flags as opt_flags_mod  # noqa: E402

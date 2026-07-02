@@ -21,6 +21,9 @@
 from __future__ import annotations
 
 import copy
+import functools
+import json
+import os
 from contextlib import contextmanager
 
 import tokenspeed_kernel
@@ -194,6 +197,26 @@ _SM12X_MOE_LARGE_M_CONSTRAINTS = {
 _SM12X_MOE_LARGE_M_MIN_ROWS = 4096
 
 
+@functools.cache
+def _sm12x_moe_constraints(which: str) -> dict:
+    """Per-gemm large-M constraints, env-overridable for tuning sweeps.
+
+    ``TOKENSPEED_MOE_SM12X_GEMM1_CONSTRAINTS`` / ``..._GEMM2_CONSTRAINTS``
+    (JSON) override the measured defaults per gemm -- gate/up is
+    K=hidden/N=2*ispp while down-proj is K=ispp/N=hidden, so their optima
+    can diverge. Empty/absent env keeps the shared defaults.
+    """
+    raw = os.environ.get(f"TOKENSPEED_MOE_SM12X_{which}_CONSTRAINTS", "")
+    if raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict) and parsed:
+                return parsed
+        except ValueError:
+            pass
+    return _SM12X_MOE_LARGE_M_CONSTRAINTS
+
+
 def _sm12x_moe_tuning_should_apply(x, w, precision_config, num_rows):
     if scoped_opt_flags_constraints is None:
         return False
@@ -205,11 +228,11 @@ def _sm12x_moe_tuning_should_apply(x, w, precision_config, num_rows):
 
 
 @contextmanager
-def _maybe_sm12x_moe_tuning(x, w, precision_config, num_rows):
+def _maybe_sm12x_moe_tuning(x, w, precision_config, num_rows, which="GEMM1"):
     if not _sm12x_moe_tuning_should_apply(x, w, precision_config, num_rows):
         yield
         return
-    with scoped_opt_flags_constraints(_SM12X_MOE_LARGE_M_CONSTRAINTS):
+    with scoped_opt_flags_constraints(_sm12x_moe_constraints(which)):
         yield
 
 
@@ -615,7 +638,7 @@ def triton_mxfp4_moe_apply(
 
     num_ragged_rows = n_tokens * top_k
     with _maybe_lds_guard(gemm1_input, w13_weight, w13_pc), _maybe_sm12x_moe_tuning(
-        gemm1_input, w13_weight, w13_pc, num_ragged_rows
+        gemm1_input, w13_weight, w13_pc, num_ragged_rows, which="GEMM1"
     ):
         intermediate_cache = matmul(
             gemm1_input,
@@ -644,7 +667,7 @@ def triton_mxfp4_moe_apply(
         gemm2_input = intermediate_cache
 
     with _maybe_lds_guard(gemm2_input, w2_weight, w2_pc), _maybe_sm12x_moe_tuning(
-        gemm2_input, w2_weight, w2_pc, num_ragged_rows
+        gemm2_input, w2_weight, w2_pc, num_ragged_rows, which="GEMM2"
     ):
         output = matmul(
             gemm2_input,
