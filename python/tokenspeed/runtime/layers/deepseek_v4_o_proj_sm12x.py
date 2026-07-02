@@ -198,7 +198,9 @@ def deepseek_v4_sm12x_fp8_einsum(
     )
 
 
-def deepseek_v4_o_proj_fp8_einsum_config(capability_major: int) -> tuple[tuple[int, int, int], bool]:
+def deepseek_v4_o_proj_fp8_einsum_config(
+    capability_major: int,
+) -> tuple[tuple[int, int, int], bool]:
     """Return ``(recipe, tma_aligned_scales)`` for the o_proj einsum.
 
     Datacenter Blackwell (major 10) keeps the deep_gemm INT32 UE8M0 path
