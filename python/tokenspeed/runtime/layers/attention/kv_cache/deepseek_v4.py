@@ -969,10 +969,24 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
 
     @property
     def prefix_cache_required_group_ids(self) -> tuple[str, ...]:
+        # Require BOTH families for prefix-cache hits. With history-only
+        # (the previous behavior) every state group is transport-only, so
+        # the hybrid cache's state-window fallback is unreachable and the
+        # ONLY hit path is a terminal-exact continuation snapshot --
+        # interior boundary snapshots are history-only and eagerly stripped
+        # once decode advances a state window past them. Net effect: DSv4
+        # prefix reuse degraded to continuation-only; an identical re-sent
+        # prompt (page-aligned, or one whose decode filled a page) matched
+        # ZERO cached tokens. The scheduler C++ tests always required the
+        # state family (paged_cache_test_fixture.h), which is why this never
+        # surfaced there. Requiring state groups makes CommitChunk
+        # checkpoint them at aligned boundaries and re-opens the
+        # interior-hit fallback; chain alignment holds (256 is a multiple
+        # of every state block size).
         return tuple(
             str(spec.group_id)
             for spec in self.paged_cache_group_specs
-            if spec.family == "history"
+            if spec.family in ("history", "state")
         )
 
     def bind_paged_cache_scheduler(self, scheduler: object) -> None:
