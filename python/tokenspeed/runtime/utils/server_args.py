@@ -603,7 +603,28 @@ class ServerArgs:
             self.enable_kvstore = False
             logger.info("Decode instance has set enable_kvstore to False!")
         elif not self.disable_kvstore:
-            self.enable_kvstore = True
+            if not self.enable_kvstore and self._device_has_unified_memory():
+                # Integrated-GPU platforms (DGX Spark/GB10, Thor, Jetson)
+                # share one physical DRAM pool between host and device: a
+                # host KV tier adds no capacity and its spills burn the
+                # memory bandwidth serving is bound by. Keep kvstore off by
+                # default there; set enable_kvstore explicitly to override.
+                logger.info(
+                    "Unified-memory device: defaulting kvstore to disabled "
+                    "(host tier adds no capacity on a shared physical pool); "
+                    "set enable_kvstore to override."
+                )
+            else:
+                self.enable_kvstore = True
+
+    @staticmethod
+    def _device_has_unified_memory() -> bool:
+        try:
+            from tokenspeed.runtime.utils.common import device_has_unified_memory
+
+            return device_has_unified_memory()
+        except Exception:
+            return False
 
         if self.kvstore_storage_backend == "mooncake":
             if self.kvstore_mem_layout == "layer_first":
