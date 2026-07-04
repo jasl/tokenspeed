@@ -109,6 +109,43 @@ class FusionParams:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Piecewise decode CUDA graph seam
+# ---------------------------------------------------------------------------
+#
+# When the decode forward is captured as a piecewise CUDA graph (compute ->
+# comm -> compute), collectives must NOT be recorded into the graph. During
+# segmented capture the active SegmentRecorder splits the graph here: instead
+# of running the real collective we hand it an eager closure to run between
+# graph replays, and return the persistent buffer the next segment reads.
+#
+# _NO_BREAK means "not captured / no active recorder -> run the collective
+# normally as today", so the flag-off path is unchanged.
+
+_NO_BREAK = object()
+
+
+def _maybe_record_piecewise_break(op_name, eager_fn, output_tensor):
+    """If a piecewise decode graph is being captured, record ``eager_fn`` as a
+    segment break and return ``output_tensor`` (the persistent buffer the next
+    segment reads). Otherwise return ``_NO_BREAK`` so the caller runs the
+    collective normally.
+
+    The import is local to avoid a module-load circular import
+    (cuda_graph_wrapper imports the sampling backend, which pulls in comm)."""
+    from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+        get_active_segment_recorder,
+        get_is_capture_mode,
+    )
+
+    if get_is_capture_mode():
+        recorder = get_active_segment_recorder()
+        if recorder is not None:
+            recorder.record_break(eager_fn)
+            return output_tensor
+    return _NO_BREAK
+
+
 def all_reduce(
     tensor: torch.Tensor,
     group: Group,
@@ -118,6 +155,15 @@ def all_reduce(
     """All-reduce the tensor across the given communication group."""
     if backend is None:
         backend = get_global_backend()
+    # Piecewise decode: run the all-reduce eagerly between graph segments.
+    # in-place -> output buffer is the same tensor the next segment reads.
+    rec = _maybe_record_piecewise_break(
+        "AR",
+        lambda t=tensor, g=group, o=op: backend.all_reduce(t, g, op=o),
+        tensor,
+    )
+    if rec is not _NO_BREAK:
+        return rec
     return backend.all_reduce(tensor, group, op=op)
 
 
@@ -142,6 +188,16 @@ def all_gather_into_tensor(
     """All-gather input into a pre-allocated output buffer."""
     if backend is None:
         backend = get_global_backend()
+    # Piecewise decode: writes into the caller-owned ``output`` buffer, which
+    # the next graph segment reads. Void return, so just return after
+    # recording the eager collective.
+    rec = _maybe_record_piecewise_break(
+        "AGT",
+        lambda o=output, i=input, g=group: backend.all_gather_into_tensor(o, i, g),
+        output,
+    )
+    if rec is not _NO_BREAK:
+        return
     backend.all_gather_into_tensor(output, input, group)
 
 
@@ -285,6 +341,24 @@ def fused_all_gather(
 # ---------------------------------------------------------------------------
 
 
+def _reject_allocating_collective_under_piecewise(name: str) -> None:
+    """Allocating token-aware collectives (TritonRSAG) return a freshly
+    allocated buffer, so the next graph segment has no stable buffer to read.
+    On the supported piecewise config (TP=2 / EP off / DP=1) use_all_reduce is
+    True everywhere and these never fire; if one does, fail LOUD rather than
+    silently hang or corrupt."""
+    from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+        get_active_segment_recorder,
+        get_is_capture_mode,
+    )
+
+    if get_is_capture_mode() and get_active_segment_recorder() is not None:
+        raise RuntimeError(
+            f"piecewise decode graph: unexpected allocating collective {name} "
+            "— not supported; disable --piecewise-decode-cudagraph or file a bug"
+        )
+
+
 def token_all_gather(
     tensor: torch.Tensor,
     group: Group,
@@ -299,6 +373,7 @@ def token_all_gather(
     """
     if backend is None:
         backend = get_global_backend()
+    _reject_allocating_collective_under_piecewise("token_all_gather")
     return backend.token_all_gather(tensor, group, scattered_num_tokens)
 
 
@@ -316,4 +391,5 @@ def token_reduce_scatter(
     """
     if backend is None:
         backend = get_global_backend()
+    _reject_allocating_collective_under_piecewise("token_reduce_scatter")
     return backend.token_reduce_scatter(tensor, group, scattered_num_tokens)
