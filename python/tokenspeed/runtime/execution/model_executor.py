@@ -135,6 +135,9 @@ class ModelExecutorConfig:
     max_cudagraph_capture_size: int
     model_is_mrope: bool
     enable_nan_detection: bool = False
+    # Piecewise decode CUDA graph: cudagraph compute regions, run TP
+    # collectives eagerly between graph replays (read by CudaGraphWrapper).
+    piecewise_decode_cudagraph: bool = False
 
     # ====== DP =========
     data_parallel_size: int = 1
@@ -218,6 +221,7 @@ class ModelExecutorConfig:
             use_v4_mtp_paged_metadata=model_config.use_v4_mtp_paged_metadata,
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
+            piecewise_decode_cudagraph=server_args.piecewise_decode_cudagraph,
         )
 
 
