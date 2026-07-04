@@ -62,6 +62,88 @@ def get_is_capture_mode() -> bool:
     return _is_capture_mode
 
 
+# ---------------------------------------------------------------------------
+# Piecewise decode CUDA graph (compute -> comm -> compute)
+# ---------------------------------------------------------------------------
+#
+# Only the decode forward is CUDA-graph captured. On a 2-node GB10 (TP=2)
+# without GPUDirect, every TP collective is host-staged over RoCE NCCL.
+# Capturing per-layer all_reduce + the sampler broadcast + the logits
+# all_gather into ONE monolithic torch.cuda.graph makes those host-staged
+# collectives hang on graph replay.
+#
+# The fix: cudagraph only the COMPUTE regions and run the COLLECTIVES
+# EAGERLY between graph replays (compute -> comm -> compute -> ...). A
+# SegmentRecorder drives segmented capture: at each collective call site the
+# collective seam calls record_break(eager_fn) which ends the current graph
+# segment, remembers the eager collective closure, and begins a fresh graph
+# segment sharing the same memory pool. Because every segment reads/writes
+# the same persistent buffers, replaying the segments in order with the
+# eager collectives interleaved reproduces the monolithic forward exactly
+# and recomputes on input change.
+#
+# This mirrors the single-GPU prototype: mid-forward capture_end() -> eager
+# in-place op -> new capture_begin(pool=shared) -> replay segments in order.
+
+
+class SegmentRecorder:
+    """Drives segmented ("piecewise") decode CUDA-graph capture.
+
+    Collectives are NOT recorded into the graph. Each collective call site,
+    while capturing, invokes :meth:`record_break` to close the current graph
+    segment, stash the eager collective closure, and open the next segment on
+    the shared memory pool. At replay the wrapper walks segments in order and
+    runs each stashed collective eagerly between replays.
+    """
+
+    def __init__(self) -> None:
+        self.pool = None
+        self.stream: torch.cuda.Stream | None = None
+        self.graphs: list[torch.cuda.CUDAGraph] = []
+        self.breaks: list[Callable[[], None]] = []
+        self._cur: torch.cuda.CUDAGraph | None = None
+        self._active = False
+
+    def begin(self, pool, stream: torch.cuda.Stream) -> None:
+        """Open the first graph segment. Caller wraps this in
+        ``with torch.cuda.stream(stream):`` so capture records on ``stream``."""
+        self.pool = pool
+        self.stream = stream
+        self._cur = torch.cuda.CUDAGraph()
+        self._cur.capture_begin(pool=pool)
+        self._active = True
+
+    def record_break(self, eager_fn: Callable[[], None]) -> None:
+        """Close the in-flight segment at a collective boundary and open the
+        next one on the shared pool. ``eager_fn`` runs the real collective
+        eagerly at replay time, between the two segments."""
+        if not self._active:
+            return
+        self._cur.capture_end()
+        self.graphs.append(self._cur)
+        self.breaks.append(eager_fn)
+        self._cur = torch.cuda.CUDAGraph()
+        self._cur.capture_begin(pool=self.pool)
+
+    def finish(self) -> tuple[list[torch.cuda.CUDAGraph], list[Callable[[], None]]]:
+        """Close the final segment and return ``(graphs, breaks)``. There is
+        always exactly one more graph than break (compute-comm-compute)."""
+        self._cur.capture_end()
+        self.graphs.append(self._cur)
+        self._active = False
+        return self.graphs, self.breaks
+
+
+# Set only during segmented capture so the collective seams can find the
+# active recorder. None on every other path -> zero behavior change when the
+# piecewise flag is off.
+_active_segment_recorder: SegmentRecorder | None = None
+
+
+def get_active_segment_recorder() -> SegmentRecorder | None:
+    return _active_segment_recorder
+
+
 def _should_update_mamba_state_after_mtp_verify(
     drafter, attn_backend, forward_mode: ForwardMode
 ) -> bool:
@@ -291,8 +373,16 @@ class CudaGraphWrapper:
             if sampling_backend is not None
             else (CUDA_GRAPH_VARIANT_DEFAULT,)
         )
-        self.graphs: dict[tuple[str, int], torch.cuda.CUDAGraph] = {}
+        # For the monolithic path each value is a single CUDAGraph. For the
+        # piecewise decode path (self.piecewise_decode) the value is instead a
+        # (graphs, breaks) tuple; self._replay branches on the value type.
+        self.graphs: dict[tuple[str, int], object] = {}
         self.output_buffers: dict[tuple[str, int], tuple] = {}
+
+        # Piecewise decode CUDA graph: cudagraph the compute regions, run the
+        # collectives eagerly between graph replays. Default OFF -> the
+        # monolithic capture/replay path below is byte-identical to before.
+        self.piecewise_decode = getattr(config, "piecewise_decode_cudagraph", False)
 
         self._forward_func: Callable | None = forward_func
         self.disable = config.enforce_eager
@@ -336,7 +426,12 @@ class CudaGraphWrapper:
                     capture_range.set_description(
                         f"Capturing batches ({bs=}{variant_desc} {avail_mem=:.2f} GB)"
                     )
-                graph, output_buffers = self._capture_one(bs, variant=variant)
+                if self.piecewise_decode:
+                    graph, output_buffers = self._capture_one_segmented(
+                        bs, variant=variant
+                    )
+                else:
+                    graph, output_buffers = self._capture_one(bs, variant=variant)
                 self.graphs[(variant, bs)] = graph
                 self.output_buffers[(variant, bs)] = output_buffers
 
@@ -386,8 +481,25 @@ class CudaGraphWrapper:
     def _has_cuda_graph_for_bs(self, bs: int) -> bool:
         return (CUDA_GRAPH_VARIANT_DEFAULT, bs) in self.graphs
 
-    def _capture_one(self, bs: int, variant: str = CUDA_GRAPH_VARIANT_DEFAULT):
-        graph = torch.cuda.CUDAGraph()
+    def _capture_one_segmented(
+        self, bs: int, variant: str = CUDA_GRAPH_VARIANT_DEFAULT
+    ):
+        """Piecewise decode capture. Identical prologue/epilogue to
+        :meth:`_capture_one`; only the capture block differs (see
+        ``segmented=True``): the single ``torch.cuda.graph`` block is
+        replaced by a SegmentRecorder that splits the forward into compute
+        segments around eager collectives. Returns
+        ``((graphs, breaks), out)``."""
+        return self._capture_one(bs, variant=variant, segmented=True)
+
+    def _capture_one(
+        self,
+        bs: int,
+        variant: str = CUDA_GRAPH_VARIANT_DEFAULT,
+        segmented: bool = False,
+    ):
+        # Segmented capture owns its per-segment graphs via the recorder.
+        graph = None if segmented else torch.cuda.CUDAGraph()
 
         capture_forward_mode = ForwardMode.DECODE
         ctx = ForwardContext(
@@ -498,8 +610,13 @@ class CudaGraphWrapper:
         global _is_capture_mode
         _is_capture_mode = True
         global global_graph_memory_pool
-        with torch.cuda.graph(graph, pool=global_graph_memory_pool, stream=self.stream):
-            out = run_once()
+        if segmented:
+            captured, out = self._capture_segments(run_once)
+        else:
+            with torch.cuda.graph(
+                graph, pool=global_graph_memory_pool, stream=self.stream
+            ):
+                out = run_once()
 
         torch.cuda.synchronize()
         dist.barrier()
@@ -517,8 +634,35 @@ class CudaGraphWrapper:
                     break
             self.capturable_grammar.reset_state()
 
+        if segmented:
+            graphs, breaks = captured
+            # All segments share one pool; reuse it for the next capture.
+            global_graph_memory_pool = graphs[0].pool()
+            return (graphs, breaks), out
+
         global_graph_memory_pool = graph.pool()
         return graph, out
+
+    def _capture_segments(self, run_once):
+        """Run ``run_once`` under a SegmentRecorder so collective seams split
+        the forward into compute segments. Returns ``((graphs, breaks), out)``.
+
+        The recorder is published in ``_active_segment_recorder`` for the
+        duration of capture only; the collective seams in comm_ops/base.py
+        pick it up (via get_active_segment_recorder) to record breaks instead
+        of running the real collective. It is always cleared afterwards so no
+        other path is affected."""
+        global _active_segment_recorder
+        rec = SegmentRecorder()
+        _active_segment_recorder = rec
+        try:
+            with torch.cuda.stream(self.stream):
+                rec.begin(pool=global_graph_memory_pool, stream=self.stream)
+                out = run_once()
+                graphs, breaks = rec.finish()
+        finally:
+            _active_segment_recorder = None
+        return (graphs, breaks), out
 
     def _capture_paged_cache_block_tables(self, bs: int, pool) -> dict | None:
         specs = tuple(pool.paged_cache_group_specs)
@@ -887,6 +1031,23 @@ class CudaGraphWrapper:
         if active_bs < padded_bs:
             state_indices[active_bs:padded_bs].fill_(int(self.config.max_req_pool_size))
 
+    def _replay(self, graph_key: tuple[str, int]) -> None:
+        """Replay the captured decode graph for ``graph_key``.
+
+        Monolithic path (default): a single ``CUDAGraph`` -> one replay().
+        Piecewise path: a ``(graphs, breaks)`` tuple -> replay each compute
+        segment in order, running the stashed eager collective between
+        consecutive segments (compute -> comm -> compute)."""
+        captured = self.graphs[graph_key]
+        if isinstance(captured, tuple):
+            graphs, breaks = captured
+            for i, segment in enumerate(graphs):
+                segment.replay()
+                if i < len(breaks):
+                    breaks[i]()
+            return
+        captured.replay()
+
     def __call__(
         self,
         bs: int,
@@ -1000,7 +1161,7 @@ class CudaGraphWrapper:
 
             graph_key = self._cuda_graph_key(padded_bs)
             with nvtx_range("graph_replay", color="red"):
-                self.graphs[graph_key].replay()
+                self._replay(graph_key)
 
             (
                 output_tokens,

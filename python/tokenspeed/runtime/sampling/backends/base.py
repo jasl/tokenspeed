@@ -155,10 +155,30 @@ class SamplingBackend(ABC):
 
     def maybe_broadcast(self, *tensors: torch.Tensor) -> None:
         """Broadcast each tensor from tp_group[0] so all attention-TP ranks
-        agree. No-op when sync is off or tp_size <= 1. Graph-safe."""
+        agree. No-op when sync is off or tp_size <= 1. Graph-safe.
+
+        Under a piecewise decode CUDA graph, the sampler broadcast is a
+        host-staged collective too, so it is recorded as a segment break and
+        run eagerly between graph replays (see comm_ops._maybe_record_piecewise_break).
+        """
         if self._tp_pg is None:
             return
+        from tokenspeed.runtime.distributed.comm_ops import (
+            _NO_BREAK,
+            _maybe_record_piecewise_break,
+        )
+
         for t in tensors:
+            # in-place broadcast -> the same tensor feeds the next segment.
+            rec = _maybe_record_piecewise_break(
+                "BCAST",
+                lambda t=t: dist.broadcast(
+                    t, src=self._tp_src_global_rank, group=self._tp_pg
+                ),
+                t,
+            )
+            if rec is not _NO_BREAK:
+                continue
             dist.broadcast(t, src=self._tp_src_global_rank, group=self._tp_pg)
 
     def prepare_step(

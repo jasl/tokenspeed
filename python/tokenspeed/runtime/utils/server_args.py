@@ -246,6 +246,12 @@ class ServerArgs:
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
     prefill_graph_max_tokens: int | None = 128
+    # Piecewise decode CUDA graph: cudagraph the compute regions and run the
+    # TP collectives eagerly between graph replays. Fixes the 2-node GB10
+    # (TP=2, host-staged RoCE NCCL) hang where graph-replayed collectives
+    # deadlock. Default OFF -> monolithic decode capture is unchanged.
+    # Supports TP=2, EP off, DP=1 only today (validated below).
+    piecewise_decode_cudagraph: bool = False
     cudagraph_capture_sizes: list[int] | None = None
     enable_nan_detection: bool = False
     enable_nvtx: bool = False
@@ -573,6 +579,48 @@ class ServerArgs:
                 "allreduce is forbidden due to different attn_tp_size: %s and dense_tp_size: %s!",
                 self.mapping.attn.tp_size,
                 self.mapping.dense.tp_size,
+            )
+
+        self.resolve_piecewise_decode_cudagraph()
+
+    def resolve_piecewise_decode_cudagraph(self):
+        """Validate + constrain the piecewise decode CUDA graph.
+
+        The seam splits the decode graph at each TP collective and runs it
+        eagerly. Only the all_reduce / all_gather_into_tensor / sampler
+        broadcast collectives have a stable persistent buffer for the next
+        segment to read. That holds only when use_all_reduce is True on every
+        layer -- i.e. attn/dense/moe TP sizes all match -- with EP off and no
+        attn DP. Enforce that config here and force allreduce+norm fusion off
+        (the fused kernel is one opaque non-splittable node)."""
+        if not self.piecewise_decode_cudagraph:
+            return
+
+        attn_tp = self.mapping.attn.tp_size
+        dense_tp = self.mapping.dense.tp_size
+        moe_tp_ep = self.mapping.moe.tp_ep_size
+        if (
+            attn_tp <= 1
+            or self.enable_expert_parallel
+            or self.mapping.has_attn_dp
+            or attn_tp != dense_tp
+            or attn_tp != moe_tp_ep
+        ):
+            raise ValueError(
+                "piecewise_decode_cudagraph only supports TP>1, EP off, DP=1 "
+                "with matching attn/dense/moe TP sizes today "
+                f"(got attn_tp={attn_tp}, dense_tp={dense_tp}, "
+                f"moe_tp_ep={moe_tp_ep}, "
+                f"enable_expert_parallel={self.enable_expert_parallel}, "
+                f"attn_dp_size={self.mapping.attn.dp_size}). "
+                "Disable --piecewise-decode-cudagraph for this configuration."
+            )
+
+        if self.enable_allreduce_fusion:
+            self.enable_allreduce_fusion = False
+            logger.info(
+                "piecewise_decode_cudagraph: forcing allreduce fusion off "
+                "(the fused allreduce+norm node is not graph-splittable)."
             )
 
     def resolve_disaggregation(self):
@@ -1607,6 +1655,16 @@ class ServerArgs:
             "--disable-prefill-graph",
             action="store_true",
             help="Disable cuda graph for prefill.",
+        )
+        parser.add_argument(
+            "--piecewise-decode-cudagraph",
+            action="store_true",
+            help="Capture the decode forward as a piecewise CUDA graph: "
+            "cudagraph the compute regions and run the TP collectives "
+            "eagerly between graph replays. Fixes the 2-node GB10 (TP=2, "
+            "host-staged NCCL) hang where graph-replayed collectives "
+            "deadlock. Supports TP=2 / EP off / DP=1 only. Forces "
+            "allreduce fusion off. Off by default.",
         )
         parser.add_argument(
             "--prefill-graph-max-tokens",
