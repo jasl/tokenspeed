@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import os
+
 import torch
 
 from tokenspeed.runtime.configs.device_config import DeviceConfig
@@ -29,10 +31,53 @@ from tokenspeed.runtime.utils import (
     get_colorful_logger,
     set_cuda_arch,
 )
+from tokenspeed.runtime.utils.common import device_has_unified_memory
 from tokenspeed.runtime.utils.server_args import ServerArgs
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
+
+_CHECKPOINT_SUFFIXES = (".safetensors", ".bin", ".pt", ".gguf")
+
+
+def _release_checkpoint_page_cache(model_path: str) -> None:
+    """Drop the checkpoint's reclaimable page cache on unified-memory devices.
+
+    On integrated-GPU platforms (GB10/Grace, Thor, Jetson) host and device
+    share one physical DRAM pool. After weight load the checkpoint files
+    (~model-size) sit in the kernel page cache, counted as reclaimable in
+    MemAvailable but leaving MemFree ~0. The NVRM/CUDA allocator cannot
+    synchronously reclaim that page cache for a GPU allocation, so a large
+    prefill's transient workspace hits NV_ERR_NO_MEMORY even though psutil
+    reports memory "available" -- one rank aborts and the TP peer hangs in
+    the following all-reduce. Re-open each checkpoint file and advise the
+    kernel to drop its pages (root-free, unlike drop_caches), restoring real
+    MemFree headroom for runtime transients.
+    """
+    if not hasattr(os, "posix_fadvise"):
+        return
+    if not os.path.isdir(model_path):
+        return
+    released = 0
+    for root, _dirs, files in os.walk(model_path):
+        for name in files:
+            if not name.endswith(_CHECKPOINT_SUFFIXES):
+                continue
+            path = os.path.join(root, name)
+            try:
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                finally:
+                    os.close(fd)
+                released += 1
+            except OSError:
+                continue
+    if released:
+        logger.info(
+            "Released page cache for %d checkpoint file(s) on unified memory.",
+            released,
+        )
 
 
 class WeightLoader:
@@ -113,6 +158,12 @@ class WeightLoader:
                 )
 
         dtype = model_config.dtype
+
+        # On unified memory the checkpoint page cache squats on MemFree and
+        # starves runtime GPU transients; release it before the KV pool is
+        # sized so both the pool estimate and the transients see real headroom.
+        if device != "cpu" and device_has_unified_memory(gpu_id):
+            _release_checkpoint_page_cache(model_config.model_path)
 
         logger.info(
             "Load weight end. type=%s, dtype=%s, avail mem=%.2f GB",
