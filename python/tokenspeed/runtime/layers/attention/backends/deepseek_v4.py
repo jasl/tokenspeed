@@ -14,8 +14,6 @@
 from __future__ import annotations
 
 import functools
-import os
-from typing import Optional
 
 import torch
 from tokenspeed_kernel.ops.attention.flash_mla import (
