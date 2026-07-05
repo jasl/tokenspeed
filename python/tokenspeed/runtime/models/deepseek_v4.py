@@ -281,14 +281,20 @@ def _deepseek_v4_bf16_linear_fp32(
         and weight.dtype == torch.bfloat16
         and weight.dim() == 2
         and hidden_states.shape[1] == weight.shape[1]
-        and (_platform.is_hopper or _platform.is_blackwell)
     ):
-        return dsv3_router_gemm(
-            hidden_states,
-            weight,
-            out_dtype=torch.float32,
-            enable_pdl=False,
-        )
+        if _platform.is_hopper or _platform.is_blackwell:
+            return dsv3_router_gemm(
+                hidden_states,
+                weight,
+                out_dtype=torch.float32,
+                enable_pdl=False,
+            )
+        if _platform.is_consumer_blackwell:
+            # sm12x has no fp32 tensor cores; the fp32-upcast fallback runs as
+            # slow TF32-Ampere cuBLAS. Inputs are already bf16 (weight dequanted),
+            # so a bf16 tensor-core matmul (fp32 accumulate) is ~2.7-3x faster
+            # with no added input precision; cast to fp32 for routing/topk.
+            return F.linear(hidden_states, weight).float()
     return None
 
 
