@@ -160,6 +160,18 @@ class EventLoop:
         self.gpu_id = gpu_id
         self.global_rank = global_rank
 
+        # Deep-context sweeps churn many distinct-shaped prefill transients. On
+        # integrated/unified-memory devices (e.g. DGX Spark GB10) torch's caching
+        # allocator retains the freed blocks as OS 'used' host RAM rather than
+        # returning them, which can exhaust the node. Release the retained cache
+        # to the OS when the queue drains to idle (see _maybe_release_idle_cache).
+        from tokenspeed.runtime.utils.common import device_has_unified_memory
+
+        self._idle_release_enabled = device_has_unified_memory(gpu_id)
+        self._idle_release_streak = 0
+        self._idle_release_last = 0.0
+        self._idle_release_interval_s = 2.0
+
         self.model_config = self._load_model_config(server_args.model)
         if server_args.speculative_draft_model_path is not None:
             draft_model_config = self._load_model_config(
@@ -1601,6 +1613,11 @@ class EventLoop:
 
             self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
 
+            # Idle: return retained caching-allocator blocks to the OS (see the
+            # overlap loop). Synchronous path — this iter's forward already
+            # committed above, so the GPU is quiescent when forward_op is None.
+            self._maybe_release_idle_cache(forward_op)
+
     def _mark_stats_scheduled(self, forward_op) -> None:
         # Stamp the pre-forward "scheduled" time on each request's stats tracker
         # so the queue/prefill split is anchored before the forward (idempotent:
@@ -1654,6 +1671,30 @@ class EventLoop:
                 )
 
         return GrammarStepInputs(grammars=grammars, advance_mask=advance_mask)
+
+    def _maybe_release_idle_cache(self, forward_op) -> None:
+        """Return the caching allocator's retained (freed) blocks to the OS when
+        the scheduler is idle, to cap unified-memory 'used' growth across
+        deep-context sweeps that churn many distinct prefill shapes.
+
+        No-op unless the device shares host RAM (integrated/GB10). Only fires
+        after two consecutive idle iterations (so any overlapped forward has
+        been committed+synced and the GPU is quiescent) and is rate-limited so a
+        bursty-then-idle workload does not thrash the allocator.
+        """
+        if not self._idle_release_enabled:
+            return
+        if forward_op is not None:
+            self._idle_release_streak = 0
+            return
+        self._idle_release_streak += 1
+        if self._idle_release_streak < 2:
+            return
+        now = time.monotonic()
+        if now - self._idle_release_last < self._idle_release_interval_s:
+            return
+        self._idle_release_last = now
+        torch.cuda.empty_cache()
 
     def event_loop_overlap(self):
         """
@@ -1797,6 +1838,12 @@ class EventLoop:
             self._pause.maybe_finish_drain(self.scheduler)
 
             self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
+
+            # Idle: return the caching allocator's retained blocks to the OS.
+            # prev_results was committed+synced above and no forward was
+            # dispatched this iteration, so the GPU is quiescent (no graph
+            # replay in flight). Rate-limited; no-op off unified memory.
+            self._maybe_release_idle_cache(forward_op)
 
             prev_results = curr_results
             prev_forward_op = forward_op
