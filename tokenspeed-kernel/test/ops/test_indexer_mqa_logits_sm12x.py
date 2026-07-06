@@ -184,6 +184,10 @@ def test_indexer_prefill_tf32_topk_close(device):
 # --------------------------------------------------------------------------- #
 # Paged decode (block-interleaved MXFP4 cache + block_table)
 # --------------------------------------------------------------------------- #
+_VALUE_BYTES = _SCALE_BLOCKS * _BYTES_PER_BLOCK  # 64 value bytes per slot
+_SCALE_BYTES = _SCALE_BLOCKS  # one e8m0 byte per 32-dim block
+
+
 def _pack_paged_cache(
     kv_values_i8: torch.Tensor,
     kv_scales_i32: torch.Tensor,
@@ -191,23 +195,42 @@ def _pack_paged_cache(
     bs: int,
     device: str,
 ) -> torch.Tensor:
-    """Pack logical [N, VB] values + [N] int32 scales into the block-interleaved
-    paged cache layout: per 32-dim block ``[16 value bytes | 1 e8m0 scale byte]``."""
+    """Pack logical [N, VB] values + [N] int32 scales into the paged cache's
+    structure-of-arrays layout (what the production writer emits and deep_gemm
+    reads): per page a value region ``bs x VB`` bytes followed by a scale region
+    ``bs x SCALE_BLOCKS`` e8m0 bytes."""
     n = kv_values_i8.shape[0]
     kvv = kv_values_i8.view(torch.uint8)
     cache = torch.zeros(num_pages, bs * _ROW_BYTES, dtype=torch.uint8, device=device)
     pos = torch.arange(n, device=device)
     page, slot = pos // bs, pos % bs
-    ii = torch.arange(_BYTES_PER_BLOCK, device=device)
+    vb_idx = torch.arange(_VALUE_BYTES, device=device)
+    cache[page[:, None], (slot * _VALUE_BYTES)[:, None] + vb_idx[None, :]] = kvv
+    scale_base = bs * _VALUE_BYTES
     for b in range(_SCALE_BLOCKS):
-        dst = slot * _ROW_BYTES + b * _BLOCK_BYTES
-        cache[page[:, None], dst[:, None] + ii[None, :]] = kvv[
-            :, b * _BYTES_PER_BLOCK : (b + 1) * _BYTES_PER_BLOCK
-        ]
-        cache[page, dst + _BYTES_PER_BLOCK] = ((kv_scales_i32 >> (8 * b)) & 0xFF).to(
-            torch.uint8
-        )
+        cache[page, scale_base + slot * _SCALE_BYTES + b] = (
+            (kv_scales_i32 >> (8 * b)) & 0xFF
+        ).to(torch.uint8)
     return cache.view(torch.int8)
+
+
+def _soa_gather(
+    cache_2d: torch.Tensor, num_kv: int, bs: int, device: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Inverse of ``_pack_paged_cache``: read logical values/scales back out of
+    the SoA cache (used to build the reference for a production-writer cache)."""
+    raw = cache_2d.view(torch.uint8)
+    pos = torch.arange(num_kv, device=device)
+    page, slot = pos // bs, pos % bs
+    vb_idx = torch.arange(_VALUE_BYTES, device=device)
+    kv = raw[page[:, None], (slot * _VALUE_BYTES)[:, None] + vb_idx[None, :]]
+    scale_base = bs * _VALUE_BYTES
+    packed = torch.zeros(num_kv, dtype=torch.int64, device=device)
+    for b in range(_SCALE_BYTES):
+        packed |= raw[page, scale_base + slot * _SCALE_BYTES + b].to(torch.int64) << (
+            8 * b
+        )
+    return kv.contiguous().view(torch.int8), packed.to(torch.int32)
 
 
 @pytest.mark.parametrize(
@@ -217,6 +240,7 @@ def _pack_paged_cache(
         pytest.param(16, 200, 64, id="nt16-kv200"),
         pytest.param(8, 130, 64, id="nt8-straddle"),
         pytest.param(160, 1024, 64, id="nt160-kv1024"),
+        pytest.param(8, 28000, 64, id="nt8-kv28000-longctx"),
     ],
 )
 def test_indexer_paged_decode_matches_reference(device, num_tokens, num_kv, block_size):
@@ -272,3 +296,73 @@ def test_indexer_paged_decode_matches_reference(device, num_tokens, num_kv, bloc
     assert _topk_sets_match(
         ref, tri, eff
     ), "paged decode top-k selection differs from reference"
+
+
+@pytest.mark.parametrize("num_kv", [1024, 20000], ids=["kv1024", "kv20000-longctx"])
+def test_indexer_paged_decode_matches_production_writer(device, num_kv):
+    """Lock the paged-decode kernel to the SoA cache layout emitted by the
+    production MXFP4 writer (the layout deep_gemm reads). This is the guard the
+    original kernel lacked: it assumed a per-slot block-interleaved layout, so a
+    self-consistent hand-packed cache passed while the real serve dropped the
+    early-context needles. Writes the cache with the real writer, then checks the
+    Triton kernel against the torch reference on the same keys, at long context.
+    """
+    write_deepseek_v4_indexer_mxfp4_cache_cuda = pytest.importorskip(
+        "tokenspeed_kernel.ops.attention.triton.deepseek_v4"
+    ).write_deepseek_v4_indexer_mxfp4_cache_cuda
+
+    num_tokens, bs = 8, 64
+    gen = torch.Generator(device=device).manual_seed(num_kv * 13 + 5)
+    index_k = torch.randn(num_kv, D, dtype=torch.bfloat16, device=device, generator=gen)
+    num_pages = (num_kv + bs - 1) // bs
+    cache = torch.zeros(
+        num_pages, bs * _ROW_BYTES, dtype=torch.uint8, device=device
+    ).view(torch.int8)
+    slot_mapping = torch.arange(num_kv, dtype=torch.int64, device=device)
+    valid = torch.ones(num_kv, dtype=torch.int32, device=device)
+    write_deepseek_v4_indexer_mxfp4_cache_cuda(index_k, cache, slot_mapping, valid, bs)
+
+    kv_i8, ks_i32 = _soa_gather(cache, num_kv, bs, device)
+    qv = torch.randint(
+        0, 256, (num_tokens, H, VB), dtype=torch.uint8, device=device, generator=gen
+    ).view(torch.int8)
+    qs = _scales((num_tokens, H), gen, device)
+    w = torch.randn(num_tokens, H, dtype=torch.float32, device=device, generator=gen)
+    ctx = torch.randint(
+        1, num_kv + 1, (num_tokens,), dtype=torch.int32, device=device, generator=gen
+    )
+    max_ctx = int(ctx.max())
+    block_table = torch.arange(num_pages, dtype=torch.int32, device=device)[
+        None, :
+    ].repeat(num_tokens, 1)
+
+    ref = indexer_mqa_logits_sm12x(
+        qv,
+        qs,
+        kv_i8,
+        ks_i32,
+        w,
+        torch.zeros(num_tokens, dtype=torch.int32, device=device),
+        ctx,
+        max_ctx,
+        head_dim=D,
+    )
+    tri = indexer_mqa_logits_paged_sm12x_triton(
+        qv,
+        qs,
+        cache,
+        block_table,
+        ctx,
+        w,
+        bs,
+        max_ctx,
+        head_dim=D,
+        input_precision="ieee",
+    )
+
+    eff = [min(int(ctx[m]), max_ctx) for m in range(num_tokens)]
+    assert bool((torch.isinf(ref) == torch.isinf(tri)).all()), "-inf padding mismatch"
+    assert _cos(ref, tri) > 0.9999
+    assert _topk_sets_match(
+        ref, tri, eff
+    ), "paged decode top-k selection differs from the production-writer cache"
