@@ -43,6 +43,7 @@ try:
 except ImportError:
     deep_gemm = None  # type: ignore[assignment]
 
+from tokenspeed_kernel.ops.activation import fused_silu_and_mul
 from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
     has_indexer_mxfp4_paged_gather,
     has_persistent_topk,
@@ -2303,13 +2304,14 @@ class DeepseekV4MLP(nn.Module):
                 gate_up, swiglu_limit=self.swiglu_limit or 0.0
             )
             out, _ = self.down_proj(x_fp8, scale=scale)
-        else:
+        elif self.swiglu_limit is not None and self.swiglu_limit > 0:
+            # Clamped SwiGLU has no fused kernel; keep the explicit fp32 path.
             gate, up = gate_up.float().chunk(2, dim=-1)
-            if self.swiglu_limit is not None and self.swiglu_limit > 0:
-                gate = torch.clamp(gate, max=self.swiglu_limit)
-                up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
-            x = (F.silu(gate) * up).to(x.dtype)
-            out, _ = self.down_proj(x)
+            gate = torch.clamp(gate, max=self.swiglu_limit)
+            up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
+            out, _ = self.down_proj((F.silu(gate) * up).to(x.dtype))
+        else:
+            out, _ = self.down_proj(fused_silu_and_mul(gate_up, output_dtype=x.dtype))
         return out
 
 
