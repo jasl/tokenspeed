@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.activation import fused_silu_and_mul
 from tokenspeed_kernel.ops.activation.triton import (
     fused_gate_sigmoid_mul_add,
     sigmoid_mul,
@@ -202,3 +203,45 @@ def test_fused_gate_sigmoid_mul_add_empty(device: str) -> None:
 
     out = fused_gate_sigmoid_mul_add(hidden_states, gate_weight, shared_output, final)
     assert out.shape == (0, 256)
+
+
+# --- fused_silu_and_mul dispatch tests ---
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize(
+    "shape",
+    # DSv4-Flash SwiGLU: gate_up is [num_tokens, 2 * moe_intermediate_per_rank].
+    # Decode (bs * num_draft), single-token, and prefill token counts.
+    [(24, 2048), (1, 2048), (2048, 2048), (128, 4096)],
+)
+def test_fused_silu_and_mul_matches_eager(
+    dtype: torch.dtype, shape: tuple[int, int], device: str
+) -> None:
+    """The fused dispatch must match the fp32-accumulated eager SwiGLU it
+    replaces: DSv4's sparse indexer selection is numerically sensitive, so the
+    swap has to reproduce ``F.silu(gate.float()) * up.float()`` closely."""
+    gate_up = torch.randn(shape, device=device, dtype=dtype)
+    d = shape[-1] // 2
+    gate, up = gate_up[..., :d], gate_up[..., d:]
+    ref = (torch.nn.functional.silu(gate.float()) * up.float()).to(dtype)
+
+    out = fused_silu_and_mul(gate_up, output_dtype=dtype)
+
+    assert out.shape == (shape[0], d)
+    assert out.dtype == dtype
+    tol = 1e-2 if dtype == torch.bfloat16 else 5e-3
+    torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+
+
+def test_fused_silu_and_mul_casts_output_dtype(device: str) -> None:
+    """Output is cast to the requested dtype even when the backend computes in
+    the input dtype (callers pass the model activation dtype)."""
+    gate_up = torch.randn(16, 2048, device=device, dtype=torch.bfloat16)
+    out = fused_silu_and_mul(gate_up, output_dtype=torch.float32)
+    assert out.dtype == torch.float32
+    ref = (
+        torch.nn.functional.silu(gate_up[..., :1024].float())
+        * gate_up[..., 1024:].float()
+    )
+    torch.testing.assert_close(out, ref, atol=5e-3, rtol=5e-3)
