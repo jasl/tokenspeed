@@ -28,8 +28,8 @@ from contextlib import contextmanager
 
 import tokenspeed_kernel
 import torch
-import torch.nn.functional as F
 from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
+from tokenspeed_kernel.ops.activation import fused_silu_and_mul
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -146,8 +146,7 @@ def _silu_gate_up(
     *,
     output_dtype: torch.dtype,
 ) -> torch.Tensor:
-    gate, up = gate_up.float().chunk(2, dim=-1)
-    return (F.silu(gate) * up).to(output_dtype)
+    return fused_silu_and_mul(gate_up, output_dtype=output_dtype)
 
 
 def _is_bf16_mxfp4(x, w, precision_config):
