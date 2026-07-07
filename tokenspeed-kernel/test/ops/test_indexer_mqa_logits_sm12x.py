@@ -38,6 +38,8 @@ from tokenspeed_kernel.ops.attention.torch.indexer_mqa_logits_sm12x import (
     indexer_mqa_logits_sm12x,
 )
 from tokenspeed_kernel.ops.attention.triton.indexer_mqa_logits_sm12x import (
+    indexer_mqa_logits_gather_sm12x_triton,
+    indexer_mqa_logits_hhead_sm12x_triton,
     indexer_mqa_logits_paged_sm12x_triton,
     indexer_mqa_logits_sm12x_triton,
 )
@@ -179,6 +181,152 @@ def test_indexer_prefill_tf32_topk_close(device):
     )
     assert bool((torch.isinf(ref) == torch.isinf(tf32)).all())
     assert _cos(ref, tf32) > 0.999
+
+
+# --------------------------------------------------------------------------- #
+# MISA-dagger fast path (pass-1 h-head prefilter + pass-2 candidate re-score)
+# --------------------------------------------------------------------------- #
+def _dense_qkvw(num_q: int, num_kv: int, seed: int, device: str):
+    """Random MXFP4-packed q/k/w with a dense window ks=0, ke=num_kv."""
+    gen = torch.Generator(device=device).manual_seed(seed)
+    qv = torch.randint(
+        0, 256, (num_q, H, VB), dtype=torch.uint8, device=device, generator=gen
+    ).view(torch.int8)
+    qs = _scales((num_q, H), gen, device)
+    kv = torch.randint(
+        0, 256, (num_kv, VB), dtype=torch.uint8, device=device, generator=gen
+    ).view(torch.int8)
+    ksc = _scales((num_kv,), gen, device)
+    w = torch.randn(num_q, H, dtype=torch.float32, device=device, generator=gen)
+    ks = torch.zeros(num_q, dtype=torch.int32, device=device)
+    ke = torch.full((num_q,), num_kv, dtype=torch.int32, device=device)
+    return qv, qs, kv, ksc, w, ks, ke
+
+
+@pytest.mark.parametrize(
+    "num_q,num_kv,h_sel",
+    [
+        pytest.param(64, 512, 32, id="h32-512"),
+        pytest.param(128, 2048, 32, id="h32-2048"),
+        pytest.param(96, 1024, 16, id="h16-1024"),
+    ],
+)
+def test_indexer_hhead_matches_masked_full(device, num_q, num_kv, h_sel):
+    """Pass-1: scoring each query's top-h heads == the full kernel with the
+    non-selected heads' weights zeroed (a zero-weight head contributes 0 to
+    logits = SUM_h ReLU(dot)*w, so this is exact up to fp add-order)."""
+    qv, qs, kv, ksc, w, ks, ke = _dense_qkvw(
+        num_q, num_kv, num_q + num_kv + h_sel, device
+    )
+    max_len = num_kv
+    head_idx = w.abs().topk(h_sel, dim=1).indices.to(torch.int32)
+    w_mask = torch.zeros_like(w).scatter_(
+        1, head_idx.long(), w.gather(1, head_idx.long())
+    )
+
+    masked = indexer_mqa_logits_sm12x_triton(
+        qv, qs, kv, ksc, w_mask, ks, ke, max_len, head_dim=D, input_precision="ieee"
+    )
+    hhead = indexer_mqa_logits_hhead_sm12x_triton(
+        qv,
+        qs,
+        kv,
+        ksc,
+        w,
+        head_idx,
+        ks,
+        ke,
+        max_len,
+        head_dim=D,
+        input_precision="ieee",
+    )
+    # Scoring the top-h heads is exact vs zeroing the rest (masked heads add 0);
+    # only tensor-core fp add-order differs -> near-identical logits + same top-k.
+    assert bool(
+        (torch.isinf(masked) == torch.isinf(hhead)).all()
+    ), "-inf padding mismatch"
+    assert _cos(masked, hhead) > 0.9999
+    assert _topk_sets_match(masked, hhead, [num_kv] * num_q)
+
+
+def test_indexer_gather_matches_full_at_candidates(device):
+    """Pass-2: re-scoring C candidate columns == the full kernel's logits gathered
+    at those columns (same per-element arithmetic -> bit-identical)."""
+    num_q, num_kv, C = 128, 4096, 1024
+    qv, qs, kv, ksc, w, ks, ke = _dense_qkvw(num_q, num_kv, 99, device)
+    full = indexer_mqa_logits_sm12x_triton(
+        qv, qs, kv, ksc, w, ks, ke, num_kv, head_dim=D, input_precision="ieee"
+    )
+    cand = full.topk(C, dim=1).indices.to(torch.int32)  # distinct valid columns
+    gathered = indexer_mqa_logits_gather_sm12x_triton(
+        qv, qs, kv, ksc, w, cand, ks, ke, head_dim=D, input_precision="ieee"
+    )
+    ref = full.gather(1, cand.long())
+    # Same per-element arithmetic as the full kernel -> near-identical (fp add-order).
+    assert _cos(ref, gathered) > 0.9999
+    fin = torch.isfinite(ref)
+    rel = (gathered[fin] - ref[fin]).abs() / ref[fin].abs().clamp_min(1.0)
+    assert float(rel.max()) < 1e-3
+
+
+def test_indexer_misa_fast_equals_masked_topk(device):
+    """The full 2-pass fast path (hhead -> topk C -> gather -> scatter) selects the
+    SAME top-512 as the masked-weight reference (misa_dagger) it replaces."""
+    num_q, num_kv, h_sel, C, topk = 128, 4096, 32, 1024, 512
+    qv, qs, kv, ksc, w, ks, ke = _dense_qkvw(num_q, num_kv, 7, device)
+    max_len = num_kv
+    head_idx = w.abs().topk(h_sel, dim=1).indices.to(torch.int32)
+    w_mask = torch.zeros_like(w).scatter_(
+        1, head_idx.long(), w.gather(1, head_idx.long())
+    )
+    full = indexer_mqa_logits_sm12x_triton(
+        qv, qs, kv, ksc, w, ks, ke, max_len, head_dim=D, input_precision="ieee"
+    )
+
+    # masked reference (misa_dagger)
+    masked = indexer_mqa_logits_sm12x_triton(
+        qv, qs, kv, ksc, w_mask, ks, ke, max_len, head_dim=D, input_precision="ieee"
+    )
+    cand_ref = masked.topk(C, dim=1).indices
+    ref_logits = torch.full_like(full, float("-inf")).scatter_(
+        1, cand_ref, full.gather(1, cand_ref)
+    )
+
+    # fast path (dedicated kernels)
+    hhead = indexer_mqa_logits_hhead_sm12x_triton(
+        qv,
+        qs,
+        kv,
+        ksc,
+        w,
+        head_idx,
+        ks,
+        ke,
+        max_len,
+        head_dim=D,
+        input_precision="ieee",
+    )
+    cand_fast = hhead.topk(C, dim=1).indices.to(torch.int32)
+    l_cand = indexer_mqa_logits_gather_sm12x_triton(
+        qv, qs, kv, ksc, w, cand_fast, ks, ke, head_dim=D, input_precision="ieee"
+    )
+    fast_logits = torch.full_like(full, float("-inf")).scatter_(
+        1, cand_fast.long(), l_cand
+    )
+
+    assert _topk_sets_match(ref_logits, fast_logits, [num_kv] * num_q, topk=topk)
+
+
+@pytest.mark.parametrize("bad_h", [8, 24, 48])
+def test_indexer_hhead_rejects_unsupported_h_sel(device, bad_h):
+    """The wrapper rejects H_SEL that is <16 or not a power of 2 (tl.arange /
+    tl.dot M constraints) with a clear ValueError, not a raw Triton error."""
+    qv, qs, kv, ksc, w, ks, ke = _dense_qkvw(8, 64, 1, device)
+    head_idx = torch.zeros(8, bad_h, dtype=torch.int32, device=device)
+    with pytest.raises(ValueError):
+        indexer_mqa_logits_hhead_sm12x_triton(
+            qv, qs, kv, ksc, w, head_idx, ks, ke, 64, head_dim=D
+        )
 
 
 # --------------------------------------------------------------------------- #

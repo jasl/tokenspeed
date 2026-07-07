@@ -252,6 +252,354 @@ def indexer_mqa_logits_sm12x_triton(
     return out
 
 
+# ============================ MISA-dagger fast path ============================
+# Two-pass sparse indexer prefill (see project_ds4_indexer_subquadratic_research):
+#   pass 1 (_hhead): score all N keys using only each query's top-H_SEL heads (by
+#     |weight|) -> cheap candidate ranking. FLOP = H_SEL/H of the full scorer.
+#     Output is the SAME compact [num_q, max_seqlen_k] layout as the full kernel,
+#     so torch.topk(C) over it yields the C candidate columns per query.
+#   pass 2 (_gather): re-score ONLY those C candidates with ALL H heads (exact) ->
+#     [num_q, C]. FLOP = C/N of the full scorer -> amortizes at long context.
+# Selecting the top-H_SEL heads is bit-exact vs zeroing the other heads' weights
+# (logits = sum_h ReLU(dot)*w, and a zero-weight head contributes 0), so the fast
+# path reproduces the MVP masked-weight path it replaces (the validated oracle).
+
+
+@triton.jit
+def _indexer_mqa_logits_hhead_kernel(
+    q_values_ptr,  # int8  [num_q, H, VALUE_BYTES]
+    q_scales_ptr,  # int32 [num_q, H]
+    k_values_ptr,  # int8  [num_kv, VALUE_BYTES]
+    k_scales_ptr,  # int32 [num_kv]
+    weights_ptr,  # fp32  [num_q, H]
+    head_idx_ptr,  # int32 [num_q, H_SEL]   per-query selected head indices (top-|w|)
+    ks_ptr,  # int32 [num_q]
+    ke_ptr,  # int32 [num_q]
+    out_ptr,  # fp32  [num_q, max_seqlen_k]
+    num_kv,
+    max_seqlen_k,
+    stride_qv_m,
+    stride_qv_h,
+    stride_qs_m,
+    stride_kv_n,
+    stride_w_m,
+    stride_hi_m,
+    stride_o_m,
+    H_SEL: tl.constexpr,  # number of heads scored per query (<= H)
+    VALUE_BYTES: tl.constexpr,
+    SCALE_BLOCKS: tl.constexpr,
+    BYTES_PER_BLOCK: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr,
+):
+    m = tl.program_id(0)
+    nb = tl.program_id(1)
+    m_off = m.to(tl.int64)
+
+    ks = tl.maximum(tl.load(ks_ptr + m), 0)
+    ke = tl.minimum(tl.load(ke_ptr + m), num_kv)
+    row_len = tl.maximum(ke - ks, 0)
+
+    n_rel = nb * BLOCK_N + tl.arange(0, BLOCK_N)
+    if nb * BLOCK_N >= row_len:
+        neg = tl.full((BLOCK_N,), float("-inf"), tl.float32)
+        tl.store(out_ptr + m_off * stride_o_m + n_rel, neg, mask=n_rel < max_seqlen_k)
+        return
+    valid_n = (n_rel < row_len) & (n_rel < max_seqlen_k)
+    k_idx = ks + n_rel
+
+    # Gathered head indices for this query (top-|w| heads) -> [H_SEL].
+    hsel = tl.arange(0, H_SEL)
+    hd = tl.load(head_idx_ptr + m_off * stride_hi_m + hsel)  # [H_SEL] int32
+    db = tl.arange(0, VALUE_BYTES)
+    blk = db // BYTES_PER_BLOCK
+
+    # ---- dequant q[m] for the selected heads: [H_SEL, VALUE_BYTES] ----
+    q_ptr = q_values_ptr + m_off * stride_qv_m + hd[:, None] * stride_qv_h + db[None, :]
+    q_b = tl.load(q_ptr).to(tl.int32) & 0xFF
+    q_lo = _e2m1_decode(q_b & 0xF)
+    q_hi = _e2m1_decode((q_b >> 4) & 0xF)
+    q_sc = tl.load(q_scales_ptr + m * stride_qs_m + hd)  # [H_SEL] int32
+    q_scale = tl.zeros((H_SEL, VALUE_BYTES), dtype=tl.float32)
+    for b in tl.static_range(SCALE_BLOCKS):
+        sval = _block_scale(q_sc, b)  # [H_SEL]
+        q_scale = tl.where(blk[None, :] == b, sval[:, None], q_scale)
+    q_lo = q_lo * q_scale
+    q_hi = q_hi * q_scale
+
+    # ---- dequant k[k_idx]: [VALUE_BYTES, BLOCK_N] (identical to the full kernel) ----
+    k_ptr = k_values_ptr + k_idx[None, :].to(tl.int64) * stride_kv_n + db[:, None]
+    k_b = tl.load(k_ptr, mask=valid_n[None, :], other=0).to(tl.int32) & 0xFF
+    k_lo = _e2m1_decode(k_b & 0xF)
+    k_hi = _e2m1_decode((k_b >> 4) & 0xF)
+    k_sc = tl.load(k_scales_ptr + k_idx, mask=valid_n, other=0)  # [BLOCK_N]
+    k_scale = tl.zeros((VALUE_BYTES, BLOCK_N), dtype=tl.float32)
+    for b in tl.static_range(SCALE_BLOCKS):
+        sval = _block_scale(k_sc, b)  # [BLOCK_N]
+        k_scale = tl.where(blk[:, None] == b, sval[None, :], k_scale)
+    k_lo = k_lo * k_scale
+    k_hi = k_hi * k_scale
+
+    scores = tl.dot(q_lo, k_lo, input_precision=INPUT_PRECISION)
+    scores += tl.dot(q_hi, k_hi, input_precision=INPUT_PRECISION)  # [H_SEL, BLOCK_N]
+
+    w = tl.load(weights_ptr + m * stride_w_m + hd).to(tl.float32)  # [H_SEL]
+    logits = tl.sum(tl.maximum(scores, 0.0) * w[:, None], axis=0)  # [BLOCK_N]
+
+    out_val = tl.where(n_rel < row_len, logits, float("-inf"))
+    tl.store(out_ptr + m_off * stride_o_m + n_rel, out_val, mask=n_rel < max_seqlen_k)
+
+
+def indexer_mqa_logits_hhead_sm12x_triton(
+    q_values: torch.Tensor,
+    q_scales: torch.Tensor,
+    k_values: torch.Tensor,
+    k_scales: torch.Tensor,
+    weights: torch.Tensor,
+    head_idx: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    max_seqlen_k: int,
+    head_dim: int = 128,
+    block_n: int = 128,
+    input_precision: str = "ieee",
+) -> torch.Tensor:
+    """MISA-dagger pass 1: compact indexer logits using each query's top-``H_SEL``
+    heads only (``head_idx``), a drop-in for ``indexer_mqa_logits_sm12x_triton``
+    restricted to a per-query head subset.
+
+    Args:
+        head_idx: Per-query selected head indices, ``[num_q, H_SEL]`` int32
+            (e.g. ``weights.abs().topk(H_SEL, dim=1).indices``). All other args
+            match ``indexer_mqa_logits_sm12x_triton``.
+
+    Returns:
+        Compact logits ``[num_q, max_seqlen_k]`` fp32 == the full-head kernel run
+        with the non-selected heads' weights zeroed.
+    """
+    num_q, num_heads, value_bytes = q_values.shape
+    h_sel = head_idx.shape[1]
+    device = q_values.device
+    out = torch.full(
+        (num_q, max_seqlen_k), float("-inf"), dtype=torch.float32, device=device
+    )
+    num_kv = k_values.shape[0]
+    if num_q == 0 or num_kv == 0 or max_seqlen_k <= 0:
+        return out
+    if value_bytes != head_dim // 2:
+        raise ValueError(
+            f"q_values last dim {value_bytes} != head_dim//2 {head_dim // 2}"
+        )
+    if h_sel > num_heads:
+        raise ValueError(f"head_idx H_SEL {h_sel} > num_heads {num_heads}")
+    # H_SEL is a constexpr block dim: tl.arange(0, H_SEL) needs a power of 2 and the
+    # tl.dot M dim needs >= 16. Fail loudly here rather than as a raw Triton error.
+    if h_sel < 16 or (h_sel & (h_sel - 1)) != 0:
+        raise ValueError(
+            f"head_idx H_SEL {h_sel} must be a power of 2 in [16, {num_heads}]"
+        )
+
+    q_values = q_values.contiguous()
+    q_scales = q_scales.contiguous()
+    k_values = k_values.contiguous()
+    k_scales = k_scales.contiguous()
+    weights = weights.contiguous()
+    head_idx = head_idx.contiguous().to(torch.int32)
+    cu_seqlen_ks = cu_seqlen_ks.contiguous()
+    cu_seqlen_ke = cu_seqlen_ke.contiguous()
+
+    grid = (num_q, triton.cdiv(max_seqlen_k, block_n))
+    _indexer_mqa_logits_hhead_kernel[grid](
+        q_values,
+        q_scales,
+        k_values,
+        k_scales,
+        weights,
+        head_idx,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        out,
+        num_kv,
+        max_seqlen_k,
+        q_values.stride(0),
+        q_values.stride(1),
+        q_scales.stride(0),
+        k_values.stride(0),
+        weights.stride(0),
+        head_idx.stride(0),
+        out.stride(0),
+        H_SEL=h_sel,
+        VALUE_BYTES=value_bytes,
+        SCALE_BLOCKS=head_dim // _MXFP4_BLOCK,
+        BYTES_PER_BLOCK=_MXFP4_BLOCK // 2,
+        BLOCK_N=block_n,
+        INPUT_PRECISION=input_precision,
+    )
+    return out
+
+
+@triton.jit
+def _indexer_mqa_logits_gather_kernel(
+    q_values_ptr,  # int8  [num_q, H, VALUE_BYTES]
+    q_scales_ptr,  # int32 [num_q, H]
+    k_values_ptr,  # int8  [num_kv, VALUE_BYTES]
+    k_scales_ptr,  # int32 [num_kv]
+    weights_ptr,  # fp32  [num_q, H]
+    cand_ptr,  # int32 [num_q, C]   per-query candidate columns (compact, 0-based)
+    ks_ptr,  # int32 [num_q]
+    ke_ptr,  # int32 [num_q]
+    out_ptr,  # fp32  [num_q, C]
+    num_kv,
+    C,
+    stride_qv_m,
+    stride_qv_h,
+    stride_qs_m,
+    stride_kv_n,
+    stride_w_m,
+    stride_cand_m,
+    stride_o_m,
+    H: tl.constexpr,
+    VALUE_BYTES: tl.constexpr,
+    SCALE_BLOCKS: tl.constexpr,
+    BYTES_PER_BLOCK: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr,
+):
+    m = tl.program_id(0)
+    cb = tl.program_id(1)
+    m_off = m.to(tl.int64)
+
+    ks = tl.maximum(tl.load(ks_ptr + m), 0)
+    ke = tl.minimum(tl.load(ke_ptr + m), num_kv)
+    row_len = tl.maximum(ke - ks, 0)
+
+    c_rel = cb * BLOCK_N + tl.arange(0, BLOCK_N)  # candidate slots for this tile
+    valid_c = c_rel < C
+    # Candidate compact column for each slot; a column past this row's window
+    # (row_len) is a -inf pad from topk on a short row -> score it -inf.
+    cand_col = tl.load(cand_ptr + m_off * stride_cand_m + c_rel, mask=valid_c, other=0)
+    valid = valid_c & (cand_col < row_len) & (cand_col >= 0)
+    k_idx = ks + cand_col  # actual kv row, valid only where ``valid``
+
+    hd = tl.arange(0, H)
+    db = tl.arange(0, VALUE_BYTES)
+    blk = db // BYTES_PER_BLOCK
+
+    # ---- dequant q[m], all H heads: [H, VALUE_BYTES] ----
+    q_ptr = q_values_ptr + m_off * stride_qv_m + hd[:, None] * stride_qv_h + db[None, :]
+    q_b = tl.load(q_ptr).to(tl.int32) & 0xFF
+    q_lo = _e2m1_decode(q_b & 0xF)
+    q_hi = _e2m1_decode((q_b >> 4) & 0xF)
+    q_sc = tl.load(q_scales_ptr + m * stride_qs_m + hd)  # [H]
+    q_scale = tl.zeros((H, VALUE_BYTES), dtype=tl.float32)
+    for b in tl.static_range(SCALE_BLOCKS):
+        sval = _block_scale(q_sc, b)
+        q_scale = tl.where(blk[None, :] == b, sval[:, None], q_scale)
+    q_lo = q_lo * q_scale
+    q_hi = q_hi * q_scale
+
+    # ---- dequant gathered k[k_idx]: [VALUE_BYTES, BLOCK_N] (scattered gather) ----
+    k_ptr = k_values_ptr + k_idx[None, :].to(tl.int64) * stride_kv_n + db[:, None]
+    k_b = tl.load(k_ptr, mask=valid[None, :], other=0).to(tl.int32) & 0xFF
+    k_lo = _e2m1_decode(k_b & 0xF)
+    k_hi = _e2m1_decode((k_b >> 4) & 0xF)
+    k_sc = tl.load(k_scales_ptr + k_idx, mask=valid, other=0)  # [BLOCK_N]
+    k_scale = tl.zeros((VALUE_BYTES, BLOCK_N), dtype=tl.float32)
+    for b in tl.static_range(SCALE_BLOCKS):
+        sval = _block_scale(k_sc, b)
+        k_scale = tl.where(blk[:, None] == b, sval[None, :], k_scale)
+    k_lo = k_lo * k_scale
+    k_hi = k_hi * k_scale
+
+    scores = tl.dot(q_lo, k_lo, input_precision=INPUT_PRECISION)
+    scores += tl.dot(q_hi, k_hi, input_precision=INPUT_PRECISION)  # [H, BLOCK_N]
+
+    w = tl.load(weights_ptr + m * stride_w_m + hd).to(tl.float32)  # [H]
+    logits = tl.sum(tl.maximum(scores, 0.0) * w[:, None], axis=0)  # [BLOCK_N]
+
+    out_val = tl.where(valid, logits, float("-inf"))
+    tl.store(out_ptr + m_off * stride_o_m + c_rel, out_val, mask=valid_c)
+
+
+def indexer_mqa_logits_gather_sm12x_triton(
+    q_values: torch.Tensor,
+    q_scales: torch.Tensor,
+    k_values: torch.Tensor,
+    k_scales: torch.Tensor,
+    weights: torch.Tensor,
+    cand: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    head_dim: int = 128,
+    block_n: int = 128,
+    input_precision: str = "ieee",
+) -> torch.Tensor:
+    """MISA-dagger pass 2: re-score each query's ``C`` candidate columns with ALL
+    heads, returning ``[num_q, C]`` exact logits over the candidate axis.
+
+    ``cand`` holds compact (0-based, per-query window) candidate columns, e.g. from
+    ``torch.topk(pass1_logits, C, dim=1).indices``. Candidate ``c`` maps to kv row
+    ``cu_seqlen_ks[m] + cand[m, c]``; a candidate column >= the row window length is
+    a -inf pad and is scored ``-inf``. The output aligns with ``cand`` column-wise,
+    so ``full(-inf).scatter_(1, cand, out)`` rebuilds a compact logits tile for the
+    unchanged top-k selector.
+
+    Returns:
+        Logits ``[num_q, C]`` fp32 (``-inf`` in padded candidate slots).
+    """
+    num_q, num_heads, value_bytes = q_values.shape
+    c_tokens = cand.shape[1]
+    device = q_values.device
+    out = torch.full(
+        (num_q, c_tokens), float("-inf"), dtype=torch.float32, device=device
+    )
+    num_kv = k_values.shape[0]
+    if num_q == 0 or num_kv == 0 or c_tokens == 0:
+        return out
+    if value_bytes != head_dim // 2:
+        raise ValueError(
+            f"q_values last dim {value_bytes} != head_dim//2 {head_dim // 2}"
+        )
+
+    q_values = q_values.contiguous()
+    q_scales = q_scales.contiguous()
+    k_values = k_values.contiguous()
+    k_scales = k_scales.contiguous()
+    weights = weights.contiguous()
+    cand = cand.contiguous().to(torch.int32)
+    cu_seqlen_ks = cu_seqlen_ks.contiguous()
+    cu_seqlen_ke = cu_seqlen_ke.contiguous()
+
+    grid = (num_q, triton.cdiv(c_tokens, block_n))
+    _indexer_mqa_logits_gather_kernel[grid](
+        q_values,
+        q_scales,
+        k_values,
+        k_scales,
+        weights,
+        cand,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        out,
+        num_kv,
+        c_tokens,
+        q_values.stride(0),
+        q_values.stride(1),
+        q_scales.stride(0),
+        k_values.stride(0),
+        weights.stride(0),
+        cand.stride(0),
+        out.stride(0),
+        H=num_heads,
+        VALUE_BYTES=value_bytes,
+        SCALE_BLOCKS=head_dim // _MXFP4_BLOCK,
+        BYTES_PER_BLOCK=_MXFP4_BLOCK // 2,
+        BLOCK_N=block_n,
+        INPUT_PRECISION=input_precision,
+    )
+    return out
+
+
 @triton.jit
 def _indexer_mqa_logits_paged_kernel(
     q_values_ptr,  # int8  [num_tokens, H, VALUE_BYTES]
