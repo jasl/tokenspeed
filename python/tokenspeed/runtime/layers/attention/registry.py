@@ -459,6 +459,17 @@ def create_attn_components(
                 world_group=server_args.mapping.world_group,
             ),
             draft_cache_cell_size=draft_cache_cell_size,
+            draft_layout=draft_deepseek_v4_layout,
+            draft_hf_config=(
+                draft_model_config.hf_config
+                if draft_deepseek_v4_layout is not None
+                else None
+            ),
+            draft_layer_num=(
+                int(draft_model_config.num_attention_layers)
+                if draft_deepseek_v4_layout is not None
+                else 0
+            ),
             decode_input_tokens=decode_input_tokens,
             overlap_schedule_depth=overlap_schedule_depth,
         )
