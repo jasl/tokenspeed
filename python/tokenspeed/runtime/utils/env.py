@@ -249,6 +249,21 @@ class Envs:
     TOKENSPEED_INDEXER_PRECISION = EnvStr("tf32")
     # Opt-in: nv_dev deep_gemm fp4 indexer kernels on consumer Blackwell.
     TOKENSPEED_INDEXER_DEEPGEMM_SM120 = EnvBool(False)
+    # MISA-dagger indexer PREFILL 2-pass candidate select:
+    # "exact" | "misa_dagger" | "misa_fast". Pass-1 scores keys with only each
+    # query's top-MISA_H heads to pick MISA_C candidates; pass-2 re-scores those
+    # candidates with all heads (near-exact top-k, recall-gated). misa_dagger reuses
+    # the full scorer twice (portable, slower than exact -- the recall oracle);
+    # misa_fast uses dedicated kernels (h-head prefilter + candidate-only re-score,
+    # ~1.4-1.7x the scorer at long ctx; triton sm12x only, else falls back to
+    # misa_dagger). Same top-k as misa_dagger. Default off (exact).
+    TOKENSPEED_INDEXER_PREFILL_MODE = EnvStr("exact")
+    # pass-1 top-h heads; rounded UP to a power of 2 in [16, 64] (16|32|64). 64
+    # routes to the exact scorer. misa_dagger tolerates the rounding; misa_fast
+    # requires the pow2 (tl.arange/tl.dot).
+    TOKENSPEED_INDEXER_MISA_H = EnvInt(32)
+    # candidate budget C; floored at max(index_topk, this) at the call site.
+    TOKENSPEED_INDEXER_MISA_C = EnvInt(1024)
     TOKENSPEED_DP_SAMPLING_BACKEND = EnvStr(None)
 
     # Scheduler

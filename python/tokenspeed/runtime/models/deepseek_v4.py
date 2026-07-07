@@ -57,6 +57,8 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_indexer_decode_metadata_compute,
 )
 from tokenspeed_kernel.ops.attention.triton.indexer_mqa_logits_sm12x import (
+    indexer_mqa_logits_gather_sm12x_triton,
+    indexer_mqa_logits_hhead_sm12x_triton,
     indexer_mqa_logits_paged_sm12x_triton,
     indexer_mqa_logits_sm12x_triton,
 )
@@ -588,6 +590,59 @@ def _deepseek_v4_indexer_sm12x_scoring_backend() -> str:
     return _INDEXER_SM12X_SCORING_BACKEND
 
 
+_INDEXER_PREFILL_MODE: str | None = None
+_INDEXER_MISA_H: int | None = None
+_INDEXER_MISA_C: int | None = None
+
+
+def _deepseek_v4_indexer_prefill_mode() -> str:
+    """Indexer prefill selection mode (``TOKENSPEED_INDEXER_PREFILL_MODE``, cached).
+
+    - ``exact`` (default): score all keys with all 64 heads, then top-k.
+    - ``misa_dagger``: MISA-dagger 2-pass reference -- pass 1 scores keys with only
+      each query's top-``MISA_H`` heads (masked-weight, reuses the full scorer) to
+      pick ``MISA_C`` candidates; pass 2 re-scores candidates with all 64 heads.
+      Near-exact (recall-gated), NO new kernel but SLOWER than exact (scorer x2);
+      the recall-validation oracle / portable fallback.
+    - ``misa_fast``: same 2-pass selection as ``misa_dagger`` (bit-identical top-k)
+      but with dedicated kernels -- pass 1 is an h-head prefilter (H_SEL/64 FLOPs),
+      pass 2 gathers+re-scores only the ``MISA_C`` candidates (C/N FLOPs). ~1.4-1.7x
+      the scorer at long ctx; triton sm12x backend only (else falls back to
+      ``misa_dagger``). Long-context prefill speed play; recall == ``misa_dagger``.
+    """
+    global _INDEXER_PREFILL_MODE
+    if _INDEXER_PREFILL_MODE is None:
+        choice = envs.TOKENSPEED_INDEXER_PREFILL_MODE.get().strip().lower()
+        _INDEXER_PREFILL_MODE = (
+            choice if choice in ("misa_dagger", "misa_fast") else "exact"
+        )
+    return _INDEXER_PREFILL_MODE
+
+
+def _deepseek_v4_indexer_misa_h() -> int:
+    """MISA-dagger pass-1 top-h heads (cached), rounded UP to a power of 2 in
+    ``[16, 64]``. The misa_fast pass-1 kernel needs a pow2 ``H_SEL >= 16``
+    (``tl.arange``/``tl.dot`` M constraints); over-selecting heads only widens the
+    candidate prefilter (pass 2 re-scores with all 64 heads), so recall is
+    preserved. misa_dagger tolerates any h but shares this pow2 domain (24->32,
+    48->64). ``H_SEL == 64`` is diverted to the exact scorer upstream, never the
+    kernel.
+    """
+    global _INDEXER_MISA_H
+    if _INDEXER_MISA_H is None:
+        raw = max(1, min(64, int(envs.TOKENSPEED_INDEXER_MISA_H.get())))
+        _INDEXER_MISA_H = 1 << max(4, (raw - 1).bit_length())  # -> 16 | 32 | 64
+    return _INDEXER_MISA_H
+
+
+def _deepseek_v4_indexer_misa_c() -> int:
+    """MISA-dagger pass-1 candidate budget C (cached, clamped to >= 512)."""
+    global _INDEXER_MISA_C
+    if _INDEXER_MISA_C is None:
+        _INDEXER_MISA_C = max(512, int(envs.TOKENSPEED_INDEXER_MISA_C.get()))
+    return _INDEXER_MISA_C
+
+
 def _deepgemm_indexer_arch_supported() -> bool:
     # deep_gemm's fp8_fp4_mqa_logits / fp8_fp4_paged_mqa_logits indexer kernels
     # are datacenter-Blackwell-only (major 10); they assert "Unsupported
@@ -936,6 +991,14 @@ def _deepseek_v4_indexer_prefill_request_chunks(
     max_logits_elems = (
         _deepseek_v4_indexer_prefill_max_logits_bytes(max_logits_bytes) // 4
     )
+    if _deepseek_v4_indexer_prefill_mode() in ("misa_dagger", "misa_fast"):
+        # Both 2-pass modes keep two large fp32 tiles co-resident within a chunk:
+        # misa_dagger's pass 2 = full re-score + masked-exact scatter; misa_fast's
+        # pass 1 = logits_h + the candidate topk workspace, and pass 2 = the [num_q,
+        # C] re-score + the [num_q, max_len] scatter tile (C == max_len when the
+        # window is short). Halve the per-chunk budget so the peak stays within the
+        # unified-memory guard (the deep-ctx freeze trigger this budget exists for).
+        max_logits_elems //= 2
     max_logits_elems = max(1, max_logits_elems)
 
     query_offsets = [0]
@@ -1508,49 +1571,135 @@ def _deepseek_v4_indexer_topk_prefill_deepgemm(
             )
     k_values, k_scales = gathered_k
 
-    if _deepseek_v4_indexer_use_sm12x_scoring():
+    def _score(w: torch.Tensor) -> torch.Tensor:
+        # Compute compact [num_q, max_len] fp32 indexer logits for weights ``w``.
         # Portable consumer-Blackwell prefill scoring: Triton (default; also for
         # the deepgemm A/B arm, which has no sm12x prefill kernel) or the torch
         # reference. Serving uses tf32 dots (the indexer is a top-k selector, so
         # tf32 is accuracy-safe and ~2-3x faster than ieee; matches the vLLM kernel).
-        with nvtx_range("indexer_topk_prefill_sm12x_logits"):
-            if _deepseek_v4_indexer_sm12x_scoring_backend() == "torch":
-                logits = indexer_mqa_logits_sm12x(
+        if _deepseek_v4_indexer_use_sm12x_scoring():
+            with nvtx_range("indexer_topk_prefill_sm12x_logits"):
+                if _deepseek_v4_indexer_sm12x_scoring_backend() == "torch":
+                    return indexer_mqa_logits_sm12x(
+                        q_values.contiguous().view(torch.int8),
+                        q_scales.contiguous(),
+                        k_values.contiguous(),
+                        k_scales.contiguous(),
+                        w.contiguous(),
+                        cu_start,
+                        cu_end,
+                        max_len,
+                        head_dim=q_values.shape[-1] * 2,
+                    )
+                return indexer_mqa_logits_sm12x_triton(
                     q_values.contiguous().view(torch.int8),
                     q_scales.contiguous(),
                     k_values.contiguous(),
                     k_scales.contiguous(),
-                    weights.contiguous(),
-                    cu_start,
-                    cu_end,
-                    max_len,
-                    head_dim=q_values.shape[-1] * 2,
-                )
-            else:
-                logits = indexer_mqa_logits_sm12x_triton(
-                    q_values.contiguous().view(torch.int8),
-                    q_scales.contiguous(),
-                    k_values.contiguous(),
-                    k_scales.contiguous(),
-                    weights.contiguous(),
+                    w.contiguous(),
                     cu_start,
                     cu_end,
                     max_len,
                     head_dim=q_values.shape[-1] * 2,
                     input_precision=_INDEXER_TRITON_PRECISION,
                 )
-    else:
         with nvtx_range("indexer_topk_prefill_deepgemm_logits"):
-            logits = deep_gemm.fp8_fp4_mqa_logits(
+            return deep_gemm.fp8_fp4_mqa_logits(
                 q=(q_values.contiguous().view(torch.int8), q_scales.contiguous()),
                 kv=(k_values.contiguous(), k_scales.contiguous()),
-                weights=weights.contiguous(),
+                weights=w.contiguous(),
                 cu_seq_len_k_start=cu_start,
                 cu_seq_len_k_end=cu_end,
                 clean_logits=False,
                 max_seqlen_k=max_len,
                 logits_dtype=torch.float32,
             )
+
+    # MISA-dagger 2-pass selection: pass 1 scores keys with each query's top-h heads
+    # (h = MISA_H) to pick C candidates; pass 2 re-scores those candidates with all 64
+    # heads and -inf-masks the rest, so the UNCHANGED selector below picks the final
+    # top-k from exact 64-head scores over the candidate set. Row-local column space is
+    # shared across both passes and the selector, so no candidate->global remap. Two
+    # equivalent implementations (bit-identical top-k): ``misa_dagger`` masks weights
+    # and reuses the full scorer twice (portable, slower than exact); ``misa_fast``
+    # uses dedicated kernels (h-head prefilter + candidate-only re-score) for the real
+    # FLOP saving (triton sm12x backend only).
+    _mode = _deepseek_v4_indexer_prefill_mode()
+    _h = min(_deepseek_v4_indexer_misa_h(), weights.shape[1]) if _mode != "exact" else 0
+    _fast_ok = (
+        _mode == "misa_fast"
+        and _deepseek_v4_indexer_use_sm12x_scoring()
+        and _deepseek_v4_indexer_sm12x_scoring_backend() != "torch"
+    )
+    if _mode == "exact" or _h >= weights.shape[1]:
+        logits = _score(weights)
+    elif _fast_ok:
+        qv_i8 = q_values.contiguous().view(torch.int8)
+        qs_c = q_scales.contiguous()
+        kv_c = k_values.contiguous()
+        ks_c = k_scales.contiguous()
+        hd_dim = q_values.shape[-1] * 2
+        with nvtx_range("indexer_topk_prefill_misa_pass1"):
+            head_idx = weights.abs().topk(_h, dim=1).indices.to(torch.int32)
+            logits_h = indexer_mqa_logits_hhead_sm12x_triton(
+                qv_i8,
+                qs_c,
+                kv_c,
+                ks_c,
+                weights,
+                head_idx,
+                cu_start,
+                cu_end,
+                max_len,
+                head_dim=hd_dim,
+                input_precision=_INDEXER_TRITON_PRECISION,
+            )
+            # Floor C at topk_tokens (=config.index_topk): pass 2 leaves only C
+            # finite columns, so C < index_topk would starve the final selector.
+            c = min(max(topk_tokens, _deepseek_v4_indexer_misa_c()), logits_h.shape[1])
+            cand = logits_h.topk(c, dim=1).indices.to(torch.int32)
+            del logits_h
+        with nvtx_range("indexer_topk_prefill_misa_pass2"):
+            logits_cand = indexer_mqa_logits_gather_sm12x_triton(
+                qv_i8,
+                qs_c,
+                kv_c,
+                ks_c,
+                weights,
+                cand,
+                cu_start,
+                cu_end,
+                head_dim=hd_dim,
+                input_precision=_INDEXER_TRITON_PRECISION,
+            )
+            logits = torch.full(
+                (num_tokens, max_len),
+                float("-inf"),
+                device=weights.device,
+                dtype=torch.float32,
+            ).scatter_(1, cand.long(), logits_cand)
+            del logits_cand, cand
+    else:
+        # misa_dagger reference (masked full-head, portable across backends; also the
+        # misa_fast fallback when the sm12x triton scorer is unavailable). Exact vs the
+        # fast path because a zero-weight head contributes 0 to logits = SUM ReLU*w.
+        with nvtx_range("indexer_topk_prefill_misa_pass1"):
+            top_idx = weights.abs().topk(_h, dim=1).indices
+            w_mask = torch.zeros_like(weights).scatter_(
+                1, top_idx, weights.gather(1, top_idx)
+            )
+            logits_h = _score(w_mask)
+            # Floor C at topk_tokens (=config.index_topk): pass 2 leaves only C
+            # finite columns, so C < index_topk would starve the final selector.
+            c = min(max(topk_tokens, _deepseek_v4_indexer_misa_c()), logits_h.shape[1])
+            cand = logits_h.topk(c, dim=1).indices
+            del logits_h
+        with nvtx_range("indexer_topk_prefill_misa_pass2"):
+            logits_full = _score(weights)
+            logits = torch.full_like(logits_full, float("-inf")).scatter_(
+                1, cand, logits_full.gather(1, cand)
+            )
+            del logits_full, cand
 
     with nvtx_range("indexer_topk_prefill_select"):
         # The prefill top-k op is torch.ops.trtllm.indexer_topk_prefill, which has
