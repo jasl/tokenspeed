@@ -264,6 +264,11 @@ class Envs:
     TOKENSPEED_INDEXER_MISA_H = EnvInt(32)
     # candidate budget C; floored at max(index_topk, this) at the call site.
     TOKENSPEED_INDEXER_MISA_C = EnvInt(1024)
+    # DSv4 compressor/indexer STATE cache element dtype: "fp32" (default) | "bf16".
+    # The states are per-token windowed residual state (not a compounding
+    # accumulator), so bf16 halves ~9.4GB of fixed state buffers (bigger KV pool)
+    # at the cost of per-token rounding; recall-gate before trusting. Opt-in.
+    TOKENSPEED_DSV4_STATE_CACHE_DTYPE = EnvStr("fp32")
     TOKENSPEED_DP_SAMPLING_BACKEND = EnvStr(None)
 
     # Scheduler

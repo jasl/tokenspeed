@@ -46,7 +46,33 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.common import ceil_div
+from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
+_STATE_CACHE_DTYPE: torch.dtype | None = None
+
+
+def _deepseek_v4_state_cache_dtype() -> torch.dtype:
+    """Element dtype of the DSv4 compressor/indexer STATE caches (cached).
+
+    ``TOKENSPEED_DSV4_STATE_CACHE_DTYPE = fp32`` (default) | ``bf16``. The states
+    are per-token windowed residual state (not a compounding accumulator), so bf16
+    halves the fixed state buffers (a larger KV pool) at the cost of per-token
+    rounding. The byte accounting and the buffer allocation both read this, so they
+    stay consistent. Recall-gate before trusting bf16.
+    """
+    global _STATE_CACHE_DTYPE
+    if _STATE_CACHE_DTYPE is None:
+        choice = envs.TOKENSPEED_DSV4_STATE_CACHE_DTYPE.get().strip().lower()
+        _STATE_CACHE_DTYPE = (
+            torch.bfloat16 if choice in ("bf16", "bfloat16") else torch.float32
+        )
+    return _STATE_CACHE_DTYPE
+
+
+def _deepseek_v4_state_cache_elem_size() -> int:
+    return torch._utils._element_size(_deepseek_v4_state_cache_dtype())
+
 
 logger = get_colorful_logger(__name__)
 
@@ -120,14 +146,14 @@ class DeepseekV4CacheLayout:
                 f"({len(self.layer_ratio)}) than requested layers ({layer_num})"
             )
 
-        fp32_size = torch._utils._element_size(torch.float32)
+        state_size = _deepseek_v4_state_cache_elem_size()
         cell_size = 0
         for layer_id in range(layer_num):
             ratio = self.layer_ratio[layer_id]
             cell_size += self.swa_cell_bytes()
             if ratio > 1:
                 cell_size += self.compressed_cell_bytes(ratio)
-                cell_size += self.state_width(layer_id) * 2 * fp32_size
+                cell_size += self.state_width(layer_id) * 2 * state_size
             if ratio == 4:
                 indexer_block_bytes = (
                     self.storage_block_size(ratio) * self.indexer_row_bytes
@@ -135,7 +161,7 @@ class DeepseekV4CacheLayout:
                 cell_size += (
                     indexer_block_bytes + self.page_size - 1
                 ) // self.page_size
-                cell_size += self.state_width(layer_id, indexer=True) * 2 * fp32_size
+                cell_size += self.state_width(layer_id, indexer=True) * 2 * state_size
         return cell_size
 
 
@@ -152,7 +178,7 @@ def _deepseek_v4_cache_group_page_bytes(
 
     group_rows = {spec.group_id: int(spec.rows_per_page) for spec in specs}
     page_bytes = {spec.group_id: 0 for spec in specs}
-    fp32_size = torch._utils._element_size(torch.float32)
+    state_size = _deepseek_v4_state_cache_elem_size()
 
     swa_block_bytes = layout.swa_block_bytes(
         group_rows.get(V4_SWA_KV_GROUP_ID, V4_KERNEL_BLOCK_ROWS)
@@ -169,7 +195,7 @@ def _deepseek_v4_cache_group_page_bytes(
         state_group_id = v4_compressor_state_group_id(ratio)
         state_block_size = group_rows.get(state_group_id, layout.page_size)
         page_bytes[state_group_id] += (
-            state_block_size * layout.state_width(layer_id) * 2 * fp32_size
+            state_block_size * layout.state_width(layer_id) * 2 * state_size
         )
 
         if ratio == 4:
@@ -186,7 +212,7 @@ def _deepseek_v4_cache_group_page_bytes(
                 indexer_state_block_size
                 * layout.state_width(layer_id, indexer=True)
                 * 2
-                * fp32_size
+                * state_size
             )
 
     return page_bytes
@@ -988,7 +1014,7 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
                             compressor_state_block_size,
                             layout.state_width(layer_id) * 2,
                         ),
-                        dtype=torch.float32,
+                        dtype=_deepseek_v4_state_cache_dtype(),
                         device=device,
                     )
                     if has_compressed
@@ -1021,7 +1047,7 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
                             indexer_state_block_size,
                             layout.state_width(layer_id, indexer=True) * 2,
                         ),
-                        dtype=torch.float32,
+                        dtype=_deepseek_v4_state_cache_dtype(),
                         device=device,
                     )
                     if has_indexer
