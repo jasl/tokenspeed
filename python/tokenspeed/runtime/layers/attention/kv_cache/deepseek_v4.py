@@ -238,10 +238,19 @@ def profile_deepseek_v4_max_num_pages(
     max_context_len: int,
     available_cache_memory_bytes: int,
     draft_cache_cell_size: int = 0,
+    draft_layout: "DeepseekV4CacheLayout | None" = None,
+    draft_hf_config: Any = None,
+    draft_layer_num: int = 0,
     decode_input_tokens: int = 1,
     overlap_schedule_depth: int = 0,
 ) -> int:
-    """Return the largest scheduler page budget that fits V4 grouped caches."""
+    """Return the largest scheduler page budget that fits V4 grouped caches.
+
+    When ``draft_layout``/``draft_hf_config``/``draft_layer_num`` are supplied, the
+    speculative-draft (NextN) pool is charged its real grouped, retention-aware
+    footprint. Otherwise the scalar ``draft_cache_cell_size`` is charged as a flat
+    full-history per-token cost (legacy fallback).
+    """
     page_size = int(layout.page_size)
     if page_size <= 0:
         raise ValueError(f"page_size must be positive, got {page_size}")
@@ -259,6 +268,41 @@ def profile_deepseek_v4_max_num_pages(
     specs = tuple(build_v4_cache_specs(hf_config, layer_ratio=layout.layer_ratio))
     page_bytes = _deepseek_v4_cache_group_page_bytes(layout, specs, layer_num)
 
+    # The draft (NextN) KV pool is a SEPARATE DeepseekV4TokenToKVPool. When its
+    # layout is known, charge its REAL grouped, retention-aware footprint (the same
+    # accounting the main pool uses) instead of the flat ``num_tokens *
+    # draft_cache_cell_size`` full-history term. For DSv4 the draft is a ratio-1
+    # sliding_window (SWA) layer whose allocation is window-bounded, so the flat
+    # term over-reserved ~num_tokens*cell (phantom) and shrank the main pool. The
+    # scalar ``draft_cache_cell_size`` is kept as a fallback when no draft layout is
+    # supplied (non-DSv4 draft / callers that pass only the scalar).
+    draft_specs: tuple = ()
+    draft_page_bytes: dict = {}
+    if draft_layout is not None and draft_hf_config is not None and draft_layer_num > 0:
+        draft_specs = tuple(
+            build_v4_cache_specs(draft_hf_config, layer_ratio=draft_layout.layer_ratio)
+        )
+        draft_page_bytes = _deepseek_v4_cache_group_page_bytes(
+            draft_layout, draft_specs, draft_layer_num
+        )
+
+    def _draft_bytes(num_tokens: int) -> int:
+        if not draft_specs:
+            return int(num_tokens * draft_cache_cell_size)
+        counts = compute_paged_cache_group_page_counts(
+            draft_specs,
+            max_live_requests=max_live_requests,
+            max_scheduled_tokens=max_scheduled_tokens,
+            max_total_tokens=num_tokens,
+            max_context_len=max_context_len,
+            decode_input_tokens=decode_input_tokens,
+            overlap_schedule_depth=overlap_schedule_depth,
+        )
+        return sum(
+            int(counts[gid]) * bytes_per_page
+            for gid, bytes_per_page in draft_page_bytes.items()
+        )
+
     def _bytes_for_pages(num_pages: int) -> int:
         num_tokens = int(num_pages) * page_size
         counts = compute_paged_cache_group_page_counts(
@@ -274,7 +318,7 @@ def profile_deepseek_v4_max_num_pages(
             int(counts[gid]) * bytes_per_page
             for gid, bytes_per_page in page_bytes.items()
         )
-        return int(cache_bytes + num_tokens * draft_cache_cell_size)
+        return int(cache_bytes + _draft_bytes(num_tokens))
 
     if _bytes_for_pages(1) > available_cache_memory_bytes:
         return 0
@@ -302,11 +346,25 @@ def profile_deepseek_v4_max_num_pages(
         int(fixed_counts[gid]) * bytes_per_page
         for gid, bytes_per_page in page_bytes.items()
     )
-    full_history_slope = Fraction(page_size * draft_cache_cell_size, 1)
+    # Draft resident (window-bounded) footprint: _draft_bytes(0) is the draft's
+    # sliding-window fixed part (0 for the scalar-fallback path). The growing part
+    # is carried by the draft's scheduled_slope terms folded in above.
+    fixed_bytes += _draft_bytes(0)
+    # Seed the per-token full-history slope. With a known draft layout the draft's
+    # groups (sliding_window for DSv4) are folded in via the loop below alongside
+    # the main specs, so its cost lands on scheduled/fixed -- NOT this slope. Without
+    # a layout, fall back to charging the scalar draft cell as full-history.
+    full_history_slope = (
+        Fraction(0, 1)
+        if draft_specs
+        else Fraction(page_size * draft_cache_cell_size, 1)
+    )
     scheduled_slope = Fraction(0, 1)
     scheduled_cap_bytes = 0
-    for spec in specs:
-        bytes_per_page = page_bytes[spec.group_id]
+    _slope_specs = [(spec, page_bytes) for spec in specs]
+    _slope_specs += [(spec, draft_page_bytes) for spec in draft_specs]
+    for spec, _bytes_map in _slope_specs:
+        bytes_per_page = _bytes_map[spec.group_id]
         if bytes_per_page == 0:
             continue
         raw_per_page = int(spec.rows_per_page) * int(spec.entry_stride_tokens)
