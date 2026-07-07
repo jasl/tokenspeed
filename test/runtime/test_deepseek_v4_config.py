@@ -1415,6 +1415,33 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertGreater(flat, 0)
         self.assertGreater(grouped, flat)
 
+    def test_deepseek_v4_state_cache_bf16_shrinks_cell_size(self):
+        """TOKENSPEED_DSV4_STATE_CACHE_DTYPE=bf16 halves the fp32 compressor/indexer
+        state bytes, so cache_cell_size shrinks -- the byte accounting and the
+        buffer allocation both read the same resolver, so they stay consistent."""
+        import tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 as kv
+
+        config = SimpleNamespace(
+            compress_ratios=[0, 4, 128],
+            num_attention_heads=64,
+            head_dim=512,
+            qk_rope_head_dim=64,
+            sliding_window=128,
+            index_head_dim=128,
+        )
+        layout = deepseek_v4_cache_layout_from_config(
+            config, page_size=64, use_fp4_indexer_cache=True
+        )
+        saved = kv._STATE_CACHE_DTYPE
+        try:
+            kv._STATE_CACHE_DTYPE = torch.float32
+            fp32_cell = layout.cache_cell_size()
+            kv._STATE_CACHE_DTYPE = torch.bfloat16
+            bf16_cell = layout.cache_cell_size()
+        finally:
+            kv._STATE_CACHE_DTYPE = saved
+        self.assertLess(bf16_cell, fp32_cell)
+
     def test_deepseek_v4_cache_layout_can_slice_mtp_layer_range(self):
         config = SimpleNamespace(
             compress_ratios=[0, 4, 128, 0],
