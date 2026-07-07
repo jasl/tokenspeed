@@ -73,6 +73,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
     _mask_invalid_graph_tokens,
     _split_paged_cache_block_tables_into_v4_metadata,
     deepseek_v4_cache_layout_from_config,
+    profile_deepseek_v4_max_num_pages,
 )
 from tokenspeed.runtime.layers.attention.registry import (
     _resolve_draft_cache_cell_size_for_profile,
@@ -1366,6 +1367,53 @@ class TestDeepseekV4Config(unittest.TestCase):
             ),
             0,
         )
+
+    def test_deepseek_v4_profile_grouped_draft_recovers_pages_vs_flat(self):
+        """A ratio-1 (sliding_window) NextN draft charged via its real grouped,
+        window-bounded footprint yields a LARGER main pool than the legacy flat
+        ``num_tokens * draft_cache_cell_size`` full-history charge -- because the
+        flat term over-reserves ~num_tokens*cell that the windowed draft never
+        allocates. Both must still return a positive, budget-fitting page count."""
+        config = SimpleNamespace(
+            compress_ratios=[0, 4, 128, 0],  # 4 layers; trailing 0 -> ratio-1 NextN
+            num_attention_heads=64,
+            head_dim=512,
+            qk_rope_head_dim=64,
+            sliding_window=128,
+            index_head_dim=128,
+        )
+        layout = deepseek_v4_cache_layout_from_config(
+            config, page_size=64, use_fp4_indexer_cache=True
+        )
+        draft_layout = deepseek_v4_cache_layout_from_config(
+            config, page_size=64, use_fp4_indexer_cache=True, layer_indices=range(3, 4)
+        )
+        self.assertEqual(draft_layout.layer_ratio, (1,))
+        draft_cell = draft_layout.cache_cell_size(1)
+
+        common = dict(
+            hf_config=config,
+            layer_num=len(layout.layer_ratio),
+            max_live_requests=8,
+            max_scheduled_tokens=4096,
+            max_context_len=8192,
+            available_cache_memory_bytes=2 * 1024**3,
+            decode_input_tokens=2,
+            overlap_schedule_depth=1,
+        )
+        flat = profile_deepseek_v4_max_num_pages(
+            layout=layout, draft_cache_cell_size=draft_cell, **common
+        )
+        grouped = profile_deepseek_v4_max_num_pages(
+            layout=layout,
+            draft_cache_cell_size=draft_cell,
+            draft_layout=draft_layout,
+            draft_hf_config=config,
+            draft_layer_num=1,
+            **common,
+        )
+        self.assertGreater(flat, 0)
+        self.assertGreater(grouped, flat)
 
     def test_deepseek_v4_cache_layout_can_slice_mtp_layer_range(self):
         config = SimpleNamespace(
