@@ -96,6 +96,72 @@ class TestBreakableCudaGraph(unittest.TestCase):
                 captured_out, self._eager(new_x), msg=f"trial {trial}"
             )
 
+    def test_honor_break_points_off_captures_decorated_method(self):
+        """The piecewise-decode mode: @break_point methods pass through and are
+        CAPTURED (no eager break), so a forward with one decorated call stays a
+        single graph segment."""
+        from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
+
+        class Mixer:
+            @break_point
+            def forward(self, x):
+                return torch.relu(x)
+
+        mixer = Mixer()
+        cap = BreakableCapture(honor_break_points=False, break_at_collectives=True)
+
+        def forward():
+            h = self.x_static @ self.w1
+            h = mixer.forward(h)
+            return h @ self.w2
+
+        for _ in range(3):
+            forward()
+        torch.cuda.synchronize()
+        with cap:
+            out = forward()
+        self.assertEqual(cap.num_segments, 1)  # nothing broke the graph
+
+        new_x = torch.randn(self.n, self.d, device=self.dev, dtype=self.dtype)
+        self.x_static.copy_(new_x)
+        cap.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, self._eager(new_x))
+
+    def test_break_at_collectives_cuts_via_add_eager(self):
+        """The comm-seam contract: an in-place 'collective' recorded via
+        add_eager under a collective-cutting capture re-runs eagerly between
+        segment replays (values refresh with the live input)."""
+        cap = BreakableCapture(honor_break_points=False, break_at_collectives=True)
+
+        def forward():
+            h = self.x_static @ self.w1
+            buf = torch.relu(h)  # in-segment allocation = pool-pinned buffer
+
+            def eager_collective():
+                # Stands in for an in-place all_reduce on a persistent buffer.
+                buf.mul_(2.0)
+
+            self.assertTrue(cap._capturing and cap.break_at_collectives)
+            cap.add_eager(eager_collective)
+            return buf @ self.w2
+
+        for _ in range(3):
+            h = torch.relu(self.x_static @ self.w1)
+            h.mul_(2.0)
+            _ = h @ self.w2
+        torch.cuda.synchronize()
+        with cap:
+            out = forward()
+        self.assertEqual(cap.num_segments, 3)  # seg + eager collective + seg
+
+        new_x = torch.randn(self.n, self.d, device=self.dev, dtype=self.dtype)
+        self.x_static.copy_(new_x)
+        cap.replay()
+        torch.cuda.synchronize()
+        expect = (torch.relu(new_x @ self.w1) * 2.0) @ self.w2
+        torch.testing.assert_close(out, expect)
+
     def test_multiple_breaks_chain(self):
         """Many breaks (like a deep transformer) must chain correctly."""
         depth = 6

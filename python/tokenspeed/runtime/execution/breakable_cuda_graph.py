@@ -148,15 +148,21 @@ class BreakableCapture:
             2478MB -> 564MB for buckets [8192,4096,2048,1024] on the repro). This
             mirrors ``torch.cuda.graph``'s shared ``default_capture_stream`` and
             its documented "pass the same stream for effective memory sharing".
-        break_at_collectives: Capture MODE selector. ``False`` (default, the
-            prefill-graph mode): :func:`break_point`-decorated sequence-mixing
-            methods run as eager breaks and collectives are captured into the
-            segments. ``True`` (the piecewise-DECODE mode, for fabrics where
+        honor_break_points: Whether :func:`break_point`-decorated sequence-mixing
+            methods run as eager breaks (``True``, the prefill default -- their
+            metadata is data-dependent and cannot be captured) or pass through
+            and stay captured (``False``, the piecewise-DECODE mode -- decode
+            attention is fixed-shape and belongs in the graph).
+        break_at_collectives: Whether the communication seams cut the graph
+            (``comm_ops`` records each collective via :meth:`add_eager` to
+            re-run eagerly between segment replays). Needed on fabrics where
             graph-replayed collectives hang -- e.g. host-staged RoCE NCCL on
-            multi-node DGX Spark): the graph is cut ONLY at the communication
-            seams (``comm_ops`` records each collective via :meth:`add_eager`)
-            while ``@break_point`` methods pass through and stay captured --
-            decode attention is fixed-shape and belongs in the graph.
+            multi-node DGX Spark -- for BOTH the decode and the prefill graph.
+            Orthogonal to ``honor_break_points``: piecewise decode uses
+            (False, True); the prefill graph on such fabrics uses (True, True);
+            the stock prefill graph uses (True, False). A collective fired
+            INSIDE an eager break passes through naturally (no segment is
+            capturing at that moment) and simply runs eagerly.
     """
 
     _active: BreakableCapture | None = None
@@ -166,9 +172,11 @@ class BreakableCapture:
         self,
         pool: Any | None = None,
         stream: torch.cuda.Stream | None = None,
+        honor_break_points: bool = True,
         break_at_collectives: bool = False,
     ) -> None:
         self.pool = pool
+        self.honor_break_points = honor_break_points
         self.break_at_collectives = break_at_collectives
         self.segments: list[Callable[[], Any]] = []
         self._current_graph: torch.cuda.CUDAGraph | None = None
@@ -396,7 +404,7 @@ def break_point(method: Callable | None = None) -> Callable:
             if not is_breakable_capture_active():
                 return method(*args, **kwargs)
             cap = BreakableCapture.current()
-            if cap.break_at_collectives:
+            if not cap.honor_break_points:
                 # Piecewise-DECODE capture: only the comm seams break the graph;
                 # sequence mixers are fixed-shape at decode and stay captured.
                 return method(*args, **kwargs)
