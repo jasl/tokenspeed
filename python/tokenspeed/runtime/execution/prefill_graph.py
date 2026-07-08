@@ -344,7 +344,18 @@ class PrefillGraph:
             self._run_inner(bucket)
         torch.cuda.synchronize()
         stream = decode_wrapper.stream if decode_wrapper is not None else None
-        cap = BreakableCapture(pool=self._pool, stream=stream)
+        # On fabrics where graph-replayed collectives hang (the deployments that
+        # run --piecewise-decode-cudagraph, e.g. host-staged RoCE NCCL on
+        # multi-node DGX Spark), cut the prefill graph at the comm seams too:
+        # the per-layer all-reduces re-run eagerly between segment replays,
+        # exactly like the piecewise decode graph. Attention breaks unchanged.
+        cap = BreakableCapture(
+            pool=self._pool,
+            stream=stream,
+            break_at_collectives=bool(
+                getattr(self.config, "piecewise_decode_cudagraph", False)
+            ),
+        )
         with cap:
             self._outputs[bucket] = CapturedForward(*self._run_inner(bucket))
         if self._pool is None:

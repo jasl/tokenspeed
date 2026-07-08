@@ -590,6 +590,7 @@ class CudaGraphWrapper:
         cap = BreakableCapture(
             pool=global_graph_memory_pool,
             stream=self.stream,
+            honor_break_points=False,
             break_at_collectives=True,
         )
         with cap:
