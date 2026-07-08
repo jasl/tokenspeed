@@ -34,6 +34,7 @@ import tqdm
 from tokenspeed.runtime.configs.paged_cache_spec import (
     compute_max_logical_pages_for_capture,
 )
+from tokenspeed.runtime.execution.breakable_cuda_graph import BreakableCapture
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
@@ -76,75 +77,16 @@ def get_is_capture_mode() -> bool:
 # collectives hang on graph replay.
 #
 # The fix: cudagraph only the COMPUTE regions and run the COLLECTIVES
-# EAGERLY between graph replays (compute -> comm -> compute -> ...). A
-# SegmentRecorder drives segmented capture: at each collective call site the
-# collective seam calls record_break(eager_fn) which ends the current graph
-# segment, remembers the eager collective closure, and begins a fresh graph
-# segment sharing the same memory pool. Because every segment reads/writes
-# the same persistent buffers, replaying the segments in order with the
-# eager collectives interleaved reproduces the monolithic forward exactly
-# and recomputes on input change.
-#
-# This mirrors the single-GPU prototype: mid-forward capture_end() -> eager
-# in-place op -> new capture_begin(pool=shared) -> replay segments in order.
-
-
-class SegmentRecorder:
-    """Drives segmented ("piecewise") decode CUDA-graph capture.
-
-    Collectives are NOT recorded into the graph. Each collective call site,
-    while capturing, invokes :meth:`record_break` to close the current graph
-    segment, stash the eager collective closure, and open the next segment on
-    the shared memory pool. At replay the wrapper walks segments in order and
-    runs each stashed collective eagerly between replays.
-    """
-
-    def __init__(self) -> None:
-        self.pool = None
-        self.stream: torch.cuda.Stream | None = None
-        self.graphs: list[torch.cuda.CUDAGraph] = []
-        self.breaks: list[Callable[[], None]] = []
-        self._cur: torch.cuda.CUDAGraph | None = None
-        self._active = False
-
-    def begin(self, pool, stream: torch.cuda.Stream) -> None:
-        """Open the first graph segment. Caller wraps this in
-        ``with torch.cuda.stream(stream):`` so capture records on ``stream``."""
-        self.pool = pool
-        self.stream = stream
-        self._cur = torch.cuda.CUDAGraph()
-        self._cur.capture_begin(pool=pool)
-        self._active = True
-
-    def record_break(self, eager_fn: Callable[[], None]) -> None:
-        """Close the in-flight segment at a collective boundary and open the
-        next one on the shared pool. ``eager_fn`` runs the real collective
-        eagerly at replay time, between the two segments."""
-        if not self._active:
-            return
-        self._cur.capture_end()
-        self.graphs.append(self._cur)
-        self.breaks.append(eager_fn)
-        self._cur = torch.cuda.CUDAGraph()
-        self._cur.capture_begin(pool=self.pool)
-
-    def finish(self) -> tuple[list[torch.cuda.CUDAGraph], list[Callable[[], None]]]:
-        """Close the final segment and return ``(graphs, breaks)``. There is
-        always exactly one more graph than break (compute-comm-compute)."""
-        self._cur.capture_end()
-        self.graphs.append(self._cur)
-        self._active = False
-        return self.graphs, self.breaks
-
-
-# Set only during segmented capture so the collective seams can find the
-# active recorder. None on every other path -> zero behavior change when the
-# piecewise flag is off.
-_active_segment_recorder: SegmentRecorder | None = None
-
-
-def get_active_segment_recorder() -> SegmentRecorder | None:
-    return _active_segment_recorder
+# EAGERLY between graph replays (compute -> comm -> compute -> ...). The
+# segmented capture runs on the shared breakable-graph machinery
+# (execution.breakable_cuda_graph.BreakableCapture -- the same segment-list
+# capture the prefill graph uses) in ``break_at_collectives`` mode: the
+# ``@break_point`` sequence mixers pass through (decode attention is
+# fixed-shape and stays captured) and the comm_ops collective seams cut the
+# graph instead, recording each collective via ``add_eager``. Because every
+# segment shares one memory pool and reads/writes the same persistent
+# buffers, replaying the segments in order with the eager collectives
+# interleaved reproduces the monolithic forward exactly.
 
 
 def _should_update_mamba_state_after_mtp_verify(
@@ -477,9 +419,9 @@ class CudaGraphWrapper:
         """Piecewise decode capture. Identical prologue/epilogue to
         :meth:`_capture_one`; only the capture block differs (see
         ``segmented=True``): the single ``torch.cuda.graph`` block is
-        replaced by a SegmentRecorder that splits the forward into compute
-        segments around eager collectives. Returns
-        ``((graphs, breaks), out)``."""
+        replaced by a collective-mode :class:`BreakableCapture` that splits
+        the forward into compute segments around eager collectives. Returns
+        ``(capture, out)``."""
         return self._capture_one(bs, variant=variant, segmented=True)
 
     def _capture_one(
@@ -625,34 +567,34 @@ class CudaGraphWrapper:
             self.capturable_grammar.reset_state()
 
         if segmented:
-            graphs, breaks = captured
             # All segments share one pool; reuse it for the next capture.
-            global_graph_memory_pool = graphs[0].pool()
-            return (graphs, breaks), out
+            global_graph_memory_pool = captured.pool
+            return captured, out
 
         global_graph_memory_pool = graph.pool()
         return graph, out
 
     def _capture_segments(self, run_once):
-        """Run ``run_once`` under a SegmentRecorder so collective seams split
-        the forward into compute segments. Returns ``((graphs, breaks), out)``.
+        """Run ``run_once`` under a collective-mode :class:`BreakableCapture` so
+        the comm seams split the forward into compute segments. Returns
+        ``(capture, out)``.
 
-        The recorder is published in ``_active_segment_recorder`` for the
-        duration of capture only; the collective seams in comm_ops/base.py
-        pick it up (via get_active_segment_recorder) to record breaks instead
-        of running the real collective. It is always cleared afterwards so no
-        other path is affected."""
-        global _active_segment_recorder
-        rec = SegmentRecorder()
-        _active_segment_recorder = rec
-        try:
-            with torch.cuda.stream(self.stream):
-                rec.begin(pool=global_graph_memory_pool, stream=self.stream)
-                out = run_once()
-                graphs, breaks = rec.finish()
-        finally:
-            _active_segment_recorder = None
-        return (graphs, breaks), out
+        The capture publishes itself (``BreakableCapture.current()``) for its
+        duration only; the collective seams in comm_ops/base.py pick it up (in
+        ``break_at_collectives`` mode) to record each collective as an eager
+        break via ``add_eager``. ``@break_point`` mixers pass through and stay
+        captured. NOTE: ``add_eager`` also RUNS the collective once at capture
+        time -- safe here because capture is rank-lockstepped (dist.barrier
+        around the capture loop) and every rank cuts at the same seams in the
+        same order."""
+        cap = BreakableCapture(
+            pool=global_graph_memory_pool,
+            stream=self.stream,
+            break_at_collectives=True,
+        )
+        with cap:
+            out = run_once()
+        return cap, out
 
     def _capture_paged_cache_block_tables(self, bs: int, pool) -> dict | None:
         specs = tuple(pool.paged_cache_group_specs)
@@ -1031,13 +973,9 @@ class CudaGraphWrapper:
         segment in order, running the stashed eager collective between
         consecutive segments (compute -> comm -> compute)."""
         captured = self.graphs[graph_key]
-        if isinstance(captured, tuple):
-            graphs, breaks = captured
-            for i, segment in enumerate(graphs):
-                segment.replay()
-                if i < len(breaks):
-                    breaks[i]()
-            return
+        # Monolithic and piecewise captures both expose .replay(); a piecewise
+        # BreakableCapture walks its segment list (compute graph replays with
+        # the stashed eager collectives interleaved) in order.
         captured.replay()
 
     def __call__(
