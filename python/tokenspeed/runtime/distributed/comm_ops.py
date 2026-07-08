@@ -115,34 +115,43 @@ class FusionParams:
 #
 # When the decode forward is captured as a piecewise CUDA graph (compute ->
 # comm -> compute), collectives must NOT be recorded into the graph. During
-# segmented capture the active SegmentRecorder splits the graph here: instead
-# of running the real collective we hand it an eager closure to run between
-# graph replays, and return the persistent buffer the next segment reads.
+# segmented capture the active collective-mode BreakableCapture splits the
+# graph here: the eager collective closure is recorded (and run once, at
+# capture) via add_eager to re-run between graph replays, and the persistent
+# buffer the next segment reads is returned.
 #
-# _NO_BREAK means "not captured / no active recorder -> run the collective
-# normally as today", so the flag-off path is unchanged.
+# _NO_BREAK means "not captured / no collective-mode capture -> run the
+# collective normally as today", so the flag-off path (and the breakable
+# PREFILL graph, which captures its collectives) is unchanged.
 
 _NO_BREAK = object()
+
+
+def _active_collective_mode_capture():
+    """The in-flight collective-mode BreakableCapture, or None.
+
+    The import is local to avoid a module-load circular import
+    (cuda_graph_wrapper imports the sampling backend, which pulls in comm)."""
+    from tokenspeed.runtime.execution.breakable_cuda_graph import BreakableCapture
+    from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
+
+    if not get_is_capture_mode():
+        return None
+    cap = BreakableCapture.current()
+    if cap is not None and cap._capturing and cap.break_at_collectives:
+        return cap
+    return None
 
 
 def _maybe_record_piecewise_break(op_name, eager_fn, output_tensor):
     """If a piecewise decode graph is being captured, record ``eager_fn`` as a
     segment break and return ``output_tensor`` (the persistent buffer the next
     segment reads). Otherwise return ``_NO_BREAK`` so the caller runs the
-    collective normally.
-
-    The import is local to avoid a module-load circular import
-    (cuda_graph_wrapper imports the sampling backend, which pulls in comm)."""
-    from tokenspeed.runtime.execution.cuda_graph_wrapper import (
-        get_active_segment_recorder,
-        get_is_capture_mode,
-    )
-
-    if get_is_capture_mode():
-        recorder = get_active_segment_recorder()
-        if recorder is not None:
-            recorder.record_break(eager_fn)
-            return output_tensor
+    collective normally."""
+    cap = _active_collective_mode_capture()
+    if cap is not None:
+        cap.add_eager(eager_fn)
+        return output_tensor
     return _NO_BREAK
 
 
@@ -347,12 +356,7 @@ def _reject_allocating_collective_under_piecewise(name: str) -> None:
     On the supported piecewise config (TP=2 / EP off / DP=1) use_all_reduce is
     True everywhere and these never fire; if one does, fail LOUD rather than
     silently hang or corrupt."""
-    from tokenspeed.runtime.execution.cuda_graph_wrapper import (
-        get_active_segment_recorder,
-        get_is_capture_mode,
-    )
-
-    if get_is_capture_mode() and get_active_segment_recorder() is not None:
+    if _active_collective_mode_capture() is not None:
         raise RuntimeError(
             f"piecewise decode graph: unexpected allocating collective {name} "
             "— not supported; disable --piecewise-decode-cudagraph or file a bug"

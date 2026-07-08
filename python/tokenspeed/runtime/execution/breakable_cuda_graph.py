@@ -148,15 +148,28 @@ class BreakableCapture:
             2478MB -> 564MB for buckets [8192,4096,2048,1024] on the repro). This
             mirrors ``torch.cuda.graph``'s shared ``default_capture_stream`` and
             its documented "pass the same stream for effective memory sharing".
+        break_at_collectives: Capture MODE selector. ``False`` (default, the
+            prefill-graph mode): :func:`break_point`-decorated sequence-mixing
+            methods run as eager breaks and collectives are captured into the
+            segments. ``True`` (the piecewise-DECODE mode, for fabrics where
+            graph-replayed collectives hang -- e.g. host-staged RoCE NCCL on
+            multi-node DGX Spark): the graph is cut ONLY at the communication
+            seams (``comm_ops`` records each collective via :meth:`add_eager`)
+            while ``@break_point`` methods pass through and stay captured --
+            decode attention is fixed-shape and belongs in the graph.
     """
 
     _active: BreakableCapture | None = None
     _default_capture_stream: torch.cuda.Stream | None = None
 
     def __init__(
-        self, pool: Any | None = None, stream: torch.cuda.Stream | None = None
+        self,
+        pool: Any | None = None,
+        stream: torch.cuda.Stream | None = None,
+        break_at_collectives: bool = False,
     ) -> None:
         self.pool = pool
+        self.break_at_collectives = break_at_collectives
         self.segments: list[Callable[[], Any]] = []
         self._current_graph: torch.cuda.CUDAGraph | None = None
         self._capturing = False
@@ -383,6 +396,10 @@ def break_point(method: Callable | None = None) -> Callable:
             if not is_breakable_capture_active():
                 return method(*args, **kwargs)
             cap = BreakableCapture.current()
+            if cap.break_at_collectives:
+                # Piecewise-DECODE capture: only the comm seams break the graph;
+                # sequence mixers are fixed-shape at decode and stay captured.
+                return method(*args, **kwargs)
 
             def resolve_dst(result: torch.Tensor) -> torch.Tensor:
                 # Handoff buffer inferred from the capture-time output, shape-keyed.
