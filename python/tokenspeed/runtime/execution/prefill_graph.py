@@ -641,10 +641,14 @@ class PrefillGraph:
     def _log_engaged_once(
         self, bucket: int, ctx: ForwardContext, is_multimodal: bool
     ) -> None:
+        # Key on (kind, bucket): each bucket's FIRST engagement logs, so the log
+        # answers "which buckets actually serve traffic" -- a kind-only key hides
+        # every bucket after the first and reads as "the graph never engaged".
         kind = "multimodal" if is_multimodal else "text"
-        if kind in self._engaged_logged:
+        key = f"{kind}:{bucket}"
+        if key in self._engaged_logged:
             return
-        self._engaged_logged.add(kind)
+        self._engaged_logged.add(key)
         logger.info(
             "prefill breakable graph ENGAGED (%s): bucket=%d dp=%s mode=%s "
             "(mixed prefill+decode batches supported)",
