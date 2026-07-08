@@ -128,15 +128,16 @@ _NO_BREAK = object()
 
 
 def _active_collective_mode_capture():
-    """The in-flight collective-mode BreakableCapture, or None.
+    """The in-flight collective-cutting BreakableCapture, or None.
 
-    The import is local to avoid a module-load circular import
-    (cuda_graph_wrapper imports the sampling backend, which pulls in comm)."""
+    True for BOTH the piecewise decode capture and a collective-cutting prefill
+    graph capture. A collective fired inside an eager break sees
+    ``_capturing == False`` (the segment was closed before the break ran) and
+    correctly passes through to run eagerly. The import is local to avoid a
+    module-load circular import (cuda_graph_wrapper imports the sampling
+    backend, which pulls in comm)."""
     from tokenspeed.runtime.execution.breakable_cuda_graph import BreakableCapture
-    from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 
-    if not get_is_capture_mode():
-        return None
     cap = BreakableCapture.current()
     if cap is not None and cap._capturing and cap.break_at_collectives:
         return cap
