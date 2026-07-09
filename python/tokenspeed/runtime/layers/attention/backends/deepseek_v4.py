@@ -1735,7 +1735,16 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 "Build/install `tokenspeed-kernel/python` with FlashMLA."
             )
 
-        prefill_heads = _fi_prefill_tile_heads(num_local_heads, padded_heads)
+        # Reduced head-tile ONLY for chunks that reach FlashInfer's prefill
+        # orchestrator (num_tokens > 64). Chunks of <= 64 tokens (short
+        # prefix-cache extends, e.g. GSM8K few-shot resends) auto-dispatch to
+        # FlashInfer's split-K DECODE kernels, which IMA at 32 padded heads
+        # (2026-07-09: arthur conc-12 decode + GSM8K 1-token-extend both died
+        # there); those keep the proven pad-to-64.
+        if q.shape[0] > 64:
+            prefill_heads = _fi_prefill_tile_heads(num_local_heads, padded_heads)
+        else:
+            prefill_heads = padded_heads
         # attn_sink is sized (padded_heads,) with -inf beyond num_local_heads;
         # the leading slice is exactly the loaded per-head sinks.
         attn_sink = attn_sink[:prefill_heads]
