@@ -182,6 +182,128 @@ def _mhc_pre_mix_triton_kernel(
 
 
 @triton.jit
+def _tf32_hc_prenorm_gemm_kernel(
+    x_ptr,
+    fn_ptr,
+    out_ptr,
+    sqrsum_ptr,
+    M,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    stride_xm: tl.constexpr,
+    stride_xk: tl.constexpr,
+    stride_fnn: tl.constexpr,
+    stride_fnk: tl.constexpr,
+    stride_outs: tl.constexpr,
+    stride_outm: tl.constexpr,
+    stride_outn: tl.constexpr,
+    stride_sqs: tl.constexpr,
+    stride_sqm: tl.constexpr,
+    NUM_SPLIT: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Fused split-K ``(x @ fn.T, rowwise sum(x*x))`` at tf32 precision.
+
+    The Triton equivalent of ``deep_gemm.tf32_hc_prenorm_gemm`` for archs
+    without the datacenter kernel: loads bf16 ``x`` in-register (no fp32
+    materialization of the ``[num_tokens, hc_hidden]`` residual), accumulates
+    the prenorm GEMM with tf32 tensor cores, and folds the pre-RMSNorm
+    sum-of-squares into the same K-loop. Split ``pid_s`` writes partial sums;
+    the mix kernel reduces over splits.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_s = tl.program_id(2)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    split_k = tl.cdiv(K, NUM_SPLIT)
+    split_begin = pid_s * split_k
+    split_end = tl.minimum(split_begin + split_k, K)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    sq = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    for k0 in tl.range(0, split_k, BLOCK_K):
+        k = split_begin + k0 + offs_k
+        k_mask = k < split_end
+        x = tl.load(
+            x_ptr + offs_m[:, None] * stride_xm + k[None, :] * stride_xk,
+            mask=(offs_m[:, None] < M) & k_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        fn = tl.load(
+            fn_ptr + offs_n[None, :] * stride_fnn + k[:, None] * stride_fnk,
+            mask=(offs_n[None, :] < N) & k_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)
+
+        acc += tl.dot(x, fn, input_precision="tf32", out_dtype=tl.float32)
+        sq += tl.sum(x * x, axis=1)
+
+    tl.store(
+        out_ptr
+        + pid_s * stride_outs
+        + offs_m[:, None] * stride_outm
+        + offs_n[None, :] * stride_outn,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+    if pid_n == 0:
+        tl.store(
+            sqrsum_ptr + pid_s * stride_sqs + offs_m * stride_sqm,
+            sq,
+            mask=offs_m < M,
+        )
+
+
+def _tf32_hc_prenorm_gemm_triton(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    out: torch.Tensor,
+    sqrsum: torch.Tensor,
+    num_split: int,
+) -> None:
+    m, k = x.shape
+    n = fn.shape[0]
+    if m == 0:
+        return
+
+    block_m = 16
+    block_n = min(max(triton.next_power_of_2(n), 16), 32)
+    block_k = 64
+    grid = (ceil_div(m, block_m), ceil_div(n, block_n), num_split)
+    _tf32_hc_prenorm_gemm_kernel[grid](
+        x,
+        fn,
+        out,
+        sqrsum,
+        m,
+        k,
+        n,
+        x.stride(0),
+        x.stride(1),
+        fn.stride(0),
+        fn.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        sqrsum.stride(0),
+        sqrsum.stride(1),
+        num_split,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        num_warps=4,
+    )
+
+
+@triton.jit
 def _mhc_pre_layer_triton_kernel(
     pre_mix,
     residual,
@@ -396,10 +518,8 @@ def mhc_pre(
 
     block_k = 64
     block_m = 64
-    n_splits = (
-        1
-        if use_fallback
-        else _compute_num_split(block_k, hc_hidden_size, ceil_div(num_tokens, block_m))
+    n_splits = _compute_num_split(
+        block_k, hc_hidden_size, ceil_div(num_tokens, block_m)
     )
 
     post_mix = torch.empty(
@@ -422,15 +542,20 @@ def mhc_pre(
     )
 
     if use_fallback:
-        # Portable fp32 equivalent of deep_gemm.tf32_hc_prenorm_gemm for archs
-        # without the datacenter kernel (consumer Blackwell sm_120/121, Thor,
-        # Hopper): the fused split-K (residual @ fn.T) + per-row sum-of-squares.
-        # n_splits == 1, so the single full reduction is exact (the mix kernel
-        # sums over splits). fn is the prenorm weight [hc_mult3, hc_hidden_size];
-        # gemm_out_sqrsum feeds the pre-RMSNorm.
-        r2d = residual_flat.reshape(num_tokens, hc_hidden_size).to(torch.float32)
-        torch.mm(r2d, fn.t(), out=gemm_out_mul[0])
-        torch.sum(r2d * r2d, dim=1, out=gemm_out_sqrsum[0])
+        # Portable Triton equivalent of deep_gemm.tf32_hc_prenorm_gemm for
+        # archs without the datacenter kernel (consumer Blackwell sm_120/121,
+        # Thor, Hopper): the fused split-K (residual @ fn.T) + per-row
+        # sum-of-squares, loading bf16 in-register (no fp32 materialization
+        # of the [num_tokens, hc_hidden_size] residual). fn is the prenorm
+        # weight [hc_mult3, hc_hidden_size]; gemm_out_sqrsum feeds the
+        # pre-RMSNorm; the mix kernel sums over splits.
+        _tf32_hc_prenorm_gemm_triton(
+            residual_flat.view(num_tokens, hc_hidden_size),
+            fn,
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            n_splits,
+        )
     else:
         deep_gemm.tf32_hc_prenorm_gemm(
             residual_flat.view(num_tokens, hc_hidden_size),
