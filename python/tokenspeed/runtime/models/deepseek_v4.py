@@ -119,9 +119,6 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     fused_qnorm_rope_kv_insert,
     save_deepseek_v4_compressor_state,
 )
-from tokenspeed.runtime.layers.attention.backends.deepseek_v4 import (
-    _use_flashinfer_sparse_mla_sm120,
-)
 from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
     _group_slot_mapping_from_raw,
     _mask_invalid_graph_tokens,
@@ -2279,19 +2276,9 @@ class _DeepseekV4TopKBuffer:
 
 
 def _deepseek_v4_padded_heads(num_local_heads: int) -> int:
-    if _use_flashinfer_sparse_mla_sm120():
-        # FlashInfer's SM120 packed sparse-MLA dispatch (prefill orchestrator
-        # and decode) accepts ``num_heads`` in {16, 32, 64, 128}, so consumer
-        # Blackwell pads to the nearest supported tile instead of always 64:
-        # TP=2 runs 32 local heads on the 32-head tile (half the attention
-        # M-rows) and skips the per-layer zero-fill + copy of pad-to-64.
-        for tile_heads in (16, 32, 64, 128):
-            if num_local_heads <= tile_heads:
-                return tile_heads
-    elif num_local_heads <= 64:
-        # FlashMLA tiles require 64 padded heads.
+    if num_local_heads <= 64:
         return 64
-    elif num_local_heads <= 128:
+    if num_local_heads <= 128:
         return 128
     raise ValueError(
         f"DeepSeek V4 attention supports at most 128 local heads, got {num_local_heads}"

@@ -9,45 +9,53 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
-import tokenspeed.runtime.models.deepseek_v4 as ds4_models
+import tokenspeed.runtime.layers.attention.backends.deepseek_v4 as ds4_backend
+from tokenspeed.runtime.layers.attention.backends.deepseek_v4 import (
+    _fi_prefill_tile_heads,
+)
 from tokenspeed.runtime.models.deepseek_v4 import _deepseek_v4_padded_heads
 
 
 class TestDeepseekV4PaddedHeads(unittest.TestCase):
-    """Padded-head tile selection for the sparse-MLA query.
+    """Head-padding policy for the sparse-MLA query.
 
-    FlashMLA tiles need 64 padded heads; FlashInfer's SM120 packed sparse-MLA
-    dispatch accepts {16, 32, 64, 128}, so consumer Blackwell pads to the
-    nearest supported tile instead (TP=2 keeps its 32 local heads on the
-    32-head tile rather than zero-padding to 64).
+    Model-level ``padded_heads`` keeps the upstream FlashMLA tile rule
+    (pad to 64/128) -- it sizes ``attn_sink`` and the DECODE path, where the
+    FlashInfer split-K decode at reduced head counts IMAs under concurrent
+    ragged batches (2026-07-09 arthur bisect). Only the sm12x FI PREFILL call
+    drops to the nearest supported tile in {16, 32, 64, 128} via
+    ``_fi_prefill_tile_heads``.
     """
 
-    def test_flashmla_route_pads_to_64_minimum(self):
-        with patch.object(
-            ds4_models, "_use_flashinfer_sparse_mla_sm120", return_value=False
-        ):
-            self.assertEqual(_deepseek_v4_padded_heads(16), 64)
-            self.assertEqual(_deepseek_v4_padded_heads(32), 64)
-            self.assertEqual(_deepseek_v4_padded_heads(64), 64)
-            self.assertEqual(_deepseek_v4_padded_heads(65), 128)
-            self.assertEqual(_deepseek_v4_padded_heads(128), 128)
-            with self.assertRaises(ValueError):
-                _deepseek_v4_padded_heads(129)
+    def test_model_padded_heads_keeps_flashmla_rule(self):
+        self.assertEqual(_deepseek_v4_padded_heads(16), 64)
+        self.assertEqual(_deepseek_v4_padded_heads(32), 64)
+        self.assertEqual(_deepseek_v4_padded_heads(64), 64)
+        self.assertEqual(_deepseek_v4_padded_heads(65), 128)
+        self.assertEqual(_deepseek_v4_padded_heads(128), 128)
+        with self.assertRaises(ValueError):
+            _deepseek_v4_padded_heads(129)
 
-    def test_fi_sm120_route_uses_supported_tile_ladder(self):
+    def test_fi_prefill_tile_ladder_when_route_active(self):
         with patch.object(
-            ds4_models, "_use_flashinfer_sparse_mla_sm120", return_value=True
+            ds4_backend, "_use_flashinfer_sparse_mla_prefill_sm12x", return_value=True
         ):
-            self.assertEqual(_deepseek_v4_padded_heads(8), 16)
-            self.assertEqual(_deepseek_v4_padded_heads(16), 16)
-            self.assertEqual(_deepseek_v4_padded_heads(17), 32)
-            self.assertEqual(_deepseek_v4_padded_heads(32), 32)
-            self.assertEqual(_deepseek_v4_padded_heads(33), 64)
-            self.assertEqual(_deepseek_v4_padded_heads(64), 64)
-            self.assertEqual(_deepseek_v4_padded_heads(65), 128)
-            self.assertEqual(_deepseek_v4_padded_heads(128), 128)
-            with self.assertRaises(ValueError):
-                _deepseek_v4_padded_heads(129)
+            self.assertEqual(_fi_prefill_tile_heads(8, 64), 16)
+            self.assertEqual(_fi_prefill_tile_heads(16, 64), 16)
+            self.assertEqual(_fi_prefill_tile_heads(17, 64), 32)
+            self.assertEqual(_fi_prefill_tile_heads(32, 64), 32)
+            self.assertEqual(_fi_prefill_tile_heads(33, 64), 64)
+            self.assertEqual(_fi_prefill_tile_heads(64, 64), 64)
+            self.assertEqual(_fi_prefill_tile_heads(96, 128), 128)
+            # Never exceeds the model-level pad.
+            self.assertEqual(_fi_prefill_tile_heads(96, 64), 64)
+
+    def test_fi_prefill_tile_passthrough_when_route_inactive(self):
+        with patch.object(
+            ds4_backend, "_use_flashinfer_sparse_mla_prefill_sm12x", return_value=False
+        ):
+            self.assertEqual(_fi_prefill_tile_heads(32, 64), 64)
+            self.assertEqual(_fi_prefill_tile_heads(96, 128), 128)
 
 
 if __name__ == "__main__":

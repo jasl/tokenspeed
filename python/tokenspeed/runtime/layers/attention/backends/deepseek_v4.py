@@ -137,6 +137,29 @@ def _use_flashinfer_sparse_mla_prefill_sm12x() -> bool:
     )
 
 
+def _fi_prefill_tile_heads(num_local_heads: int, padded_heads: int) -> int:
+    """Query-head padding for the sm12x sparse-MLA PREFILL call.
+
+    FlashInfer's SM120 prefill orchestrator accepts ``num_heads`` in
+    {16, 32, 64, 128}, so prefill pads to the nearest supported tile instead
+    of the model-level ``padded_heads`` (64, a FlashMLA tile requirement):
+    TP=2 runs its 32 local heads on the 32-head tile -- half the attention
+    M-rows -- and skips the per-layer zero-fill + copy of pad-to-64.
+
+    PREFILL-ONLY on purpose: the same reduction on the DECODE path
+    (FlashInfer split-K decode at 32 heads) IMAs under concurrent ragged
+    batches (arthur coherence gate, 2026-07-09 bisect) -- decode keeps the
+    proven ``padded_heads`` config. Never exceeds ``padded_heads``, and the
+    non-FI (FlashMLA/datacenter) route is unchanged.
+    """
+    if not _use_flashinfer_sparse_mla_prefill_sm12x():
+        return padded_heads
+    for tile_heads in (16, 32, 64, 128):
+        if num_local_heads <= tile_heads:
+            return min(tile_heads, padded_heads)
+    return padded_heads
+
+
 def _compressed_block_table_base_offsets(
     metadata: DeepseekV4ForwardMetadata,
     compress_ratio: int,
@@ -1712,12 +1735,16 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 "Build/install `tokenspeed-kernel/python` with FlashMLA."
             )
 
+        prefill_heads = _fi_prefill_tile_heads(num_local_heads, padded_heads)
+        # attn_sink is sized (padded_heads,) with -inf beyond num_local_heads;
+        # the leading slice is exactly the loaded per-head sinks.
+        attn_sink = attn_sink[:prefill_heads]
         with nvtx_range(f"attn_{kind}_prefill_pad_q"):
-            if q.shape[1] == padded_heads:
+            if q.shape[1] == prefill_heads:
                 q_padded = q.contiguous()
             else:
                 q_padded = torch.zeros(
-                    (q.shape[0], padded_heads, q.shape[2]),
+                    (q.shape[0], prefill_heads, q.shape[2]),
                     dtype=q.dtype,
                     device=q.device,
                 )
@@ -1727,7 +1754,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             layer_id=layer_id,
             compress_ratio=compress_ratio,
             window_size=window_size,
-            padded_heads=padded_heads,
+            padded_heads=prefill_heads,
             head_dim=head_dim,
             topk_indices=topk_indices,
         ):
