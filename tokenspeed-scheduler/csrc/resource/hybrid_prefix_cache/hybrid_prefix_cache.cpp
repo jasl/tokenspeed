@@ -356,10 +356,14 @@ bool HybridPrefixCache::adoptExistingPagedCacheSnapshot(PagedCacheSnapshot& exis
     struct Adoption {
         std::string gid;
         PagedCacheGroupTable* table{nullptr};
+        // Null for a State group missing from `existing` (stripped by the
+        // superseded-state release): refill from the live table instead.
         const PagedCacheGroupSnapshot* segment{nullptr};
         PagedCacheGroupFamily family{PagedCacheGroupFamily::History};
     };
 
+    // Phase 1 validates every group before phase 2 mutates any table, so a
+    // failed adoption never leaves the request's commit cursors desynced.
     std::vector<Adoption> actions;
     actions.reserve(paged_cache_required_groups_.size());
     for (const auto& gid : paged_cache_required_groups_) {
@@ -368,14 +372,41 @@ bool HybridPrefixCache::adoptExistingPagedCacheSnapshot(PagedCacheSnapshot& exis
         if (table_it == tables.end() || alloc_it == paged_cache_allocators_.end()) {
             return false;
         }
-
-        const PagedCacheGroupFamily family = alloc_it->second->Config().family;
-        auto segment_it = existing.groups.find(gid);
-        if (segment_it == existing.groups.end()) {
+        PagedCacheGroupTable& table = table_it->second;
+        const auto& cfg = alloc_it->second->Config();
+        const std::int32_t raw_per_page = cfg.RawTokensPerPage();
+        if (raw_per_page <= 0) {
             return false;
         }
 
-        actions.push_back(Adoption{gid, &table_it->second, &segment_it->second, family});
+        auto segment_it = existing.groups.find(gid);
+        const PagedCacheGroupSnapshot* segment = segment_it != existing.groups.end() ? &segment_it->second : nullptr;
+
+        if (cfg.family == PagedCacheGroupFamily::History) {
+            // History segments are mandatory and must cover exactly
+            // [committed, target); a size mismatch means the node's chain
+            // disagrees with this request's tables (e.g. a snapshot written
+            // by a desynced pre-fix build), so bail before mutating anything
+            // instead of throwing mid-apply.
+            if (segment == nullptr) {
+                return false;
+            }
+            if (target > table.CommittedPrefixLenTokens()) {
+                const std::int32_t expected = (target - table.CommittedPrefixLenTokens()) / raw_per_page;
+                if (static_cast<std::int32_t>(segment->pages.Ids().size()) != expected) {
+                    return false;
+                }
+            }
+        } else if (segment != nullptr) {
+            // Present State segments must end exactly at the target boundary.
+            const auto& ids = segment->pages.Ids();
+            if (ids.empty() ||
+                (segment->base_logical_page + static_cast<std::int32_t>(ids.size())) * raw_per_page != target) {
+                return false;
+            }
+        }
+
+        actions.push_back(Adoption{gid, &table, segment, cfg.family});
     }
 
     for (const auto& action : actions) {
@@ -383,8 +414,27 @@ bool HybridPrefixCache::adoptExistingPagedCacheSnapshot(PagedCacheSnapshot& exis
             action.table->AdoptSnapshotSegment(action.segment->pages.Ids(), target);
             continue;
         }
-
-        action.table->AdoptStateSnapshotSegment(action.segment->pages.Ids(), action.segment->base_logical_page, target);
+        if (action.segment != nullptr) {
+            action.table->AdoptStateSnapshotSegment(action.segment->pages.Ids(), action.segment->base_logical_page,
+                                                    target);
+            continue;
+        }
+        // Stripped State group: refill the boundary window from the live
+        // table so the commit cursor keeps advancing in lockstep and the node
+        // regains its resume anchor. When the live window has already slid
+        // past this boundary the checkpoint degrades to a cursor advance and
+        // returns no pages; the group then stays absent (State-incomplete
+        // node), which only caps future match depth.
+        auto result = action.table->CheckpointStateToSnapshot(target);
+        if (result.pages.Empty()) {
+            continue;
+        }
+        PagedCacheGroupSnapshot group_snap{};
+        group_snap.pages = std::move(result.pages);
+        group_snap.base_logical_page = result.segment_base_logical_page;
+        group_snap.raw_token_cursor = action.table->RawTokenCursor();
+        group_snap.sliding = action.table->IsSliding();
+        existing.groups.emplace(action.gid, std::move(group_snap));
     }
     return true;
 }
@@ -409,6 +459,16 @@ bool HybridPrefixCache::commitTerminalContinuationSnapshot(std::map<std::string,
     actions.reserve(paged_cache_continuation_state_groups_.size());
     for (const auto& gid : paged_cache_continuation_state_groups_) {
         if (snapshot->groups.find(gid) != snapshot->groups.end()) continue;
+
+        // Required State groups are owned by the lockstep boundary-commit loop
+        // in CommitChunk: checkpointing one here would advance its commit
+        // cursor past the History tables and desync the canonical cursor
+        // (the root cause of AdoptSnapshotSegment size-mismatch crashes when
+        // the canonical front group is State-family). If a required State
+        // group is absent from the terminal snapshot, leave it absent; the
+        // snapshot stays state-incomplete and the superseded-state release
+        // below is skipped for this commit.
+        if (paged_cache_state_group_set_.find(gid) != paged_cache_state_group_set_.end()) continue;
 
         auto table_it = tables.find(gid);
         auto alloc_it = paged_cache_allocators_.find(gid);
@@ -1516,9 +1576,13 @@ void HybridPrefixCache::CommitChunk(const std::string& request_id, TreeNode* ter
     const std::int32_t lcm = paged_cache_history_alignment_tokens_;
     if (lcm <= 0) return;
     const auto& required_groups = paged_cache_required_groups_;
-    if (required_groups.empty()) return;
+    if (required_groups.empty() || paged_cache_history_groups_.empty()) return;
 
-    auto canonical_it = tables.find(required_groups.front());
+    // The canonical commit cursor comes from a History-family table: History
+    // cursors only ever advance inside this lockstep loop, so the canonical
+    // cursor is independent of the model-side ordering of required groups and
+    // immune to any out-of-band State checkpointing.
+    auto canonical_it = tables.find(paged_cache_history_groups_.front());
     if (canonical_it == tables.end()) return;
     std::int32_t last_committed = canonical_it->second.CommittedPrefixLenTokens();
 
@@ -1607,6 +1671,16 @@ void HybridPrefixCache::CommitChunk(const std::string& request_id, TreeNode* ter
             const auto& cfg = group_alloc_it->second->Config();
             auto result = cfg.family == PagedCacheGroupFamily::History ? table.CommitHistoryToSnapshot(target)
                                                                        : table.CheckpointStateToSnapshot(target);
+            if (cfg.family == PagedCacheGroupFamily::State && result.pages.Empty()) {
+                // Late catch-up commit: the live sliding window already
+                // advanced past this boundary, so there is no full-window
+                // segment to publish (the checkpoint still advanced the
+                // commit cursor, keeping the tables in lockstep). Leave the
+                // group out: an empty segment would poison future matches
+                // and adoptions, while a State-incomplete node only caps
+                // match depth.
+                continue;
+            }
             PagedCacheGroupSnapshot group_snap{};
             group_snap.pages = std::move(result.pages);
             group_snap.base_logical_page = result.segment_base_logical_page;
@@ -1615,15 +1689,17 @@ void HybridPrefixCache::CommitChunk(const std::string& request_id, TreeNode* ter
             snapshot->groups.emplace(gid, std::move(group_snap));
         }
 
-        bool snapshot_complete = true;
-        for (const auto& gid : required_groups) {
+        // History groups must all be present; State groups may be
+        // legitimately absent after a late catch-up commit (see above).
+        bool history_groups_present = true;
+        for (const auto& gid : paged_cache_history_groups_) {
             if (snapshot->groups.find(gid) == snapshot->groups.end()) {
-                snapshot_complete = false;
+                history_groups_present = false;
                 break;
             }
         }
-        _assert(snapshot_complete,
-                "HybridPrefixCache::CommitChunk: built snapshot missing a required group after "
+        _assert(history_groups_present,
+                "HybridPrefixCache::CommitChunk: built snapshot missing a required History group after "
                 "preflight+commit; invariant violated");
         const bool attached = AttachPagedCacheSnapshotToNode(attach_node, std::move(snapshot));
         _assert(attached,
@@ -1662,10 +1738,45 @@ void HybridPrefixCache::CommitChunk(const std::string& request_id, TreeNode* ter
                     std::max(max_state_window, alloc_it->second->Config().sliding_window_tokens.value_or(0));
             }
         }
+        // Retain the MOST RECENT superseded boundary (the deepest ancestor
+        // whose snapshot still carries required State groups) and release
+        // only strictly older ones. An identical resend of this prompt
+        // matches through the radix walk, which stops one page short of the
+        // full prompt, so the newest superseded boundary is the deepest
+        // interior node such a resend can hit; stripping it degraded aligned
+        // resends to zero prefix reuse. Memory growth stays bounded at
+        // exactly one extra retained window per chain: the retained boundary
+        // advances with decode and the previously retained one becomes
+        // strictly older, so a later commit releases it.
+        //
+        // The retention slot is keyed to REQUIRED State payload on purpose:
+        // interior boundary hits go through the state-window fallback, which
+        // is only reachable when the State family is required. Transport-only
+        // continuation anchors keep the pre-existing release cadence — their
+        // small pools are sized for exactly one live anchor per chain, and
+        // retaining superseded anchors would silently shrink admission
+        // capacity for configurations this retention cannot benefit.
+        bool retained_most_recent_boundary = false;
         for (TreeNode* cur = terminal->Parent(); cur != nullptr && !cur->IsRoot(); cur = cur->Parent()) {
             if (!cur->HasPagedCacheSnapshot()) continue;
             if (static_cast<std::int32_t>(cur->DepthInTokens()) + max_state_window > chunk_depth) {
                 continue;
+            }
+            if (!retained_most_recent_boundary) {
+                const PagedCacheSnapshot* snap = cur->GetPagedCacheSnapshot();
+                bool has_required_state_payload = false;
+                if (snap != nullptr) {
+                    for (const auto& gid : paged_cache_state_groups_) {
+                        if (snap->groups.find(gid) != snap->groups.end()) {
+                            has_required_state_payload = true;
+                            break;
+                        }
+                    }
+                }
+                if (has_required_state_payload) {
+                    retained_most_recent_boundary = true;
+                    continue;
+                }
             }
             if (!cur->OnDevice() || cur->Device().RefCount() != 1) continue;
             if (isPagedCacheSnapshotBorrowed(cur, PagedCacheGroupFamily::State)) continue;
