@@ -60,4 +60,4 @@ def test_trtllm_indexer_q_registration_matches_availability(fresh_registry) -> N
         "rope_dim": frozenset({64}),
     }
     assert spec.capability.min_arch_version == ArchVersion(10, 0)
-    assert spec.capability.max_arch_version == ArchVersion(10, 9)
+    assert spec.capability.max_arch_version == ArchVersion(12, 9)

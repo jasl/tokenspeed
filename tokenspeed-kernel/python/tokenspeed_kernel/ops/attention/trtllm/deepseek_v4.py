@@ -42,15 +42,38 @@ _ROPE_DIM = 64
 _MXFP4_VALUE_BYTES = _HEAD_DIM // 2
 _BLACKWELL_CAPABILITY = CapabilityRequirement(
     min_arch_version=ArchVersion(10, 0),
-    max_arch_version=ArchVersion(10, 9),
+    max_arch_version=ArchVersion(12, 9),
     vendors=frozenset({"nvidia"}),
 )
+# Consumer Blackwell (sm_120/121) runs these kernels correctly (elementwise /
+# warp-level, no tcgen05; software FP4 encode; e8m0 convert has an sm_120a
+# native path) but only the <= 4096-token launch envelope is validated there;
+# larger prefill chunks stay on the portable Triton chain.
+_SM12X_MAX_TOKENS = 4096
 
 
 def has_trtllm_deepseek_v4_indexer_q_prepare() -> bool:
     """Return whether the TRT-LLM Q preparation chain is importable."""
 
     return has_trtllm_indexer_q_kernels()
+
+
+def trtllm_deepseek_v4_indexer_q_prepare_max_tokens(
+    device: torch.device | None = None,
+) -> int | None:
+    """Per-call token cap for the prepare chain on the current device.
+
+    ``None`` means uncapped (datacenter Blackwell). Consumer Blackwell is
+    capped to the validated launch envelope; the chain is token-local
+    (in-place RoPE, per-head Hadamard, per-token FP4 pack + weight scale),
+    so callers may process larger batches in capped slices.
+    """
+
+    index = device.index if device is not None and device.index is not None else None
+    if index is None:
+        index = torch.cuda.current_device()
+    major, _minor = torch.cuda.get_device_capability(index)
+    return _SM12X_MAX_TOKENS if major == 12 else None
 
 
 def supports_trtllm_deepseek_v4_indexer_q_prepare(
@@ -102,7 +125,11 @@ def supports_trtllm_deepseek_v4_indexer_q_prepare(
     if device_index is None:
         device_index = torch.cuda.current_device()
     major, _minor = torch.cuda.get_device_capability(device_index)
-    return major == 10
+    if major == 10:
+        return True
+    if major == 12:
+        return index_q.shape[0] <= _SM12X_MAX_TOKENS
+    return False
 
 
 def trtllm_deepseek_v4_indexer_q_prepare_mxfp4(

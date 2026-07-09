@@ -40,7 +40,7 @@ from tokenspeed_kernel.thirdparty.cuda.trtllm_deepseek_v4_indexer import (
 def _is_supported() -> bool:
     return (
         torch.cuda.is_available()
-        and torch.cuda.get_device_capability()[0] == 10
+        and torch.cuda.get_device_capability()[0] in (10, 12)
         and has_trtllm_deepseek_v4_indexer_q_prepare()
     )
 
