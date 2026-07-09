@@ -56,12 +56,22 @@ from tokenspeed_kernel.ops.attention.torch.indexer_mqa_logits_sm12x import (
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_indexer_decode_metadata_compute,
 )
+from tokenspeed_kernel.ops.attention.triton.indexer_mqa_logits_mtile_sm12x import (
+    indexer_mqa_logits_sm12x_mtile_triton,
+)
 from tokenspeed_kernel.ops.attention.triton.indexer_mqa_logits_sm12x import (
     indexer_mqa_logits_gather_sm12x_triton,
     indexer_mqa_logits_hhead_sm12x_triton,
     indexer_mqa_logits_paged_sm12x_triton,
     indexer_mqa_logits_sm12x_triton,
 )
+
+# Row threshold for the M-tiled prefill scorer: below this the per-query
+# kernel's per-row early-exit wins (small/ragged extends); above it the
+# M-tiled kernel's K-tile amortization wins (07-10 forensics: ~1.8x at
+# 13K-17K rows). Both kernels share the exact compact output contract and
+# produce identical top-k selections (tf32 reduction-order jitter only).
+_INDEXER_MTILE_MIN_ROWS = 1024
 from tokenspeed_kernel.ops.gemm.triton.deepseek_v4_o_proj_sm12x import (
     deepseek_v4_o_proj_einsum,
 )
@@ -1591,7 +1601,12 @@ def _deepseek_v4_indexer_topk_prefill_deepgemm(
                         max_len,
                         head_dim=q_values.shape[-1] * 2,
                     )
-                return indexer_mqa_logits_sm12x_triton(
+                scorer = (
+                    indexer_mqa_logits_sm12x_mtile_triton
+                    if q_values.shape[0] >= _INDEXER_MTILE_MIN_ROWS
+                    else indexer_mqa_logits_sm12x_triton
+                )
+                return scorer(
                     q_values.contiguous().view(torch.int8),
                     q_scales.contiguous(),
                     k_values.contiguous(),
