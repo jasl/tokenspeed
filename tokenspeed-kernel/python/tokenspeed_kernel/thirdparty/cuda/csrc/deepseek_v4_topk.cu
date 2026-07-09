@@ -11,6 +11,7 @@
  */
 
 #include <algorithm>
+#include <cstdlib>
 #include <cfloat>
 #include <cstdint>
 #include <type_traits>
@@ -476,6 +477,26 @@ void launch_persistent_topk(const TensorView& logits,
       << "cudaDevAttrMaxSharedMemoryPerBlockOptin query failed: "
       << cudaGetErrorString(err);
 
+  // GB10 / consumer-Blackwell parts whose opt-in smem cannot host the 128KB
+  // cooperative-radix fallback. Gate on smem CAPACITY (not capability family:
+  // RTX 50-series is also family-120 with ~100KB smem) so any >=128KB device
+  // (Hopper, datacenter Blackwell) keeps the tuned cooperative path unchanged.
+  // On these parts run every row on a single barrier-free CTA -- the in-kernel
+  // selector handles arbitrary seq_len at kSmemMedium. This both fixes the
+  // long-context oversubscribe hard-fail (total_ctas > num_sms*occupancy would
+  // fall back to the 128KB FilteredTopK these parts can't allocate) and removes
+  // the cooperative spin-wait barrier, which is fragile under a
+  // CUDA-graph-captured NCCL collective co-resident on the same SMs.
+  // Escape hatch for A/B + emergencies: TOKENSPEED_TOPK_DISABLE_NONCOOP=1 keeps
+  // the cooperative path even on <128KB parts (works below the oversubscribe
+  // ceiling; hard-fails above it -- diagnostic use only).
+  static const bool s_disable_noncoop = [] {
+    const char* e = getenv("TOKENSPEED_TOPK_DISABLE_NONCOOP");
+    return e && e[0] == '1';
+  }();
+  const bool force_noncooperative =
+      (max_smem_per_block < 128 * 1024) && !s_disable_noncoop;
+
   if (num_rows > 32 && max_smem_per_block >= 128 * 1024) {
     cudaError_t status =
         vllm::FilteredTopKRaggedTransform<float, int32_t, TopK>(
@@ -538,24 +559,88 @@ void launch_persistent_topk(const TensorView& logits,
       smem_size = P::kSmemMedium;
     }
 
+    if (force_noncooperative) {
+      // Single CTA per row (grid == num_rows), no cooperative group / barrier.
+      // Every row runs the in-kernel medium/decode selector; the long-row
+      // selectors stream from global at kSmemMedium, so the (device-exceeding)
+      // chunk buffer is unnecessary and ctas_per_group collapses.
+      ctas_per_group = 1;
+      smem_size = P::kSmemMedium;
+    }
+
+    // Query occupancy for the instantiation that will actually launch;
+    // overestimating it deadlocks the cooperative barrier.
     int occupancy = 1;
-    err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &occupancy, P::persistent_topk_kernel<TopK, 4>, P::kThreadsPerBlock,
-        smem_size);
-    TVM_FFI_ICHECK(err == cudaSuccess)
+    cudaError_t occ_err = cudaSuccess;
+    if (vec_size == 4) {
+      occ_err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+          &occupancy, P::persistent_topk_kernel<TopK, 4>, P::kThreadsPerBlock,
+          smem_size);
+    } else if (vec_size == 2) {
+      occ_err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+          &occupancy, P::persistent_topk_kernel<TopK, 2>, P::kThreadsPerBlock,
+          smem_size);
+    } else {
+      occ_err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+          &occupancy, P::persistent_topk_kernel<TopK, 1>, P::kThreadsPerBlock,
+          smem_size);
+    }
+    TVM_FFI_ICHECK(occ_err == cudaSuccess)
         << "persistent topk occupancy query failed: "
-        << cudaGetErrorString(err);
+        << cudaGetErrorString(occ_err);
     if (occupancy < 1) {
       occupancy = 1;
     }
 
-    uint32_t max_resident_ctas = static_cast<uint32_t>(num_sms) * occupancy;
+    // The cooperative spin-wait barrier only runs when at least one row hits
+    // the radix path (seq_len > RADIX_THRESHOLD). Below that, non-CTA-0 CTAs
+    // early-exit, so oversubscription can't deadlock and headroom is wasted.
+    const bool needs_cooperative =
+        !force_noncooperative &&
+        static_cast<uint32_t>(max_seq_len) > P::RADIX_THRESHOLD;
+
+    const uint32_t hw_resident_cap =
+        static_cast<uint32_t>(num_sms) * static_cast<uint32_t>(occupancy);
+    uint32_t max_resident_ctas = hw_resident_cap;
+    if (needs_cooperative) {
+      // Reserve one CTA per SM when occupancy allows; fall back to a single
+      // CTA when occupancy == 1 (the most deadlock-prone case -- any straggler
+      // kernel that takes the only slot on one SM hangs the barrier). Never
+      // drop below one full group's worth.
+      uint32_t headroom = (occupancy > 1) ? static_cast<uint32_t>(num_sms) : 1u;
+      if (max_resident_ctas >= headroom + ctas_per_group) {
+        max_resident_ctas -= headroom;
+      }
+    }
     uint32_t num_groups = std::min(max_resident_ctas / ctas_per_group,
                                    static_cast<uint32_t>(num_rows));
     if (num_groups == 0) {
       num_groups = 1;
     }
     uint32_t total_ctas = num_groups * ctas_per_group;
+
+    // If the cooperative launch wouldn't fit, fall back to FilteredTopK
+    // instead of deadlocking. Only relevant when needs_cooperative.
+    if (needs_cooperative && total_ctas > hw_resident_cap) {
+      TVM_FFI_ICHECK(max_smem_per_block >= 128 * 1024)
+          << "persistent_topk would oversubscribe and the FilteredTopK "
+          << "fallback requires >=128KB smem per block (have "
+          << max_smem_per_block << "). total_ctas=" << total_ctas
+          << " > num_sms*occupancy=" << hw_resident_cap << " (TopK=" << TopK
+          << ", vec_size=" << vec_size << ", ctas_per_group=" << ctas_per_group
+          << ", smem=" << smem_size << ").";
+      cudaError_t status =
+          vllm::FilteredTopKRaggedTransform<float, int32_t, TopK>(
+              static_cast<float*>(logits.data_ptr()),
+              static_cast<int32_t*>(output.data_ptr()),
+              static_cast<int32_t*>(lengths.data_ptr()),
+              static_cast<uint32_t>(num_rows), static_cast<uint32_t>(TopK),
+              static_cast<uint32_t>(stride),
+              static_cast<uint32_t>(q_len_per_req), stream);
+      TVM_FFI_ICHECK(status == cudaSuccess)
+          << "FilteredTopK fallback failed: " << cudaGetErrorString(status);
+      return;
+    }
 
     size_t state_bytes = num_groups * sizeof(P::RadixRowState);
     TVM_FFI_ICHECK(workspace.size(0) >= static_cast<int64_t>(state_bytes))
@@ -578,6 +663,7 @@ void launch_persistent_topk(const TensorView& logits,
     params.ctas_per_group = ctas_per_group;
     params.max_seq_len = static_cast<uint32_t>(max_seq_len);
     params.q_len_per_req = static_cast<uint32_t>(q_len_per_req);
+    params.force_noncooperative = force_noncooperative;
 
 #define LAUNCH_PERSISTENT(TOPK_VAL, VS)                                      \
   do {                                                                       \
