@@ -62,6 +62,9 @@ from tokenspeed_kernel.ops.attention.trtllm.deepseek_v4 import (
     supports_trtllm_deepseek_v4_indexer_q_prepare as _supports_trtllm_indexer_q_prepare,
 )
 from tokenspeed_kernel.ops.attention.trtllm.deepseek_v4 import (
+    trtllm_deepseek_v4_indexer_q_prepare_max_tokens as _trtllm_indexer_q_prepare_max_tokens,
+)
+from tokenspeed_kernel.ops.attention.trtllm.deepseek_v4 import (
     trtllm_deepseek_v4_indexer_q_prepare_mxfp4 as _trtllm_indexer_q_prepare_mxfp4,
 )
 from tokenspeed_kernel.ops.transform import hadamard_transform
@@ -321,22 +324,52 @@ def deepseek_v4_prepare_indexer_q_mxfp4(
         raise ValueError(
             "deepseek_v4_prepare_indexer_q_mxfp4 only supports CUDA tensors."
         )
-    if index_q.shape[
-        0
-    ] >= _TRTLLM_INDEXER_Q_MIN_TOKENS and _supports_trtllm_indexer_q_prepare(
-        index_q,
-        positions,
-        cos_sin_cache,
-    ):
-        return _trtllm_indexer_q_prepare_mxfp4(
-            index_q=index_q,
-            positions=positions,
-            cos_sin_cache=cos_sin_cache,
-            weights=weights,
-            softmax_scale=softmax_scale,
-            head_scale=head_scale,
-            enable_pdl=True,
-        )
+    num_tokens = index_q.shape[0]
+    if num_tokens >= _TRTLLM_INDEXER_Q_MIN_TOKENS:
+        if _supports_trtllm_indexer_q_prepare(index_q, positions, cos_sin_cache):
+            return _trtllm_indexer_q_prepare_mxfp4(
+                index_q=index_q,
+                positions=positions,
+                cos_sin_cache=cos_sin_cache,
+                weights=weights,
+                softmax_scale=softmax_scale,
+                head_scale=head_scale,
+                enable_pdl=True,
+            )
+        # Devices with a per-call token cap (the consumer-Blackwell launch
+        # envelope) run larger batches in capped slices: every kernel in the
+        # chain is token-local, so slicing along tokens is exact.
+        max_tokens = _trtllm_indexer_q_prepare_max_tokens(index_q.device)
+        if (
+            max_tokens is not None
+            and num_tokens > max_tokens
+            and _supports_trtllm_indexer_q_prepare(
+                index_q[:max_tokens], positions[:max_tokens], cos_sin_cache
+            )
+        ):
+            values_parts = []
+            scales_parts = []
+            weights_parts = []
+            for start in range(0, num_tokens, max_tokens):
+                end = min(start + max_tokens, num_tokens)
+                (part_values, part_scales), part_weights = (
+                    _trtllm_indexer_q_prepare_mxfp4(
+                        index_q=index_q[start:end],
+                        positions=positions[start:end],
+                        cos_sin_cache=cos_sin_cache,
+                        weights=weights[start:end],
+                        softmax_scale=softmax_scale,
+                        head_scale=head_scale,
+                        enable_pdl=True,
+                    )
+                )
+                values_parts.append(part_values)
+                scales_parts.append(part_scales)
+                weights_parts.append(part_weights)
+            return (
+                torch.cat(values_parts, dim=0),
+                torch.cat(scales_parts, dim=0),
+            ), torch.cat(weights_parts, dim=0)
     return _triton_fused_indexer_q_rope_hadamard_mxfp4(
         index_q=index_q,
         positions=positions,
