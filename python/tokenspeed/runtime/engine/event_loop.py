@@ -1862,9 +1862,11 @@ class EventLoop:
                         self._execute_forward_op_in_plan(execution_plan, op, stats)
                     )
 
-                if self.pd_kv_transfer is not None:
-                    pd_events = self.pd_kv_transfer.generate_events()
-                    request_changes.extend(self._process_pd_events(pd_events))
+                if self.kv_transfer is not None:
+                    kv_transfer_events = self.kv_transfer.generate_events()
+                    request_changes.extend(
+                        self._process_kv_transfer_events(kv_transfer_events)
+                    )
 
                 if request_changes:
                     advance_forward(self.scheduler, request_changes)
