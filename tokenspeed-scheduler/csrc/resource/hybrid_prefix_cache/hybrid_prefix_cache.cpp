@@ -1349,7 +1349,16 @@ HybridPrefixCache::PagedCacheGroupAdmission HybridPrefixCache::checkPagedCacheGr
             const bool required_state_group =
                 paged_cache_state_group_set_.find(gid) != paged_cache_state_group_set_.end();
             if (required_state_group && table_exists && lcm > 0 && committed_prefix + lcm <= raw_cursor) {
-                const std::int32_t commit_target = committed_prefix + lcm;
+                // CommitChunk advances committed_prefix across EVERY pending
+                // lcm boundary at apply time (its while-loop), and superseded
+                // interior state snapshots release their pages; only the last
+                // boundary's trailing window stays borrowed. Credit against
+                // that final boundary — crediting only the first one
+                // (committed_prefix + lcm) starves the continuation chunks of
+                // a multi-chunk prefill: the one-chunk-sized state pools then
+                // deadlock admission forever (chunk 1 owns the whole pool,
+                // the clamp frees one window's worth, chunk 2 never admits).
+                const std::int32_t commit_target = (raw_cursor / lcm) * lcm;
                 const std::int32_t retained_tokens = *cfg.sliding_window_tokens;
                 const std::int32_t live_lower_raw = std::max(0, commit_target - retained_tokens);
                 const std::int32_t live_lower_page = live_lower_raw / raw_per_page;
@@ -1403,6 +1412,13 @@ HybridPrefixCache::PagedCacheGroupAdmission HybridPrefixCache::checkPagedCacheGr
         if (free + releasable_owned < new_pages) {
             result.ok = false;
             result.failed_groups.insert(gid);
+            // Admission refusals silently defer the request to the next
+            // iteration; if the numbers cannot change (e.g. a credit-model
+            // bug) that becomes a permanent, invisible queue jam. Keep this
+            // loud enough to spot the repeat pattern in the serve log.
+            spdlog::warn(
+                "[HybridPrefixCache] paged-cache admission refused group={} new_pages={} free={} releasable_owned={}",
+                gid, new_pages, free, releasable_owned);
         }
     }
     return result;

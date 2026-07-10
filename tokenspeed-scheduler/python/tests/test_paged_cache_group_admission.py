@@ -426,3 +426,4 @@ def test_transport_state_decode_checkpoint_exact_capacity_is_admitted():
     assert _request_input_lengths(second_plan) == {"A": 64}
     assert scheduler.paged_cache_group_available_pages("c4.test") == 0
     assert scheduler.paged_cache_group_failed_alloc_count("c4.test") == 0
+
