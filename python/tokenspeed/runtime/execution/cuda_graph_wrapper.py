@@ -581,11 +581,27 @@ class CudaGraphWrapper:
         time -- safe here because capture is rank-lockstepped (dist.barrier
         around the capture loop) and every rank cuts at the same seams in the
         same order."""
+        # break_at_collectives defaults ON (the Barrier-2 workaround: NCCL
+        # collectives recorded as eager breaks). TOKENSPEED_DECODE_MONOLITHIC=1
+        # captures collectives INTO the decode graph instead (one replay per
+        # step). REQUIRES nvidia-nccl-cu13<=2.30.4 on multi-node host-staged
+        # RoCE: NCCL 2.30.7 has a proxy-progress-thread-death regression that
+        # wedges ANY graph-replayed collective within ~100-800 replays
+        # (pure-torch and raw-libnccl repros both wedge; 2.30.4 passes 5000
+        # max-rate replays). Measured throughput is EQUAL to piecewise at
+        # every depth (tg128 and 2048-tok longgen both flat): the overlap
+        # scheduler hides the eager-break host tax, and both modes sit on the
+        # serial per-layer-allreduce NIC latency. Monolithic only buys fewer
+        # host launches per step. Default stays piecewise: it is the only
+        # safe mode on NCCL 2.30.7.
+        import os
+
+        monolithic = os.environ.get("TOKENSPEED_DECODE_MONOLITHIC", "0") == "1"
         cap = BreakableCapture(
             pool=global_graph_memory_pool,
             stream=self.stream,
             honor_break_points=False,
-            break_at_collectives=True,
+            break_at_collectives=not monolithic,
         )
         with cap:
             out = run_once()
