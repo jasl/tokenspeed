@@ -296,9 +296,17 @@ def compute_paged_cache_group_page_counts(
             )
             scheduled_tokens = min(max_scheduled_tokens, max_total_tokens)
             scheduled_pages = ceil_div(scheduled_tokens, raw_per_page)
+            # Two scheduled chunks, not one: a multi-chunk prefill's
+            # continuation must admit while the previous chunk's pages are
+            # still owned (their release only lands with the CommitChunk in
+            # the continuation's own apply). A single-chunk pool makes
+            # admission depend on exact release-credit prediction across
+            # every state group's commit geometry — the 2026-07-10 GB10
+            # deadlock/throw class; one extra chunk of the small state pages
+            # buys unconditional headroom.
             total = (
                 resident_pages
-                + scheduled_pages
+                + 2 * scheduled_pages
                 + max_live_requests
                 + protected_pages
                 + _PAGED_CACHE_GROUP_DUMMY_PAGES
