@@ -1121,6 +1121,47 @@ class EventLoop:
             return False
         return True
 
+    def _check_tp_plan_consistency(self, execution_plan) -> None:
+        """Cross-rank guard: every attention TP rank must emit the same plan.
+
+        The scheduler is replicated per rank and assumed to run in lockstep
+        (identical broadcast inputs -> identical plans). A single divergent
+        tick is permanent and surfaces as a silent NCCL wedge 10-18 minutes
+        later (one rank inside a forward collective, the peer waiting at the
+        next request broadcast — the 2026-07-10 drain-transition hang). This
+        converts that wedge into an immediate, attributed failure. Enable
+        with TOKENSPEED_TP_PLAN_CHECK=1; one small gloo all-gather per tick.
+        """
+        enabled = getattr(self, "_tp_plan_check_enabled", None)
+        if enabled is None:
+            import os
+
+            enabled = (
+                os.environ.get("TOKENSPEED_TP_PLAN_CHECK", "0") == "1"
+                and self.request_handler.attn_tp_size > 1
+            )
+            self._tp_plan_check_enabled = enabled
+            self._tp_plan_check_tick = 0
+        if not enabled:
+            return
+        self._tp_plan_check_tick += 1
+        digest = (
+            self._tp_plan_check_tick,
+            tuple(
+                (tuple(op.request_ids), tuple(op.input_lengths))
+                for op in execution_plan.forward
+            ),
+        )
+        gathered = [None] * self.request_handler.attn_tp_size
+        torch.distributed.all_gather_object(
+            gathered, digest, group=self.request_handler.attn_tp_cpu_group
+        )
+        if any(g != gathered[0] for g in gathered[1:]):
+            raise RuntimeError(
+                "TP plan divergence detected at tick "
+                f"{self._tp_plan_check_tick}: {gathered}"
+            )
+
     def _process_new_requests(self):
         recv_reqs = self.request_handler.recv_reqs()
         # Snapshot the pause state before dispatch: process_requests may flip it
@@ -1733,6 +1774,7 @@ class EventLoop:
                 prev_forward_op = None
                 continue
             execution_plan = self.scheduler.next_execution_plan()
+            self._check_tp_plan_consistency(execution_plan)
             self._publish_scheduler_kv_events()
 
             self._submit_cache_ops(execution_plan)
