@@ -340,7 +340,35 @@ class CapturableGrammarExecutor:
         fetch_batch → build → H2D bitmask → bitmask_event. Main rejoins
         via wait_bitmask before apply_mask; forward on main overlaps
         with the advance + fill on the side stream.
+
+        Under a collective-cutting (piecewise) BreakableCapture the
+        fork/join spans segment boundaries: capture_end() at the first
+        collective seam sees the side stream as unjoined forked work
+        (cudaErrorStreamCaptureUnjoined). Run the copies inline on the
+        capture stream instead — replay semantics are identical (fixed
+        buffers), only the fill/compute overlap is lost, and only for
+        captured decode steps.
         """
+        from tokenspeed.runtime.execution.breakable_cuda_graph import (
+            BreakableCapture,
+        )
+
+        cap = BreakableCapture.current()
+        self._inline_fill = bool(
+            cap is not None and cap._capturing and cap.break_at_collectives
+        )
+        if self._inline_fill:
+            if input_ids_buf_slice is not None:
+                bs = input_ids_buf_slice.shape[0] // self.max_tokens_per_req
+                self.candidates_host[:bs].copy_(
+                    input_ids_buf_slice.view(bs, self.max_tokens_per_req),
+                    non_blocking=True,
+                )
+            self.fetch_batch()
+            self.build()
+            self.bitmask.copy_(self.bitmask_host, non_blocking=True)
+            return
+
         self.fork_event.record()
 
         with torch.cuda.stream(self.stream):
@@ -364,6 +392,8 @@ class CapturableGrammarExecutor:
 
     def wait_bitmask(self) -> None:
         """Join the side stream on the main stream before apply_mask."""
+        if getattr(self, "_inline_fill", False):
+            return
         torch.cuda.current_stream().wait_event(self.bitmask_event)
 
     def schedule_post_sampler(
