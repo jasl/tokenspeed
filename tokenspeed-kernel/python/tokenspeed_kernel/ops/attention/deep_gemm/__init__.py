@@ -53,9 +53,22 @@ def _check_out(
     return out, lens_out
 
 
+# deep_gemm wheels link the torch C++ ABI; a wheel built against another torch
+# raises ImportError (undefined c10 symbol) the moment its _C loads. These DSA
+# registrations are the only module-level consumer on the tokenspeed_kernel
+# import path, so a broken/absent deep_gemm must skip them instead of killing
+# every NVIDIA boot (consumer Blackwell serves on the Triton scorer anyway).
+_HAS_DEEP_GEMM = False
 if platform.is_nvidia:
-    from tokenspeed_kernel.thirdparty import deep_gemm
+    try:
+        from tokenspeed_kernel.thirdparty import deep_gemm
+
+        _HAS_DEEP_GEMM = True
+    except Exception:
+        deep_gemm = None  # type: ignore[assignment]
     from tokenspeed_kernel.thirdparty import trtllm as _trtllm  # noqa: F401
+
+if _HAS_DEEP_GEMM:
 
     @register_kernel(
         "attention",
