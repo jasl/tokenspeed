@@ -272,6 +272,26 @@ def _install_backend_build_requirements(verbose=False) -> None:
         + _pip_verbose_args(verbose)
     )
 
+    # Multi-node host-staged RoCE (DGX Spark GB10 class): 2.30.4 is the only
+    # NCCL safe for CUDA-graph-replayed collectives on both the torch 2.11 and
+    # 2.13 capture paths — 2.28.9/2.29.7/2.30.7 all hit the proxy-progress
+    # death class (minimal repro: ds4-sm120-harness
+    # run_gb10_nccl_graph_replay_gate.sh). torch's own ==2.28.9/==2.29.7 dep
+    # re-resolves over any manual pin on every editable install, and a
+    # requirements-file pin is ResolutionImpossible against torch's pin, so
+    # force it here with --no-deps after the requirement install.
+    if backend == "cuda" and sys.platform == "linux":
+        subprocess.check_call(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--no-deps",
+                "nvidia-nccl-cu13==2.30.4",
+            ]
+        )
+
     # The same setup.py process imports build deps immediately after pip adds
     # them. If pip created user site-packages during this run, that path was not
     # present when Python started, so add site paths before resolving headers.
