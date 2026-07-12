@@ -107,19 +107,6 @@ if platform.is_nvidia:
                 "sm12x_hybrid MoE supports the concatenated w13 layout only, got "
                 f"{w13_layout!r}"
             )
-        # A real (non-None) expert bias would be reordered to [up|gate] by the
-        # CUTLASS preprocessor while the Triton branch expects [gate|up] — refuse
-        # that case. A None/absent bias (DeepSeek-V4 MoE, with_bias=False) is fine:
-        # both bodies read it via getattr(..., None). `hasattr` alone is wrong
-        # because the module may carry a None bias placeholder.
-        if (
-            getattr(w, "w13_weight_bias", None) is not None
-            or getattr(w, "w2_weight_bias", None) is not None
-        ):
-            raise NotImplementedError(
-                "sm12x_hybrid MoE does not support non-None expert biases"
-            )
-
         # Capture the reordered LINEAR (unswizzled) scales in [up|gate] order
         # before the CUTLASS preprocessor overwrites them with the 128x4 swizzle.
         w13_scale_linear = _reorder_w13(w.w13_weight_scale.data, w13_layout, 1)
@@ -153,6 +140,24 @@ if platform.is_nvidia:
         w.w2_weight_triton_tensor = w2_tri
         # CUTLASS w13 is [up|gate] -> Triton GEMM1 emits [up|gate] -> gate_second.
         w.hybrid_gate_up_swapped = True
+
+        # Expert bias (DeepSeek-V4 registers zero bf16 placeholders; a real bias
+        # would flow the same way). The CUTLASS preprocessor already reordered
+        # w13 bias to [up|gate] and left both biases in their loaded dtype (bf16)
+        # for the CUTLASS body. The Triton branch fuses that SAME [up|gate] bias
+        # in GEMM1 and gate_second swaps weight-output and bias together, yielding
+        # SiLU(gate+gate_bias)*(up+up_bias) -- identical to stock triton's
+        # [gate|up] bias. Triton's matmul epilogue wants a float32 bias (stock
+        # casts to float32), so publish float32 copies under *_triton; the CUTLASS
+        # body keeps reading its bf16 w.w13_weight_bias / w.w2_weight_bias intact.
+        if getattr(w, "w13_weight_bias", None) is not None:
+            w.w13_weight_bias_triton = torch.nn.Parameter(
+                w.w13_weight_bias.data.to(torch.float32), requires_grad=False
+            )
+        if getattr(w, "w2_weight_bias", None) is not None:
+            w.w2_weight_bias_triton = torch.nn.Parameter(
+                w.w2_weight_bias.data.to(torch.float32), requires_grad=False
+            )
 
     @register_kernel(
         "moe",

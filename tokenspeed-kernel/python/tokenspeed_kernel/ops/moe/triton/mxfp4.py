@@ -659,8 +659,17 @@ def triton_mxfp4_moe_apply(
 
     w13_weight = w.w13_weight_triton_tensor
     w2_weight = w.w2_weight_triton_tensor
-    w13_bias = getattr(w, "w13_weight_bias", None)
-    w2_bias = getattr(w, "w2_weight_bias", None)
+    # sm12x_hybrid shares w.w13_weight_bias with the CUTLASS body (loaded dtype,
+    # e.g. bf16, reordered to [up|gate]); it publishes a matching float32 copy
+    # under *_triton so this path gets the float32 bias the matmul epilogue
+    # expects. Stock triton casts its own bias to float32 in-place under the
+    # standard name, so the fallback keeps that path unchanged.
+    w13_bias = getattr(w, "w13_weight_bias_triton", None)
+    if w13_bias is None:
+        w13_bias = getattr(w, "w13_weight_bias", None)
+    w2_bias = getattr(w, "w2_weight_bias_triton", None)
+    if w2_bias is None:
+        w2_bias = getattr(w, "w2_weight_bias", None)
     w13_pc = getattr(w, "w13_precision_config", None)
     w2_pc = getattr(w, "w2_precision_config", None)
 
