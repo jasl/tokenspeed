@@ -145,7 +145,18 @@ def _silu_gate_up(
     gate_up: torch.Tensor,
     *,
     output_dtype: torch.dtype,
+    gate_second: bool = False,
 ) -> torch.Tensor:
+    if gate_second:
+        # GEMM1 emitted [up | gate] rather than the usual [gate | up]: the
+        # sm12x_hybrid solution backs this Triton path with the FlashInfer
+        # CUTLASS weight residency, whose w13 is reordered to [w3|w1] == [up|gate]
+        # (see flashinfer.cutlass_mxfp4._reorder_w13). fused_silu_and_mul consumes
+        # [gate | up] (gate first), so swap the halves back before the fused
+        # activation. The swap is a byte-exact reorder of the same activation
+        # values, so the result is bit-identical to the native [gate|up] path.
+        half = gate_up.shape[-1] // 2
+        gate_up = torch.cat((gate_up[..., half:], gate_up[..., :half]), dim=-1)
     return fused_silu_and_mul(gate_up, output_dtype=output_dtype)
 
 
@@ -311,6 +322,51 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     )
     scale = convert_layout(wrap_torch_tensor(scale), scale_layout)
     return quant_tensor, InFlexData(), scale
+
+
+def _strided_mxfp4(quant_tensor, scale, num_warps):
+    """Zero-copy StridedLayout wrap of a raw row-major packed-FP4 weight.
+
+    Twin of :func:`_swizzle_mxfp4` that keeps the weight BYTES in place: it wraps
+    a transposed view of the caller's buffer (so the quantization axis lands on
+    ``dim(-2)`` with ``stride(-2) == 1``) as a triton_kernels ``StridedLayout``
+    FP4 tensor — no value copy. Only the E8M0 block scales are materialized into
+    the Blackwell MX scale layout (the same ~1/16-sized copy that
+    ``_swizzle_mxfp4`` makes). ``matmul`` selects the ``SWIZZLE_MX_VALUE="STRIDED"``
+    epilogue for this layout on cap>=10; the numeric result is bit-identical to
+    the ``_swizzle_mxfp4`` Blackwell value layout at DeepSeek-V4 decode shapes
+    (verified on GB10/SM121), the two differing only in on-chip value tiling.
+
+    Sharing one physical residency lets the sm12x_hybrid MoE dispatch the same
+    weight bytes to either the FlashInfer CUTLASS path (raw buffer) or this
+    Triton path (this strided view) without duplicating the ~44 GB/rank experts.
+    """
+    scale_layout = layout.make_default_matmul_mxfp4_w_scale_layout(
+        mx_axis=-2, num_warps=num_warps
+    )
+    # Mirror the generic matmul hints _swizzle_mxfp4 sets so the strided value
+    # layout shares opt_flags with the swizzled one (persistent + epilogue
+    # subtiling on Blackwell); required for tile-for-tile numeric agreement.
+    if platform.is_blackwell_plus:
+        opt_flags.update_opt_flags_constraints(
+            {"is_persistent": True, "epilogue_subtile": 1}
+        )
+    elif platform.is_hopper:
+        opt_flags.update_opt_flags_constraints({"split_k": 1})
+    elif platform.is_amd:
+        opt_flags.update_opt_flags_constraints({"block_k": 256})
+    # Transpose so the quantization axis is on dim1 (a view; no copy).
+    quant_tensor = quant_tensor.transpose(-2, -1)
+    if quant_tensor.stride(-2) != 1:
+        raise ValueError(
+            "strided mxfp4 wrap requires a row-major packed weight; expected "
+            f"stride(-2)==1 after transpose, got strides {tuple(quant_tensor.stride())}"
+        )
+    scale = scale.transpose(-2, -1)
+    # layout=None -> StridedLayout (zero-copy view of the caller's buffer).
+    quant_wrapped = wrap_torch_tensor(quant_tensor, dtype=FP4)
+    scale_wrapped = convert_layout(wrap_torch_tensor(scale), scale_layout)
+    return quant_wrapped, InFlexData(), scale_wrapped
 
 
 def _routing_from_topk(
@@ -652,6 +708,9 @@ def triton_mxfp4_moe_apply(
         intermediate_cache = _silu_gate_up(
             intermediate_cache,
             output_dtype=x.dtype,
+            # sm12x_hybrid backs this path with the CUTLASS [up|gate] residency;
+            # unset (default False) for the native concatenated [gate|up] path.
+            gate_second=getattr(w, "hybrid_gate_up_swapped", False),
         )
 
     if hasattr(w, "w2_act_scale"):
