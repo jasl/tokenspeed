@@ -75,7 +75,6 @@ class MoeBackend(Enum):
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
-    SM12X_HYBRID = "sm12x_hybrid"
 
     DEEP_GEMM_MEGA_MOE = "deep_gemm_mega_moe"
     MEGA_MOE = "mega_moe"
