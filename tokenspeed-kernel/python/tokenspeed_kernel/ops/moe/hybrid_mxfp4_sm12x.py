@@ -107,11 +107,17 @@ if platform.is_nvidia:
                 "sm12x_hybrid MoE supports the concatenated w13 layout only, got "
                 f"{w13_layout!r}"
             )
-        if hasattr(w, "w13_weight_bias") or hasattr(w, "w2_weight_bias"):
-            # The CUTLASS and Triton branches expect different bias dtypes/layouts;
-            # DeepSeek-V4 MoE is bias-free, so keep the hybrid honest and refuse.
+        # A real (non-None) expert bias would be reordered to [up|gate] by the
+        # CUTLASS preprocessor while the Triton branch expects [gate|up] — refuse
+        # that case. A None/absent bias (DeepSeek-V4 MoE, with_bias=False) is fine:
+        # both bodies read it via getattr(..., None). `hasattr` alone is wrong
+        # because the module may carry a None bias placeholder.
+        if (
+            getattr(w, "w13_weight_bias", None) is not None
+            or getattr(w, "w2_weight_bias", None) is not None
+        ):
             raise NotImplementedError(
-                "sm12x_hybrid MoE does not support expert biases"
+                "sm12x_hybrid MoE does not support non-None expert biases"
             )
 
         # Capture the reordered LINEAR (unswizzled) scales in [up|gate] order
