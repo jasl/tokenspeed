@@ -3432,10 +3432,16 @@ class DeepseekV4Indexer(nn.Module):
                 head_scale=self.n_head**-0.5,
             )
 
+        # deep_gemm's fp8_fp4 indexer kernels are only the datacenter (cap 10)
+        # scoring path. On consumer Blackwell the sm12x scoring backends
+        # (Triton/torch) handle both prefill and paged decode, so a broken or
+        # absent deep_gemm must not gate the indexer there — historically this
+        # gate only passed on GB10 because the deepgemm A/B lever env plus a
+        # working deep_gemm wheel happened to satisfy it.
         packed_indexer_available = _deepseek_v4_deepgemm_fp4_indexer_available(
             packed_index_q[0]
         )
-        if not packed_indexer_available:
+        if not packed_indexer_available and not _deepseek_v4_indexer_use_sm12x_scoring():
             raise RuntimeError(
                 "DeepSeek V4 sparse indexer requires DeepGEMM FP4 support"
             )
